@@ -88,17 +88,18 @@ hp_error_t hp_project_header(const hp_projection_t *proj, const hp_header_t *src
 hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
     if (!filter) return HP_ERR_INVALID_ARG;
     memset(filter, 0, sizeof(*filter));
-    if (!where_clause || *where_clause == '\0') return HP_OK;
+    if (!where_clause) return HP_OK;
 
     const char *p = where_clause;
-    while (*p && filter->count < HP_MAX_PREDICATES) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) return HP_OK;
 
+    while (*p && filter->count < HP_MAX_PREDICATES) {
+        /* Parse column name */
         const char *col_start = p;
         while (*p && !isspace((unsigned char)*p) && *p != '=' && *p != '!' && *p != '<' && *p != '>') p++;
         size_t col_len = p - col_start;
-        if (col_len == 0) break;
+        if (col_len == 0) return HP_ERR_INVALID_ARG;
 
         hp_predicate_t *pred = &filter->preds[filter->count];
         if (col_len >= sizeof(pred->col_name)) col_len = sizeof(pred->col_name) - 1;
@@ -136,21 +137,23 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
         while (*p && isspace((unsigned char)*p)) p++;
 
         const char *val_start = p;
-        if (*p == '"') {
-            p++;
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
             val_start = p;
-            while (*p && *p != '"') p++;
+            while (*p && *p != q) p++;
+            if (*p != q) return HP_ERR_INVALID_ARG;
             size_t val_len = p - val_start;
             if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
             memcpy(pred->str_val, val_start, val_len);
             pred->str_val[val_len] = '\0';
             pred->str_val_len = val_len;
-            if (*p == '"') p++;
+            p++;
             pred->is_num = false;
             pred->is_int = false;
         } else {
             while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
             size_t val_len = p - val_start;
+            if (val_len == 0) return HP_ERR_INVALID_ARG;
             if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
             memcpy(pred->str_val, val_start, val_len);
             pred->str_val[val_len] = '\0';
@@ -190,7 +193,41 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
         }
 
         filter->count++;
-        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+
+        bool has_conj = false;
+        if (*p == ',') {
+            p++;
+            has_conj = true;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+        if (*p == '&' && *(p + 1) == '&') {
+            p += 2;
+            has_conj = true;
+            while (*p && isspace((unsigned char)*p)) p++;
+        } else if ((p[0] == 'a' || p[0] == 'A') &&
+                   (p[1] == 'n' || p[1] == 'N') &&
+                   (p[2] == 'd' || p[2] == 'D') &&
+                   (isspace((unsigned char)p[3]) || p[3] == '\0' || p[3] == ',')) {
+            p += 3;
+            has_conj = true;
+            while (*p && isspace((unsigned char)*p)) p++;
+        }
+
+        if (!has_conj) {
+            return HP_ERR_INVALID_ARG;
+        }
+
+        if (!*p) {
+            return HP_ERR_INVALID_ARG;
+        }
+    }
+
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '\0') {
+        return HP_ERR_INVALID_ARG;
     }
 
     return HP_OK;

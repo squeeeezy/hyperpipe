@@ -143,7 +143,14 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
         hp_projection_init(&tc->projection, cfg->select_spec);
     }
     if (cfg->where_spec) {
-        hp_filter_init(&tc->filter, cfg->where_spec);
+        err = hp_filter_init(&tc->filter, cfg->where_spec);
+        if (err != HP_OK) {
+            hp_sliding_buffer_free(&tc->ring_buf);
+            hp_json_ser_free(&tc->json_ser);
+            free(tc->page_buf_data);
+            tc->page_buf_data = NULL;
+            return err;
+        }
     }
 
     if (cfg->on_error == HP_ON_ERROR_QUARANTINE && cfg->quarantine_path) {
@@ -302,7 +309,12 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     }
 
                     if (tc->filter.count > 0) {
-                        hp_filter_bind(&tc->filter, &tc->in_header);
+                        err = hp_filter_bind(&tc->filter, &tc->in_header);
+                        if (err != HP_OK) {
+                            tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
+                            hp_page_buffer_flush(&pb);
+                            return err;
+                        }
                     }
 
                     header_processed = true;
@@ -522,7 +534,12 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     }
 
                     if (tc->filter.count > 0) {
-                        hp_filter_bind(&tc->filter, &tc->in_header);
+                        err = hp_filter_bind(&tc->filter, &tc->in_header);
+                        if (err != HP_OK) {
+                            tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
+                            hp_page_buffer_flush(&pb);
+                            return err;
+                        }
                     }
 
                     header_processed = true;

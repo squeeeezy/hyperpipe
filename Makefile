@@ -70,11 +70,15 @@ test: $(BUILD_DIR)/libhyperpipe.a
 	$(CC) $(CFLAGS) $(TEST_DIR)/test_differential.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_differential
 	$(CC) $(CFLAGS) $(TEST_DIR)/test_filter.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_filter
 	$(CC) $(CFLAGS) $(TEST_DIR)/test_roundtrip.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_roundtrip
+	$(CC) $(CFLAGS) $(TEST_DIR)/test_fault_tolerance.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_fault_tolerance
+	$(CC) $(CFLAGS) $(TEST_DIR)/test_real_dataset.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_real_dataset
 	$(BUILD_DIR)/test_rfc4180
 	$(BUILD_DIR)/test_ring_buffer
 	$(BUILD_DIR)/test_differential
 	$(BUILD_DIR)/test_filter
 	$(BUILD_DIR)/test_roundtrip
+	$(BUILD_DIR)/test_fault_tolerance
+	$(BUILD_DIR)/test_real_dataset
 
 clean:
 	rm -rf $(BUILD_DIR)
