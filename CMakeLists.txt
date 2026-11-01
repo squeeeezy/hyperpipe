@@ -67,3 +67,6 @@ add_test(NAME test_roundtrip COMMAND test_roundtrip)
 # Benchmark harness
 add_executable(bench_hyperpipe bench/bench_main.c)
 target_link_libraries(bench_hyperpipe PRIVATE hyperpipe_core)
+if(WIN32)
+    target_link_libraries(bench_hyperpipe PRIVATE psapi)
+endif()

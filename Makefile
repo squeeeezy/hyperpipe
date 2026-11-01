@@ -62,7 +62,7 @@ $(BUILD_DIR)/hyperpipe: $(SRC_DIR)/hp_main.c $(BUILD_DIR)/libhyperpipe.a
 	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lhyperpipe -o $@
 
 $(BUILD_DIR)/bench_hyperpipe: $(BENCH_DIR)/bench_main.c $(BUILD_DIR)/libhyperpipe.a
-	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lhyperpipe -o $@
+	$(CC) $(CFLAGS) $< -L$(BUILD_DIR) -lhyperpipe -lpsapi -o $@
 
 test: $(BUILD_DIR)/libhyperpipe.a
 	$(CC) $(CFLAGS) $(TEST_DIR)/test_rfc4180.c -L$(BUILD_DIR) -lhyperpipe -o $(BUILD_DIR)/test_rfc4180
