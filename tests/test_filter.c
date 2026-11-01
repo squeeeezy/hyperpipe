@@ -6,10 +6,10 @@
 static void test_projection(void) {
     hp_header_t hdr;
     hdr.count = 4;
-    hdr.names[0] = strdup("id");
-    hdr.names[1] = strdup("name");
-    hdr.names[2] = strdup("score");
-    hdr.names[3] = strdup("city");
+    hdr.names[0] = hp_strdup("id");
+    hdr.names[1] = hp_strdup("name");
+    hdr.names[2] = hp_strdup("score");
+    hdr.names[3] = hp_strdup("city");
 
     hp_projection_t proj;
     hp_error_t err = hp_projection_init(&proj, "name,score");
@@ -50,9 +50,9 @@ static void test_projection(void) {
 static void test_filtering(void) {
     hp_header_t hdr;
     hdr.count = 3;
-    hdr.names[0] = strdup("name");
-    hdr.names[1] = strdup("age");
-    hdr.names[2] = strdup("status");
+    hdr.names[0] = hp_strdup("name");
+    hdr.names[1] = hp_strdup("age");
+    hdr.names[2] = hp_strdup("status");
 
     hp_filter_t filter;
     hp_error_t err = hp_filter_init(&filter, "age >= 21, status == active");

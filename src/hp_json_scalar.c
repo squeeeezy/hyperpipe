@@ -292,7 +292,7 @@ hp_error_t hp_json_parse_line(const char *line,
 
             /* Register header column if header provided and new */
             if (header && idx >= header->count && header->count < HP_MAX_COLUMNS) {
-                header->names[header->count++] = strdup(key_buf);
+                header->names[header->count++] = hp_strdup(key_buf);
             }
         }
 

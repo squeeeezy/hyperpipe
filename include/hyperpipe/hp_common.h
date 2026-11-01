@@ -1,6 +1,13 @@
 #ifndef HYPERPIPE_HP_COMMON_H
 #define HYPERPIPE_HP_COMMON_H
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -72,6 +79,16 @@ typedef struct hp_header_s {
     char *names[HP_MAX_COLUMNS];
     size_t count;
 } hp_header_t;
+
+HP_INLINE char *hp_strdup(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *copy = (char *)malloc(len + 1);
+    if (copy) {
+        memcpy(copy, s, len + 1);
+    }
+    return copy;
+}
 
 HP_INLINE void hp_header_free(hp_header_t *h) {
     if (!h) return;

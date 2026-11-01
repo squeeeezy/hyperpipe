@@ -77,9 +77,9 @@ hp_error_t hp_project_header(const hp_projection_t *proj, const hp_header_t *src
     for (size_t i = 0; i < proj->count; i++) {
         int64_t col_idx = proj->col_indices[i];
         if (src && col_idx >= 0 && (size_t)col_idx < src->count) {
-            dst->names[dst->count++] = strdup(src->names[col_idx]);
+            dst->names[dst->count++] = hp_strdup(src->names[col_idx]);
         } else {
-            dst->names[dst->count++] = strdup(proj->col_names[i]);
+            dst->names[dst->count++] = hp_strdup(proj->col_names[i]);
         }
     }
     return HP_OK;

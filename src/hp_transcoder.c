@@ -287,7 +287,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                         size_t flen = raw_row.fields[i].len < sizeof(buf) - 1 ? raw_row.fields[i].len : sizeof(buf) - 1;
                         memcpy(buf, raw_row.fields[i].ptr, flen);
                         buf[flen] = '\0';
-                        tc->in_header.names[tc->in_header.count++] = strdup(buf);
+                        tc->in_header.names[tc->in_header.count++] = hp_strdup(buf);
                     }
 
                     if (tc->projection.active) {
@@ -296,7 +296,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     } else {
                         tc->out_header.count = 0;
                         for (size_t i = 0; i < tc->in_header.count; i++) {
-                            tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
+                            tc->out_header.names[tc->out_header.count++] = hp_strdup(tc->in_header.names[i]);
                         }
                     }
 
@@ -516,7 +516,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     } else {
                         tc->out_header.count = 0;
                         for (size_t i = 0; i < tc->in_header.count; i++) {
-                            tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
+                            tc->out_header.names[tc->out_header.count++] = hp_strdup(tc->in_header.names[i]);
                         }
                     }
 
