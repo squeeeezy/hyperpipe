@@ -4,4 +4,5 @@ bin/
 *.o
 *.a
 *.obj
-data/nasa_server_access_log.csv
+data/*.csv
+
