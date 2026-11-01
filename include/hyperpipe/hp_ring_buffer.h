@@ -3,8 +3,8 @@
 
 #include "hp_common.h"
 
-#define HP_DEFAULT_BUFFER_CAPACITY (4 * 1024 * 1024)   /* 4 MiB L3-aligned streaming ring buffer */
-#define HP_SIMD_PADDING 64                             /* 64 bytes safety padding for AVX-512 loads */
+#define HP_DEFAULT_BUFFER_CAPACITY (256 * 1024)   /* 256 KiB ultra-compact L2/L3-aligned ring buffer */
+#define HP_SIMD_PADDING 64                        /* 64 bytes safety padding for AVX-512 loads */
 
 /*
  * Sliding linear ring buffer designed for streaming SIMD parsers.

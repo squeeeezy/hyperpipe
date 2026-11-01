@@ -21,6 +21,7 @@ typedef struct hp_dispatch_table_s {
     size_t (*csv_scan_special)(const uint8_t *p, size_t len, uint8_t delim);
     size_t (*csv_scan_quote)(const uint8_t *p, size_t len);
     size_t (*json_scan_escapes)(const uint8_t *p, size_t len);
+    hp_error_t (*csv_parse_row)(hp_csv_parser_t *parser, const uint8_t *src, size_t len, size_t *consumed, hp_row_t *out_row, bool is_eof);
 } hp_dispatch_table_t;
 
 extern hp_dispatch_table_t g_hp_dispatch;

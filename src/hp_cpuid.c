@@ -2,8 +2,33 @@
 
 #if defined(_MSC_VER)
     #include <intrin.h>
+    static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+        int cpu_info[4];
+        __cpuidex(cpu_info, leaf, subleaf);
+        *eax = (uint32_t)cpu_info[0];
+        *ebx = (uint32_t)cpu_info[1];
+        *ecx = (uint32_t)cpu_info[2];
+        *edx = (uint32_t)cpu_info[3];
+    }
+    static uint64_t read_xcr0(void) {
+        return _xgetbv(0);
+    }
 #elif defined(__GNUC__) || defined(__clang__)
     #include <cpuid.h>
+    #include <immintrin.h>
+    static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+        __cpuid_count(leaf, subleaf, *eax, *ebx, *ecx, *edx);
+    }
+    static uint64_t read_xcr0(void) {
+        uint32_t eax, edx;
+        __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
+        return ((uint64_t)edx << 32) | eax;
+    }
+#else
+    static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
+        (void)leaf; (void)subleaf; *eax = *ebx = *ecx = *edx = 0;
+    }
+    static uint64_t read_xcr0(void) { return 0; }
 #endif
 
 hp_dispatch_table_t g_hp_dispatch = {
@@ -11,35 +36,9 @@ hp_dispatch_table_t g_hp_dispatch = {
     .active_mode_name = "Scalar",
     .csv_scan_special = hp_csv_scan_special_scalar,
     .csv_scan_quote = hp_csv_scan_quote_scalar,
-    .json_scan_escapes = hp_json_scan_escapes_scalar
+    .json_scan_escapes = hp_json_scan_escapes_scalar,
+    .csv_parse_row = hp_csv_parse_row_scalar
 };
-
-static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
-#if defined(_MSC_VER)
-    int info[4];
-    __cpuidex(info, (int)leaf, (int)subleaf);
-    *eax = (uint32_t)info[0];
-    *ebx = (uint32_t)info[1];
-    *ecx = (uint32_t)info[2];
-    *edx = (uint32_t)info[3];
-#elif defined(__GNUC__) || defined(__clang__)
-    __cpuid_count(leaf, subleaf, *eax, *ebx, *ecx, *edx);
-#else
-    *eax = *ebx = *ecx = *edx = 0;
-#endif
-}
-
-static uint64_t read_xcr0(void) {
-#if defined(_MSC_VER)
-    return _xgetbv(0);
-#elif defined(__GNUC__) || defined(__clang__)
-    uint32_t eax, edx;
-    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0));
-    return ((uint64_t)edx << 32) | eax;
-#else
-    return 0;
-#endif
-}
 
 hp_cpu_caps_t hp_detect_cpu_caps(void) {
     hp_cpu_caps_t caps;
@@ -56,8 +55,8 @@ hp_cpu_caps_t hp_detect_cpu_caps(void) {
 
     if (osxsave) {
         uint64_t xcr0 = read_xcr0();
-        caps.os_avx_supported = (xcr0 & 0x06) == 0x06; /* XMM (bit 1) and YMM (bit 2) */
-        caps.os_avx512_supported = caps.os_avx_supported && ((xcr0 & 0xE0) == 0xE0); /* opmask (5), ZMM_Hi256 (6), Hi16_ZMM (7) */
+        caps.os_avx_supported = (xcr0 & 0x06) == 0x06;
+        caps.os_avx512_supported = caps.os_avx_supported && ((xcr0 & 0xE0) == 0xE0);
     }
 
     if (max_leaf >= 7) {
@@ -103,7 +102,6 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
         if (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl) {
             selected = HP_SIMD_AVX512;
         } else {
-            /* Fallback to AVX2 if available, else scalar */
             selected = caps.has_avx2 ? HP_SIMD_AVX2 : HP_SIMD_SCALAR;
         }
     } else if (requested_mode == HP_SIMD_AVX2) {
@@ -120,17 +118,20 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_avx512;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_avx512;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_avx512;
+            g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx512;
             break;
         case HP_SIMD_AVX2:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_avx2;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_avx2;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_avx2;
+            g_hp_dispatch.csv_parse_row = hp_csv_parse_row_scalar;
             break;
         case HP_SIMD_SCALAR:
         default:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_scalar;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_scalar;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_scalar;
+            g_hp_dispatch.csv_parse_row = hp_csv_parse_row_scalar;
             break;
     }
 }

@@ -110,15 +110,13 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
     hp_error_t err = hp_sliding_buffer_init(&tc->ring_buf, cap);
     if (err != HP_OK) return err;
 
-    /* Allocate 2 MiB page buffer for high-throughput batch writes */
-    tc->page_buf_cap = 2 * 1024 * 1024;
+    tc->page_buf_cap = 64 * 1024;
     tc->page_buf_data = (uint8_t *)malloc(tc->page_buf_cap);
     if (!tc->page_buf_data) {
         hp_sliding_buffer_free(&tc->ring_buf);
         return HP_ERR_NOMEM;
     }
 
-    /* Initialize SIMD runtime dispatch */
     hp_dispatch_init(cfg->simd_mode);
 
     hp_format_t parser_fmt = (cfg->in_format == HP_FORMAT_AUTO) ? HP_FORMAT_CSV : cfg->in_format;
@@ -189,7 +187,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     pb.len = 0;
     pb.stream = out_stream;
 
-    /* Prime ring buffer */
     size_t bytes_read = 0;
     hp_error_t err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
     if (err != HP_OK) return err;
@@ -198,7 +195,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     size_t available = 0;
     const uint8_t *src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
 
-    /* Sniff format from buffered data */
     if (tc->config.in_format == HP_FORMAT_AUTO) {
         tc->config.in_format = hp_sniff_format(src, available);
         if (tc->config.in_format == HP_FORMAT_TSV) {
@@ -215,7 +211,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     }
 
     if (tc->config.in_format == HP_FORMAT_CSV || tc->config.in_format == HP_FORMAT_TSV) {
-        /* CSV/TSV input stream */
         while (1) {
             src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
             if (available == 0) {
@@ -243,7 +238,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                         hp_page_buffer_flush(&pb);
                         return err;
                     }
-                    /* Forward sync to next unescaped newline */
                     const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
                     size_t skip = nl ? (size_t)(nl - src + 1) : available;
                     if (tc->quarantine_file) {
@@ -258,7 +252,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 }
 
                 if (consumed == 0) {
-                    /* Incomplete row at buffer tail -> refill buffer */
                     break;
                 }
 
@@ -272,7 +265,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 }
 
                 if (!header_processed) {
-                    /* Store header */
                     tc->in_header.count = 0;
                     for (size_t i = 0; i < raw_row.field_count && i < HP_MAX_COLUMNS; i++) {
                         char buf[256];
@@ -298,7 +290,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                     header_processed = true;
 
-                    /* If output format is CSV/TSV, write projected header */
                     if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
                         uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
                         for (size_t i = 0; i < tc->out_header.count; i++) {
@@ -315,23 +306,53 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                 tc->stats.rows_read++;
 
-                /* Apply predicate filter */
                 if (!hp_filter_matches(&tc->filter, &raw_row)) {
                     src += consumed;
                     available -= consumed;
                     continue;
                 }
 
-                /* Apply column projection */
-                hp_row_t out_row;
-                if (tc->projection.active) {
-                    hp_project_row(&tc->projection, &raw_row, &out_row);
-                } else {
-                    out_row = raw_row;
-                }
+                if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
+                    uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
+                    if (pb.len + 2048 >= pb.cap) {
+                        hp_page_buffer_flush(&pb);
+                    }
 
-                /* Serialize to output format */
-                if (tc->config.out_format == HP_FORMAT_NDJSON) {
+                    if (tc->projection.active) {
+                        for (size_t i = 0; i < tc->projection.count; i++) {
+                            if (i > 0) pb.data[pb.len++] = out_delim;
+                            int64_t col_idx = tc->projection.col_indices[i];
+                            if (col_idx >= 0 && (size_t)col_idx < raw_row.field_count) {
+                                const hp_str_t *f = &raw_row.fields[col_idx];
+                                if (!f->has_escapes) {
+                                    memcpy(pb.data + pb.len, f->ptr, f->len);
+                                    pb.len += f->len;
+                                } else {
+                                    write_csv_field_pb(&pb, f->ptr, f->len, out_delim);
+                                }
+                            }
+                        }
+                    } else {
+                        for (size_t i = 0; i < raw_row.field_count; i++) {
+                            if (i > 0) pb.data[pb.len++] = out_delim;
+                            const hp_str_t *f = &raw_row.fields[i];
+                            if (!f->has_escapes) {
+                                memcpy(pb.data + pb.len, f->ptr, f->len);
+                                pb.len += f->len;
+                            } else {
+                                write_csv_field_pb(&pb, f->ptr, f->len, out_delim);
+                            }
+                        }
+                    }
+                    pb.data[pb.len++] = '\n';
+                } else {
+                    hp_row_t out_row;
+                    if (tc->projection.active) {
+                        hp_project_row(&tc->projection, &raw_row, &out_row);
+                    } else {
+                        out_row = raw_row;
+                    }
+
                     const char *line = NULL;
                     size_t line_len = 0;
                     err = hp_json_ser_row(&tc->json_ser, &tc->out_header, &out_row, &line, &line_len);
@@ -342,13 +363,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                     hp_page_buffer_write(&pb, line, line_len);
                     tc->stats.bytes_out += line_len;
-                } else {
-                    uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                    for (size_t i = 0; i < out_row.field_count; i++) {
-                        if (i > 0) hp_page_buffer_putc(&pb, out_delim);
-                        write_csv_field_pb(&pb, out_row.fields[i].ptr, out_row.fields[i].len, out_delim);
-                    }
-                    hp_page_buffer_putc(&pb, '\n');
                 }
 
                 tc->stats.rows_emitted++;
@@ -405,7 +419,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 hp_sliding_buffer_consume(&tc->ring_buf, line_len);
                 made_progress = true;
 
-                /* Strip trailing CR/LF for parsing */
                 size_t strip_len = line_len;
                 while (strip_len > 0 && (line_buf[strip_len - 1] == '\r' || line_buf[strip_len - 1] == '\n' || isspace((unsigned char)line_buf[strip_len - 1]))) {
                     line_buf[--strip_len] = '\0';
