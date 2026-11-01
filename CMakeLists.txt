@@ -64,6 +64,17 @@ add_executable(test_roundtrip tests/test_roundtrip.c)
 target_link_libraries(test_roundtrip PRIVATE hyperpipe_core)
 add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
+add_executable(test_fault_tolerance tests/test_fault_tolerance.c)
+target_link_libraries(test_fault_tolerance PRIVATE hyperpipe_core)
+add_test(NAME test_fault_tolerance COMMAND test_fault_tolerance)
+
+add_executable(test_real_dataset tests/test_real_dataset.c)
+target_link_libraries(test_real_dataset PRIVATE hyperpipe_core)
+if(WIN32)
+    target_link_libraries(test_real_dataset PRIVATE psapi)
+endif()
+add_test(NAME test_real_dataset COMMAND test_real_dataset)
+
 # Benchmark harness
 add_executable(bench_hyperpipe bench/bench_main.c)
 target_link_libraries(bench_hyperpipe PRIVATE hyperpipe_core)

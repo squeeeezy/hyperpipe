@@ -17,6 +17,89 @@
     }
 #endif
 
+typedef struct hp_page_buffer_s {
+    uint8_t data[65536];
+    size_t len;
+    FILE *stream;
+} hp_page_buffer_t;
+
+HP_INLINE void hp_page_buffer_flush(hp_page_buffer_t *pb) {
+    if (pb->len > 0) {
+        fwrite(pb->data, 1, pb->len, pb->stream);
+        pb->len = 0;
+    }
+}
+
+HP_INLINE void hp_page_buffer_write(hp_page_buffer_t *pb, const void *src, size_t size) {
+    if (size >= sizeof(pb->data)) {
+        hp_page_buffer_flush(pb);
+        fwrite(src, 1, size, pb->stream);
+        return;
+    }
+    if (pb->len + size > sizeof(pb->data)) {
+        hp_page_buffer_flush(pb);
+    }
+    memcpy(pb->data + pb->len, src, size);
+    pb->len += size;
+}
+
+HP_INLINE void hp_page_buffer_putc(hp_page_buffer_t *pb, uint8_t ch) {
+    if (pb->len >= sizeof(pb->data)) {
+        hp_page_buffer_flush(pb);
+    }
+    pb->data[pb->len++] = ch;
+}
+
+static void write_csv_field_pb(hp_page_buffer_t *pb, const char *p, size_t len, uint8_t delim) {
+    bool needs_quotes = false;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == delim || p[i] == '"' || p[i] == '\n' || p[i] == '\r') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (!needs_quotes) {
+        hp_page_buffer_write(pb, p, len);
+    } else {
+        hp_page_buffer_putc(pb, '"');
+        for (size_t i = 0; i < len; i++) {
+            if (p[i] == '"') hp_page_buffer_putc(pb, '"');
+            hp_page_buffer_putc(pb, (uint8_t)p[i]);
+        }
+        hp_page_buffer_putc(pb, '"');
+    }
+}
+
+hp_format_t hp_sniff_format(const uint8_t *sample, size_t len) {
+    if (!sample || len == 0) return HP_FORMAT_CSV;
+
+    size_t i = 0;
+    if (len >= 3 && sample[0] == 0xEF && sample[1] == 0xBB && sample[2] == 0xBF) {
+        i = 3;
+    }
+    while (i < len && (sample[i] == ' ' || sample[i] == '\t' || sample[i] == '\r' || sample[i] == '\n')) {
+        i++;
+    }
+    if (i >= len) return HP_FORMAT_CSV;
+
+    if (sample[i] == '{') {
+        return HP_FORMAT_NDJSON;
+    }
+
+    size_t commas = 0;
+    size_t tabs = 0;
+    for (size_t k = i; k < len && sample[k] != '\n' && sample[k] != '\r'; k++) {
+        if (sample[k] == ',') commas++;
+        else if (sample[k] == '\t') tabs++;
+    }
+
+    if (tabs > commas) {
+        return HP_FORMAT_TSV;
+    }
+    return HP_FORMAT_CSV;
+}
+
 hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg) {
     if (!tc || !cfg) return HP_ERR_INVALID_ARG;
     memset(tc, 0, sizeof(*tc));
@@ -29,7 +112,8 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
     /* Initialize SIMD runtime dispatch */
     hp_dispatch_init(cfg->simd_mode);
 
-    err = hp_csv_parser_init(&tc->csv_parser, cfg->in_format, cfg->simd_mode);
+    hp_format_t parser_fmt = (cfg->in_format == HP_FORMAT_AUTO) ? HP_FORMAT_CSV : cfg->in_format;
+    err = hp_csv_parser_init(&tc->csv_parser, parser_fmt, cfg->simd_mode);
     if (err != HP_OK) {
         hp_sliding_buffer_free(&tc->ring_buf);
         return err;
@@ -41,7 +125,6 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
         return err;
     }
 
-    /* Configure vectorized escape scanner according to dispatch */
     tc->json_ser.scan_escapes = g_hp_dispatch.json_scan_escapes;
 
     if (cfg->select_spec) {
@@ -49,6 +132,15 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
     }
     if (cfg->where_spec) {
         hp_filter_init(&tc->filter, cfg->where_spec);
+    }
+
+    if (cfg->on_error == HP_ON_ERROR_QUARANTINE && cfg->quarantine_path) {
+        tc->quarantine_file = fopen(cfg->quarantine_path, "wb");
+        if (!tc->quarantine_file) {
+            hp_sliding_buffer_free(&tc->ring_buf);
+            hp_json_ser_free(&tc->json_ser);
+            return HP_ERR_IO;
+        }
     }
 
     return HP_OK;
@@ -60,26 +152,9 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
     hp_json_ser_free(&tc->json_ser);
     hp_header_free(&tc->in_header);
     hp_header_free(&tc->out_header);
-}
-
-static void write_csv_field(FILE *out, const char *p, size_t len, uint8_t delim) {
-    bool needs_quotes = false;
-    for (size_t i = 0; i < len; i++) {
-        if (p[i] == delim || p[i] == '"' || p[i] == '\n' || p[i] == '\r') {
-            needs_quotes = true;
-            break;
-        }
-    }
-
-    if (!needs_quotes) {
-        fwrite(p, 1, len, out);
-    } else {
-        fputc('"', out);
-        for (size_t i = 0; i < len; i++) {
-            if (p[i] == '"') fputc('"', out);
-            fputc(p[i], out);
-        }
-        fputc('"', out);
+    if (tc->quarantine_file) {
+        fclose(tc->quarantine_file);
+        tc->quarantine_file = NULL;
     }
 }
 
@@ -89,17 +164,50 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     double t0 = get_time_sec();
     bool header_processed = false;
 
+    hp_page_buffer_t pb;
+    pb.len = 0;
+    pb.stream = out_stream;
+
+    /* Prime ring buffer */
+    size_t bytes_read = 0;
+    hp_error_t err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
+    if (err != HP_OK) return err;
+    tc->stats.bytes_in += bytes_read;
+
+    size_t available = 0;
+    const uint8_t *src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+
+    /* Sniff format from buffered data */
+    if (tc->config.in_format == HP_FORMAT_AUTO) {
+        tc->config.in_format = hp_sniff_format(src, available);
+        if (tc->config.in_format == HP_FORMAT_TSV) {
+            tc->csv_parser.delim = '\t';
+        }
+    }
+
+    if (tc->config.out_format == HP_FORMAT_AUTO) {
+        if (tc->config.in_format == HP_FORMAT_NDJSON) {
+            tc->config.out_format = HP_FORMAT_CSV;
+        } else {
+            tc->config.out_format = HP_FORMAT_NDJSON;
+        }
+    }
+
     if (tc->config.in_format == HP_FORMAT_CSV || tc->config.in_format == HP_FORMAT_TSV) {
         /* CSV/TSV input stream */
         while (1) {
-            size_t bytes_read = 0;
-            hp_error_t err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
-            if (err != HP_OK) return err;
-            tc->stats.bytes_in += bytes_read;
-
-            size_t available = 0;
-            const uint8_t *src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-            if (available == 0 && tc->ring_buf.eof_reached) break;
+            src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+            if (available == 0) {
+                if (tc->ring_buf.eof_reached) break;
+                err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
+                if (err != HP_OK) {
+                    hp_page_buffer_flush(&pb);
+                    return err;
+                }
+                tc->stats.bytes_in += bytes_read;
+                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                if (available == 0 && tc->ring_buf.eof_reached) break;
+            }
 
             bool is_eof = tc->ring_buf.eof_reached;
             bool made_progress = false;
@@ -109,7 +217,23 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 hp_row_t raw_row;
 
                 err = hp_csv_parse_row(&tc->csv_parser, src, available, &consumed, &raw_row, is_eof);
-                if (err != HP_OK) return err;
+                if (err != HP_OK) {
+                    if (tc->config.on_error == HP_ON_ERROR_FAIL) {
+                        hp_page_buffer_flush(&pb);
+                        return err;
+                    }
+                    /* Forward sync to next unescaped newline */
+                    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
+                    size_t skip = nl ? (size_t)(nl - src + 1) : available;
+                    if (tc->quarantine_file) {
+                        fwrite(src, 1, skip, tc->quarantine_file);
+                    }
+                    hp_sliding_buffer_consume(&tc->ring_buf, skip);
+                    tc->stats.rows_dropped++;
+                    made_progress = true;
+                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    continue;
+                }
 
                 if (consumed == 0) {
                     /* Incomplete row at buffer tail -> refill buffer */
@@ -155,10 +279,10 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
                         uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
                         for (size_t i = 0; i < tc->out_header.count; i++) {
-                            if (i > 0) fputc(out_delim, out_stream);
-                            write_csv_field(out_stream, tc->out_header.names[i], strlen(tc->out_header.names[i]), out_delim);
+                            if (i > 0) hp_page_buffer_putc(&pb, out_delim);
+                            write_csv_field_pb(&pb, tc->out_header.names[i], strlen(tc->out_header.names[i]), out_delim);
                         }
-                        fputc('\n', out_stream);
+                        hp_page_buffer_putc(&pb, '\n');
                     }
 
                     src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
@@ -186,95 +310,173 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     const char *line = NULL;
                     size_t line_len = 0;
                     err = hp_json_ser_row(&tc->json_ser, &tc->out_header, &out_row, &line, &line_len);
-                    if (err != HP_OK) return err;
+                    if (err != HP_OK) {
+                        hp_page_buffer_flush(&pb);
+                        return err;
+                    }
 
-                    fwrite(line, 1, line_len, out_stream);
+                    hp_page_buffer_write(&pb, line, line_len);
                     tc->stats.bytes_out += line_len;
                 } else {
                     uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
                     for (size_t i = 0; i < out_row.field_count; i++) {
-                        if (i > 0) fputc(out_delim, out_stream);
-                        write_csv_field(out_stream, out_row.fields[i].ptr, out_row.fields[i].len, out_delim);
+                        if (i > 0) hp_page_buffer_putc(&pb, out_delim);
+                        write_csv_field_pb(&pb, out_row.fields[i].ptr, out_row.fields[i].len, out_delim);
                     }
-                    fputc('\n', out_stream);
+                    hp_page_buffer_putc(&pb, '\n');
                 }
 
                 tc->stats.rows_emitted++;
-
                 src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
             }
 
-            if (!made_progress && is_eof) {
-                break;
+            if (!made_progress) {
+                if (is_eof) break;
+                err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
+                if (err != HP_OK) {
+                    hp_page_buffer_flush(&pb);
+                    return err;
+                }
+                tc->stats.bytes_in += bytes_read;
             }
         }
     } else if (tc->config.in_format == HP_FORMAT_NDJSON) {
-        /* NDJSON input stream -> parse line by line */
-        char line_buf[64 * 1024];
         char val_arena[64 * 1024];
+        char line_buf[64 * 1024];
 
-        while (fgets(line_buf, sizeof(line_buf), in_stream)) {
-            size_t llen = strlen(line_buf);
-            tc->stats.bytes_in += llen;
+        while (1) {
+            src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+            if (available == 0) {
+                if (tc->ring_buf.eof_reached) break;
+                err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
+                if (err != HP_OK) {
+                    hp_page_buffer_flush(&pb);
+                    return err;
+                }
+                tc->stats.bytes_in += bytes_read;
+                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                if (available == 0 && tc->ring_buf.eof_reached) break;
+            }
 
-            hp_row_t raw_row;
-            hp_error_t err = hp_json_parse_line(line_buf, llen, &tc->in_header, &raw_row, val_arena, sizeof(val_arena));
-            if (err != HP_OK) continue;
+            bool is_eof = tc->ring_buf.eof_reached;
+            bool made_progress = false;
 
-            if (!header_processed) {
+            while (available > 0) {
+                const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
+                if (!nl && !is_eof) {
+                    break;
+                }
+
+                size_t line_len = nl ? (size_t)(nl - src + 1) : available;
+                if (line_len >= sizeof(line_buf)) {
+                    hp_page_buffer_flush(&pb);
+                    return HP_ERR_BUFFER_OVERFLOW;
+                }
+
+                memcpy(line_buf, src, line_len);
+                line_buf[line_len] = '\0';
+
+                hp_sliding_buffer_consume(&tc->ring_buf, line_len);
+                made_progress = true;
+
+                size_t trimmed_len = line_len;
+                while (trimmed_len > 0 && (line_buf[trimmed_len - 1] == '\r' || line_buf[trimmed_len - 1] == '\n' || line_buf[trimmed_len - 1] == ' ')) {
+                    line_buf[--trimmed_len] = '\0';
+                }
+
+                if (trimmed_len == 0) {
+                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    continue;
+                }
+
+                hp_row_t raw_row;
+                hp_error_t jerr = hp_json_parse_line(line_buf, trimmed_len, &tc->in_header, &raw_row, val_arena, sizeof(val_arena));
+                if (jerr != HP_OK) {
+                    if (tc->config.on_error == HP_ON_ERROR_FAIL) {
+                        hp_page_buffer_flush(&pb);
+                        return jerr;
+                    }
+                    if (tc->quarantine_file) {
+                        fwrite(line_buf, 1, line_len, tc->quarantine_file);
+                    }
+                    tc->stats.rows_dropped++;
+                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    continue;
+                }
+
+                if (!header_processed) {
+                    if (tc->projection.active) {
+                        hp_projection_bind(&tc->projection, &tc->in_header);
+                        hp_project_header(&tc->projection, &tc->in_header, &tc->out_header);
+                    } else {
+                        tc->out_header.count = 0;
+                        for (size_t i = 0; i < tc->in_header.count; i++) {
+                            tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
+                        }
+                    }
+                    if (tc->filter.count > 0) {
+                        hp_filter_bind(&tc->filter, &tc->in_header);
+                    }
+                    header_processed = true;
+
+                    if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
+                        uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
+                        for (size_t i = 0; i < tc->out_header.count; i++) {
+                            if (i > 0) hp_page_buffer_putc(&pb, out_delim);
+                            write_csv_field_pb(&pb, tc->out_header.names[i], strlen(tc->out_header.names[i]), out_delim);
+                        }
+                        hp_page_buffer_putc(&pb, '\n');
+                    }
+                }
+
+                tc->stats.rows_read++;
+                if (!hp_filter_matches(&tc->filter, &raw_row)) {
+                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    continue;
+                }
+
+                hp_row_t out_row;
                 if (tc->projection.active) {
-                    hp_projection_bind(&tc->projection, &tc->in_header);
-                    hp_project_header(&tc->projection, &tc->in_header, &tc->out_header);
+                    hp_project_row(&tc->projection, &raw_row, &out_row);
                 } else {
-                    tc->out_header.count = 0;
-                    for (size_t i = 0; i < tc->in_header.count; i++) {
-                        tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
-                    }
+                    out_row = raw_row;
                 }
-                if (tc->filter.count > 0) {
-                    hp_filter_bind(&tc->filter, &tc->in_header);
-                }
-                header_processed = true;
 
-                if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
+                if (tc->config.out_format == HP_FORMAT_NDJSON) {
+                    const char *line = NULL;
+                    size_t out_line_len = 0;
+                    err = hp_json_ser_row(&tc->json_ser, &tc->out_header, &out_row, &line, &out_line_len);
+                    if (err != HP_OK) {
+                        hp_page_buffer_flush(&pb);
+                        return err;
+                    }
+                    hp_page_buffer_write(&pb, line, out_line_len);
+                    tc->stats.bytes_out += out_line_len;
+                } else {
                     uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                    for (size_t i = 0; i < tc->out_header.count; i++) {
-                        if (i > 0) fputc(out_delim, out_stream);
-                        write_csv_field(out_stream, tc->out_header.names[i], strlen(tc->out_header.names[i]), out_delim);
+                    for (size_t i = 0; i < out_row.field_count; i++) {
+                        if (i > 0) hp_page_buffer_putc(&pb, out_delim);
+                        write_csv_field_pb(&pb, out_row.fields[i].ptr, out_row.fields[i].len, out_delim);
                     }
-                    fputc('\n', out_stream);
+                    hp_page_buffer_putc(&pb, '\n');
                 }
+                tc->stats.rows_emitted++;
+                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
             }
 
-            tc->stats.rows_read++;
-            if (!hp_filter_matches(&tc->filter, &raw_row)) continue;
-
-            hp_row_t out_row;
-            if (tc->projection.active) {
-                hp_project_row(&tc->projection, &raw_row, &out_row);
-            } else {
-                out_row = raw_row;
-            }
-
-            if (tc->config.out_format == HP_FORMAT_NDJSON) {
-                const char *line = NULL;
-                size_t line_len = 0;
-                err = hp_json_ser_row(&tc->json_ser, &tc->out_header, &out_row, &line, &line_len);
-                if (err != HP_OK) return err;
-                fwrite(line, 1, line_len, out_stream);
-                tc->stats.bytes_out += line_len;
-            } else {
-                uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                for (size_t i = 0; i < out_row.field_count; i++) {
-                    if (i > 0) fputc(out_delim, out_stream);
-                    write_csv_field(out_stream, out_row.fields[i].ptr, out_row.fields[i].len, out_delim);
+            if (!made_progress) {
+                if (is_eof) break;
+                err = hp_sliding_buffer_refill(&tc->ring_buf, in_stream, &bytes_read);
+                if (err != HP_OK) {
+                    hp_page_buffer_flush(&pb);
+                    return err;
                 }
-                fputc('\n', out_stream);
+                tc->stats.bytes_in += bytes_read;
             }
-            tc->stats.rows_emitted++;
         }
     }
 
+    hp_page_buffer_flush(&pb);
     double t1 = get_time_sec();
     tc->stats.elapsed_seconds = t1 - t0;
     return HP_OK;

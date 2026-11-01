@@ -41,6 +41,12 @@ typedef enum hp_format_e {
     HP_FORMAT_NDJSON = 3
 } hp_format_t;
 
+typedef enum hp_on_error_e {
+    HP_ON_ERROR_FAIL = 0,
+    HP_ON_ERROR_SKIP = 1,
+    HP_ON_ERROR_QUARANTINE = 2
+} hp_on_error_t;
+
 typedef enum hp_simd_mode_e {
     HP_SIMD_AUTO = 0,
     HP_SIMD_SCALAR = 1,

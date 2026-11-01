@@ -1,88 +1,143 @@
-# HyperPipe Architecture & Engineering Specification
+# HyperPipe Architecture & Systems Specification
 
 ## 1. Overview
-HyperPipe is an $O(1)$ memory streaming structured data transcoder and in-flight filter (CSV <-> NDJSON, TSV <-> NDJSON) written in ISO C11 with dynamic runtime vector acceleration (AVX-512BW/VL, AVX2, BMI2, and scalar fallback).
+HyperPipe is a bounded $O(1)$ memory streaming structured data transcoder and in-flight projection/filtering engine written in pure ISO C11 with dynamic runtime vector acceleration (AVX-512BW/VL, AVX2, BMI2, and scalar fallback).
 
 ---
 
 ## 2. Sliding Linear Ring Buffer ($O(1)$ RSS Guarantee)
 
-Traditional circular buffers present non-contiguous wrap-arounds that break vector loads, forcing branchy split-register handling. HyperPipe uses a **Sliding Linear Window with Zero-Copy Vector Padding**:
+Traditional circular buffers suffer from non-contiguous wrap-around boundaries that break SIMD vector loads, forcing branchy split-register handling. HyperPipe solves this using a **Sliding Linear Window with Zero-Copy Vector Padding**:
 
-```
-+---------------------------+-----------------------------------+--------------------+-----------------+
-| Parsed & Consumed Prefix  |      Active Readable Window       | Free Space (Tail)  | SIMD Tail Guard |
-|                           |                                   |                    |    (64 Bytes)   |
-+---------------------------+-----------------------------------+--------------------+-----------------+
-0                           ^ head                              ^ tail               ^ capacity
-                            |<-------- Linear Span ------------>|
+```mermaid
+flowchart LR
+    subgraph MemoryBuffer["Continuous 64 KB Memory Buffer"]
+        direction LR
+        A["Prefix (0..head)<br/>Parsed & Consumed"] --> B["Active Window (head..tail)<br/>Contiguous Vector Scan Span"]
+        B --> C["Tail Free Space (tail..cap)<br/>Zero-Copy DMA/fread Target"]
+        C --> D["Tail Guard Zone (64 Bytes)<br/>Zero-Padded SIMD Safety Overrun"]
+    end
 ```
 
-### Sliding Operation (Zero Allocation)
-1. Active data is processed contiguously between `head` and `tail`.
-2. When `head > 0` and additional stream data is required, `memmove(data, data + head, tail - head)` slides unparsed bytes back to index 0 in a single memory operation.
-3. `head` is reset to 0, `tail` becomes `active_len`.
-4. Free space from `tail` to `capacity` is refilled directly via `fread`.
-5. 64 trailing safety bytes are zeroed to prevent vector load faults (`_mm512_loadu_si512`) past buffer bounds.
-6. Memory usage is bounded by `capacity + 64` (default 64 KB, peak RSS < 5 MB regardless of stream length).
+### Sliding Window Lifecycle (Zero Allocation)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Stream as Input Stream (Pipe/Disk)
+    participant Buffer as Sliding Linear Ring Buffer
+    participant Parser as Vectorized SIMD Scanner
+    
+    Stream->>Buffer: Initial block read (fread into tail free space)
+    loop Continuous Streaming
+        Buffer->>Parser: Zero-copy pointer to contiguous active window
+        Parser->>Parser: Vectorized delimiter & quote scanning
+        Parser->>Buffer: Consume parsed row bytes (advance head)
+        alt Active Window Low (head > 0)
+            Buffer->>Buffer: memmove(data, data + head, tail - head)
+            Note over Buffer: Reset head to 0, slide unconsumed bytes to base
+            Stream->>Buffer: fread fills free space (tail to capacity)
+            Buffer->>Buffer: memset 64 trailing bytes to 0 (SIMD guard)
+        end
+    end
+```
 
 ---
 
 ## 3. Vectorized CSV Scanner State Machine
 
-### AVX2 Kernel (32 Bytes / Cycle)
-```
-Input Stream (32 Bytes)
-         │
-         ▼
- _mm256_loadu_si256
-         │
- ┌───────┴───────────────┬───────────────────────┬───────────────────────┐
- │                       │                       │                       │
- _mm256_cmpeq_epi8(',')  _mm256_cmpeq_epi8('"')  _mm256_cmpeq_epi8('\n') _mm256_cmpeq_epi8('\r')
- │                       │                       │                       │
- └───────┬───────────────┴───────────────────────┴───────────────────────┘
-         │
-     _mm256_or_si256
-         │
-         ▼
- _mm256_movemask_epi8  ──►  Bitmask (32 bits)
-                                │
-                                ├─► Mask == 0: 32 bytes plain text (skip 32)
-                                └─► Mask != 0: __builtin_ctz(mask) (jump to delimiter)
+### AVX2 Scanner Pipeline (32 Bytes / Cycle)
+
+```mermaid
+flowchart TD
+    In["Input Stream Chunk (32 Bytes)"] --> Load["_mm256_loadu_si256"]
+    
+    Load --> CmpDelim["_mm256_cmpeq_epi8(',')"]
+    Load --> CmpQuote["_mm256_cmpeq_epi8('\"')"]
+    Load --> CmpLF["_mm256_cmpeq_epi8('\\n')"]
+    Load --> CmpCR["_mm256_cmpeq_epi8('\\r')"]
+    
+    CmpDelim --> OrAll["_mm256_or_si256"]
+    CmpQuote --> OrAll
+    CmpLF --> OrAll
+    CmpCR --> OrAll
+    
+    OrAll --> Movemask["_mm256_movemask_epi8 (Extract 32-bit Mask)"]
+    
+    Movemask --> Check{"Mask == 0 ?"}
+    Check -- Yes --> Skip["Advance 32 Bytes (Zero Branches)"]
+    Check -- No --> CTZ["__builtin_ctz(mask) (Jump Directly to Delimiter)"]
 ```
 
-### AVX-512BW Kernel (64 Bytes / Cycle)
-Zen 4 executes 64-byte vector comparisons returning native `__mmask64` registers:
-```c
-__m512i chunk = _mm512_loadu_si512((const void *)ptr);
-__mmask64 m_delim = _mm512_cmpeq_epi8_mask(chunk, v_delim);
-__mmask64 m_quote = _mm512_cmpeq_epi8_mask(chunk, v_quote);
-__mmask64 m_lf    = _mm512_cmpeq_epi8_mask(chunk, v_lf);
-__mmask64 m_cr    = _mm512_cmpeq_epi8_mask(chunk, v_cr);
-uint64_t mask = (uint64_t)(m_delim | m_quote | m_lf | m_cr);
+### AVX-512BW Scanner Pipeline (64 Bytes / Cycle)
+
+Zen 4 and modern Xeon architectures execute 64-byte vector comparisons returning native `__mmask64` registers:
+
+```mermaid
+flowchart TD
+    Chunk["Input Stream Chunk (64 Bytes)"] --> Load512["_mm512_loadu_si512"]
+    
+    Load512 --> M1["_mm512_cmpeq_epi8_mask(chunk, v_delim)"]
+    Load512 --> M2["_mm512_cmpeq_epi8_mask(chunk, v_quote)"]
+    Load512 --> M3["_mm512_cmpeq_epi8_mask(chunk, v_lf)"]
+    Load512 --> M4["_mm512_cmpeq_epi8_mask(chunk, v_cr)"]
+    
+    M1 --> BitwiseOr["Bitwise OR on k-registers (m1 | m2 | m3 | m4)"]
+    M2 --> BitwiseOr
+    M3 --> BitwiseOr
+    M4 --> BitwiseOr
+    
+    BitwiseOr --> Mask64["64-bit Combined Mask"]
+    Mask64 --> BranchlessJump["_tzcnt_u64(mask) -> Direct Opcode Dispatch"]
 ```
 
 ---
 
-## 4. Vectorized JSON String Escape Scanner
+## 4. Fault-Tolerant Streaming State Machine
 
-JSON string serialization bottleneck is scanning each byte for `"`, `\`, and control characters (`< 0x20`).
-HyperPipe vectorizes this with unsigned saturating subtraction and bitmask tests:
-
+```mermaid
+stateDiagram-v2
+    [*] --> SniffFormat
+    SniffFormat --> StreamIngest: Auto-Sniff Delimiters & Headers
+    
+    state StreamIngest {
+        [*] --> ParseRow
+        ParseRow --> ValidateRow: Check Syntax & Escape Boundaries
+        ValidateRow --> InFlightFilter: Valid Row
+        InFlightFilter --> PageBufferOutput: Predicate Match
+        InFlightFilter --> ParseRow: Filter Reject
+        
+        ValidateRow --> ErrorDispatch: Malformed / Corrupt Row
+        state ErrorDispatch <<choice>>
+        ErrorDispatch --> Abort: on-error fail
+        ErrorDispatch --> ForwardSync: on-error skip / quarantine
+        ForwardSync --> WriteQuarantine: quarantine path configured
+        WriteQuarantine --> ResyncNewline: Write Raw Line
+        ForwardSync --> ResyncNewline: on-error skip
+        ResyncNewline --> ParseRow: SIMD search for next '\\n'
+    }
+    
+    PageBufferOutput --> FlushOutput: Buffer Full (64 KB)
+    FlushOutput --> [*]: Stream EOF
 ```
-  AVX2 Branchless Escape Detection:
-  under_32 = _mm256_cmpeq_epi8(_mm256_subs_epu8(chunk, 31), _mm256_setzero_si256());
-  is_quote = _mm256_cmpeq_epi8(chunk, '"');
-  is_slash = _mm256_cmpeq_epi8(chunk, '\\');
-  escapes  = is_quote | is_slash | under_32;
-```
-If `escapes == 0`, all 32 bytes are copied directly via `memcpy` without per-byte character inspection.
 
 ---
 
 ## 5. Dynamic Runtime CPUID Dispatch
-CPU capabilities are queried once at startup:
-- Leaf 1 & Leaf 7: AVX2, BMI2, AVX-512F, AVX-512BW, AVX-512VL.
-- XCR0 register: OS vector state support.
-- Function pointers in `g_hp_dispatch` are populated once with optimal SIMD or fallback scalar routines.
+
+CPU capabilities are detected once at process initialization:
+
+```mermaid
+flowchart TD
+    Init["hp_dispatch_init()"] --> CPUID["cpuid(EAX=1, EAX=7)"]
+    CPUID --> XCR0["_xgetbv(0) -> OS Vector Support Check"]
+    
+    XCR0 --> Branch{"Features Enabled?"}
+    Branch -- "AVX-512F + BW + VL & OS State" --> Select512["Select AVX-512BW Engine (64B/cycle)"]
+    Branch -- "AVX2 + BMI2 & OS State" --> Select256["Select AVX2 Engine (32B/cycle)"]
+    Branch -- Fallback --> SelectScalar["Select Pure C11 Scalar Fallback"]
+    
+    Select512 --> Table["Populate g_hp_dispatch Function Pointers"]
+    Select256 --> Table
+    SelectScalar --> Table
+```

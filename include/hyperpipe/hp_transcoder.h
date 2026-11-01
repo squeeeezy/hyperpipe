@@ -12,6 +12,8 @@ typedef struct hp_transcoder_config_s {
     hp_format_t in_format;
     hp_format_t out_format;
     hp_simd_mode_t simd_mode;
+    hp_on_error_t on_error;
+    const char *quarantine_path;
     const char *select_spec;
     const char *where_spec;
     size_t buffer_capacity;
@@ -20,6 +22,7 @@ typedef struct hp_transcoder_config_s {
 typedef struct hp_transcoder_stats_s {
     uint64_t rows_read;
     uint64_t rows_emitted;
+    uint64_t rows_dropped;
     uint64_t bytes_in;
     uint64_t bytes_out;
     double elapsed_seconds;
@@ -35,10 +38,14 @@ typedef struct hp_transcoder_s {
     hp_header_t in_header;
     hp_header_t out_header;
     hp_transcoder_stats_t stats;
+    FILE *quarantine_file;
 } hp_transcoder_t;
 
 hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg);
 void hp_transcoder_free(hp_transcoder_t *tc);
+
+/* Sniff format from sample bytes */
+hp_format_t hp_sniff_format(const uint8_t *sample, size_t len);
 
 /* Run streaming transcoding from in_stream to out_stream */
 hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream);
