@@ -1,5 +1,6 @@
 #include "hyperpipe/hp_transcoder.h"
 #include <time.h>
+#include <ctype.h>
 
 #if defined(_WIN32)
     #include <windows.h>

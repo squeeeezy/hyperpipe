@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #if defined(_MSC_VER)
     #define HP_ALIGNED(n) __declspec(align(n))
