@@ -102,9 +102,19 @@ hp_error_t hp_json_ser_write_string(hp_json_ser_t *ser, const char *str, size_t 
 static bool is_valid_json_number(const char *s, size_t len) {
     if (len == 0) return false;
     size_t i = 0;
-    if (s[i] == '-') i++;
+    if (s[0] == '-') i++;
     if (i >= len) return false;
 
+    /* Fast path for unsigned and signed integers */
+    size_t digits_start = i;
+    while (i < len && (uint8_t)(s[i] - '0') <= 9) i++;
+    if (i == len && i > digits_start) {
+        if (s[digits_start] == '0' && (len - digits_start) > 1) return false;
+        return true;
+    }
+
+    /* Reset and check full floating-point specification */
+    i = (s[0] == '-') ? 1 : 0;
     if (s[i] == '0') {
         i++;
     } else if (s[i] >= '1' && s[i] <= '9') {
@@ -137,16 +147,19 @@ hp_error_t hp_json_ser_row(hp_json_ser_t *ser,
     if (!ser || !row) return HP_ERR_INVALID_ARG;
     hp_json_ser_reset(ser);
 
-    hp_error_t err = hp_json_ser_grow(ser, 2);
+    /* Pre-calculate upper bound size to grow buffer once per row */
+    size_t est_size = 32;
+    size_t count = row->field_count;
+    for (size_t i = 0; i < count; i++) {
+        est_size += row->fields[i].len * 2 + 32;
+    }
+    hp_error_t err = hp_json_ser_grow(ser, est_size);
     if (err != HP_OK) return err;
 
     ser->out_buf[ser->pos++] = '{';
 
-    size_t count = row->field_count;
     for (size_t i = 0; i < count; i++) {
         if (i > 0) {
-            err = hp_json_ser_grow(ser, 1);
-            if (err != HP_OK) return err;
             ser->out_buf[ser->pos++] = ',';
         }
 
@@ -158,33 +171,26 @@ hp_error_t hp_json_ser_row(hp_json_ser_t *ser,
             key = default_key;
         }
 
-        err = hp_json_ser_write_string(ser, key, strlen(key));
-        if (err != HP_OK) return err;
-
-        err = hp_json_ser_grow(ser, 1);
-        if (err != HP_OK) return err;
+        /* Fast key emit */
+        ser->out_buf[ser->pos++] = '"';
+        size_t key_len = strlen(key);
+        memcpy(ser->out_buf + ser->pos, key, key_len);
+        ser->pos += key_len;
+        ser->out_buf[ser->pos++] = '"';
         ser->out_buf[ser->pos++] = ':';
 
         /* Write value */
         const hp_str_t *f = &row->fields[i];
         if (!f->has_escapes && is_valid_json_number(f->ptr, f->len)) {
-            err = hp_json_ser_grow(ser, f->len);
-            if (err != HP_OK) return err;
             memcpy(ser->out_buf + ser->pos, f->ptr, f->len);
             ser->pos += f->len;
         } else if (!f->has_escapes && f->len == 4 && memcmp(f->ptr, "true", 4) == 0) {
-            err = hp_json_ser_grow(ser, 4);
-            if (err != HP_OK) return err;
             memcpy(ser->out_buf + ser->pos, "true", 4);
             ser->pos += 4;
         } else if (!f->has_escapes && f->len == 5 && memcmp(f->ptr, "false", 5) == 0) {
-            err = hp_json_ser_grow(ser, 5);
-            if (err != HP_OK) return err;
             memcpy(ser->out_buf + ser->pos, "false", 5);
             ser->pos += 5;
         } else if (!f->has_escapes && f->len == 4 && memcmp(f->ptr, "null", 4) == 0) {
-            err = hp_json_ser_grow(ser, 4);
-            if (err != HP_OK) return err;
             memcpy(ser->out_buf + ser->pos, "null", 4);
             ser->pos += 4;
         } else {
@@ -193,8 +199,6 @@ hp_error_t hp_json_ser_row(hp_json_ser_t *ser,
         }
     }
 
-    err = hp_json_ser_grow(ser, 2);
-    if (err != HP_OK) return err;
     ser->out_buf[ser->pos++] = '}';
     ser->out_buf[ser->pos++] = '\n';
 

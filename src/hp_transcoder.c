@@ -18,25 +18,26 @@
 #endif
 
 typedef struct hp_page_buffer_s {
-    uint8_t data[65536];
+    uint8_t *data;
+    size_t cap;
     size_t len;
     FILE *stream;
 } hp_page_buffer_t;
 
 HP_INLINE void hp_page_buffer_flush(hp_page_buffer_t *pb) {
-    if (pb->len > 0) {
+    if (pb && pb->len > 0) {
         fwrite(pb->data, 1, pb->len, pb->stream);
         pb->len = 0;
     }
 }
 
 HP_INLINE void hp_page_buffer_write(hp_page_buffer_t *pb, const void *src, size_t size) {
-    if (size >= sizeof(pb->data)) {
+    if (size >= pb->cap) {
         hp_page_buffer_flush(pb);
         fwrite(src, 1, size, pb->stream);
         return;
     }
-    if (pb->len + size > sizeof(pb->data)) {
+    if (pb->len + size > pb->cap) {
         hp_page_buffer_flush(pb);
     }
     memcpy(pb->data + pb->len, src, size);
@@ -44,7 +45,7 @@ HP_INLINE void hp_page_buffer_write(hp_page_buffer_t *pb, const void *src, size_
 }
 
 HP_INLINE void hp_page_buffer_putc(hp_page_buffer_t *pb, uint8_t ch) {
-    if (pb->len >= sizeof(pb->data)) {
+    if (pb->len >= pb->cap) {
         hp_page_buffer_flush(pb);
     }
     pb->data[pb->len++] = ch;
@@ -109,6 +110,14 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
     hp_error_t err = hp_sliding_buffer_init(&tc->ring_buf, cap);
     if (err != HP_OK) return err;
 
+    /* Allocate 2 MiB page buffer for high-throughput batch writes */
+    tc->page_buf_cap = 2 * 1024 * 1024;
+    tc->page_buf_data = (uint8_t *)malloc(tc->page_buf_cap);
+    if (!tc->page_buf_data) {
+        hp_sliding_buffer_free(&tc->ring_buf);
+        return HP_ERR_NOMEM;
+    }
+
     /* Initialize SIMD runtime dispatch */
     hp_dispatch_init(cfg->simd_mode);
 
@@ -116,12 +125,16 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
     err = hp_csv_parser_init(&tc->csv_parser, parser_fmt, cfg->simd_mode);
     if (err != HP_OK) {
         hp_sliding_buffer_free(&tc->ring_buf);
+        free(tc->page_buf_data);
+        tc->page_buf_data = NULL;
         return err;
     }
 
     err = hp_json_ser_init(&tc->json_ser, 4096, cfg->simd_mode);
     if (err != HP_OK) {
         hp_sliding_buffer_free(&tc->ring_buf);
+        free(tc->page_buf_data);
+        tc->page_buf_data = NULL;
         return err;
     }
 
@@ -139,6 +152,8 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
         if (!tc->quarantine_file) {
             hp_sliding_buffer_free(&tc->ring_buf);
             hp_json_ser_free(&tc->json_ser);
+            free(tc->page_buf_data);
+            tc->page_buf_data = NULL;
             return HP_ERR_IO;
         }
     }
@@ -152,6 +167,10 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
     hp_json_ser_free(&tc->json_ser);
     hp_header_free(&tc->in_header);
     hp_header_free(&tc->out_header);
+    if (tc->page_buf_data) {
+        free(tc->page_buf_data);
+        tc->page_buf_data = NULL;
+    }
     if (tc->quarantine_file) {
         fclose(tc->quarantine_file);
         tc->quarantine_file = NULL;
@@ -165,6 +184,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     bool header_processed = false;
 
     hp_page_buffer_t pb;
+    pb.data = tc->page_buf_data;
+    pb.cap = tc->page_buf_cap;
     pb.len = 0;
     pb.stream = out_stream;
 
@@ -231,7 +252,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     hp_sliding_buffer_consume(&tc->ring_buf, skip);
                     tc->stats.rows_dropped++;
                     made_progress = true;
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += skip;
+                    available -= skip;
                     continue;
                 }
 
@@ -244,7 +266,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 made_progress = true;
 
                 if (raw_row.field_count == 0) {
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += consumed;
+                    available -= consumed;
                     continue;
                 }
 
@@ -285,7 +308,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                         hp_page_buffer_putc(&pb, '\n');
                     }
 
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += consumed;
+                    available -= consumed;
                     continue;
                 }
 
@@ -293,7 +317,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                 /* Apply predicate filter */
                 if (!hp_filter_matches(&tc->filter, &raw_row)) {
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += consumed;
+                    available -= consumed;
                     continue;
                 }
 
@@ -327,7 +352,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 }
 
                 tc->stats.rows_emitted++;
-                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                src += consumed;
+                available -= consumed;
             }
 
             if (!made_progress) {
@@ -379,32 +405,35 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 hp_sliding_buffer_consume(&tc->ring_buf, line_len);
                 made_progress = true;
 
-                size_t trimmed_len = line_len;
-                while (trimmed_len > 0 && (line_buf[trimmed_len - 1] == '\r' || line_buf[trimmed_len - 1] == '\n' || line_buf[trimmed_len - 1] == ' ')) {
-                    line_buf[--trimmed_len] = '\0';
+                /* Strip trailing CR/LF for parsing */
+                size_t strip_len = line_len;
+                while (strip_len > 0 && (line_buf[strip_len - 1] == '\r' || line_buf[strip_len - 1] == '\n' || isspace((unsigned char)line_buf[strip_len - 1]))) {
+                    line_buf[--strip_len] = '\0';
                 }
 
-                if (trimmed_len == 0) {
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                if (strip_len == 0) {
+                    src += line_len;
+                    available -= line_len;
                     continue;
                 }
 
                 hp_row_t raw_row;
-                hp_error_t jerr = hp_json_parse_line(line_buf, trimmed_len, &tc->in_header, &raw_row, val_arena, sizeof(val_arena));
-                if (jerr != HP_OK) {
+                err = hp_json_parse_line(line_buf, strip_len, &tc->in_header, &raw_row, val_arena, sizeof(val_arena));
+                if (err != HP_OK) {
                     if (tc->config.on_error == HP_ON_ERROR_FAIL) {
                         hp_page_buffer_flush(&pb);
-                        return jerr;
+                        return err;
                     }
                     if (tc->quarantine_file) {
                         fwrite(line_buf, 1, line_len, tc->quarantine_file);
                     }
                     tc->stats.rows_dropped++;
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += line_len;
+                    available -= line_len;
                     continue;
                 }
 
-                if (!header_processed) {
+                if (!header_processed && tc->in_header.count > 0) {
                     if (tc->projection.active) {
                         hp_projection_bind(&tc->projection, &tc->in_header);
                         hp_project_header(&tc->projection, &tc->in_header, &tc->out_header);
@@ -414,9 +443,11 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                             tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
                         }
                     }
+
                     if (tc->filter.count > 0) {
                         hp_filter_bind(&tc->filter, &tc->in_header);
                     }
+
                     header_processed = true;
 
                     if (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) {
@@ -430,8 +461,10 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 }
 
                 tc->stats.rows_read++;
+
                 if (!hp_filter_matches(&tc->filter, &raw_row)) {
-                    src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                    src += line_len;
+                    available -= line_len;
                     continue;
                 }
 
@@ -461,7 +494,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     hp_page_buffer_putc(&pb, '\n');
                 }
                 tc->stats.rows_emitted++;
-                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
+                src += line_len;
+                available -= line_len;
             }
 
             if (!made_progress) {

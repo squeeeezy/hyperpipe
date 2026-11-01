@@ -18,8 +18,11 @@ typedef struct hp_predicate_s {
     int64_t col_index;
     hp_pred_op_t op;
     char str_val[256];
+    size_t str_val_len;
     double num_val;
+    int64_t int_val;
     bool is_num;
+    bool is_int;
 } hp_predicate_t;
 
 #define HP_MAX_PREDICATES 16

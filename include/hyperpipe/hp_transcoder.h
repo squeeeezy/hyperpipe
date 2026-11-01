@@ -39,6 +39,8 @@ typedef struct hp_transcoder_s {
     hp_header_t out_header;
     hp_transcoder_stats_t stats;
     FILE *quarantine_file;
+    uint8_t *page_buf_data;
+    size_t page_buf_cap;
 } hp_transcoder_t;
 
 hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg);
