@@ -86,16 +86,47 @@ static void run_benchmark_run(const char *csv_file, hp_simd_mode_t simd, const c
 }
 
 int main(int argc, char **argv) {
-    size_t rows = 500000; /* 500k rows default for quick run, user can supply N */
+    const char *test_csv = NULL;
+    int is_temp_file = 0;
+
+    static const char *default_real_paths[] = {
+        "hyperpipe/data/nasa_server_access_log.csv",
+        "../data/nasa_server_access_log.csv",
+        "data/nasa_server_access_log.csv",
+        NULL
+    };
+
     if (argc > 1) {
-        rows = (size_t)strtoull(argv[1], NULL, 10);
+        FILE *f = fopen(argv[1], "rb");
+        if (f) {
+            fclose(f);
+            test_csv = argv[1];
+        } else {
+            size_t rows = (size_t)strtoull(argv[1], NULL, 10);
+            if (rows == 0) rows = 500000;
+            test_csv = "bench_input.csv";
+            generate_test_csv(test_csv, rows);
+            is_temp_file = 1;
+        }
+    } else {
+        /* Auto-discover authentic production dataset if present */
+        for (int i = 0; default_real_paths[i]; i++) {
+            FILE *f = fopen(default_real_paths[i], "rb");
+            if (f) {
+                fclose(f);
+                test_csv = default_real_paths[i];
+                break;
+            }
+        }
+        if (!test_csv) {
+            test_csv = "bench_input.csv";
+            generate_test_csv(test_csv, 500000);
+            is_temp_file = 1;
+        }
     }
 
-    const char *test_csv = "bench_input.csv";
-    generate_test_csv(test_csv, rows);
-
     printf("\n=========================================================================================\n");
-    printf(" HyperPipe SIMD Streaming Transcoder Benchmark (AMD Zen 4 Ryzen 5 7600X)\n");
+    printf(" HyperPipe SIMD Streaming Transcoder Benchmark (Dataset: %s)\n", test_csv);
     printf("=========================================================================================\n");
     printf("  Kernel       |  Elapsed  |   Throughput  |   Throughput |    Row Rate   | Peak Memory RSS\n");
     printf("---------------+-----------+---------------+--------------+---------------+----------------\n");
@@ -105,6 +136,8 @@ int main(int argc, char **argv) {
     run_benchmark_run(test_csv, HP_SIMD_AVX512, "AVX-512");
 
     printf("=========================================================================================\n");
-    remove(test_csv);
+    if (is_temp_file) {
+        remove(test_csv);
+    }
     return 0;
 }
