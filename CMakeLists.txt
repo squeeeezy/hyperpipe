@@ -8,7 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/W4 /WX /O2)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3)
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3 -march=native)
 endif()
 
 include_directories(include)

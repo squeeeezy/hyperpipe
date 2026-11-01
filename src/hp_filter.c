@@ -31,7 +31,6 @@ hp_error_t hp_projection_bind(hp_projection_t *proj, const hp_header_t *header) 
     if (!header) return HP_ERR_INVALID_ARG;
 
     for (size_t i = 0; i < proj->count; i++) {
-        /* Check if column name is an integer index */
         char *endptr = NULL;
         long idx = strtol(proj->col_names[i], &endptr, 10);
         if (endptr != proj->col_names[i] && *endptr == '\0') {
@@ -61,7 +60,6 @@ hp_error_t hp_project_row(const hp_projection_t *proj, const hp_row_t *src, hp_r
         if (col_idx >= 0 && (size_t)col_idx < src->field_count) {
             dst->fields[dst->field_count++] = src->fields[col_idx];
         } else {
-            /* Missing column: emit empty field */
             dst->fields[dst->field_count].ptr = "";
             dst->fields[dst->field_count].len = 0;
             dst->fields[dst->field_count].has_escapes = false;
@@ -97,7 +95,6 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) break;
 
-        /* Parse column name */
         const char *col_start = p;
         while (*p && !isspace((unsigned char)*p) && *p != '=' && *p != '!' && *p != '<' && *p != '>') p++;
         size_t col_len = p - col_start;
@@ -111,7 +108,6 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
 
         while (*p && isspace((unsigned char)*p)) p++;
 
-        /* Parse operator */
         if (strncmp(p, "==", 2) == 0) {
             pred->op = HP_OP_EQ;
             p += 2;
@@ -139,10 +135,8 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
 
         while (*p && isspace((unsigned char)*p)) p++;
 
-        /* Parse value */
         const char *val_start = p;
         if (*p == '"') {
-            /* Quoted value */
             p++;
             val_start = p;
             while (*p && *p != '"') p++;
@@ -155,7 +149,6 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
             pred->is_num = false;
             pred->is_int = false;
         } else {
-            /* Unquoted value */
             while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
             size_t val_len = p - val_start;
             if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
@@ -163,7 +156,6 @@ hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
             pred->str_val[val_len] = '\0';
             pred->str_val_len = val_len;
 
-            /* Check if integer */
             bool is_int = false;
             if (val_len > 0) {
                 size_t k = 0;
@@ -239,7 +231,16 @@ HP_HOT bool hp_filter_matches(const hp_filter_t *filter, const hp_row_t *row) {
         size_t len = f->len;
 
         if (pred->is_int) {
-            /* Fast inline integer parsing directly from field pointer without string copy */
+            if (pred->op == HP_OP_EQ) {
+                if (len == pred->str_val_len && memcmp(ptr, pred->str_val, len) == 0) {
+                    continue;
+                }
+            } else if (pred->op == HP_OP_NEQ) {
+                if (len == pred->str_val_len && memcmp(ptr, pred->str_val, len) == 0) {
+                    return false;
+                }
+            }
+
             if (len == 0 || len > 19) return false;
             size_t k = 0;
             bool neg = false;
@@ -285,7 +286,6 @@ HP_HOT bool hp_filter_matches(const hp_filter_t *filter, const hp_row_t *row) {
                 default: return false;
             }
         } else {
-            /* Zero-copy length-gated string comparison */
             if (pred->op == HP_OP_EQ) {
                 if (len != pred->str_val_len || memcmp(ptr, pred->str_val, len) != 0) return false;
             } else if (pred->op == HP_OP_NEQ) {

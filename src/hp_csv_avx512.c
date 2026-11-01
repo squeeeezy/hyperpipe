@@ -76,11 +76,13 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
     }
 
     size_t pos = 0;
-    while (pos < len && (src[pos] == '\r' || src[pos] == '\n')) pos++;
-    if (pos >= len) {
-        *consumed = pos;
-        out_row->field_count = 0;
-        return HP_OK;
+    if (__builtin_expect(src[0] == '\r' || src[0] == '\n', 0)) {
+        while (pos < len && (src[pos] == '\r' || src[pos] == '\n')) pos++;
+        if (pos >= len) {
+            *consumed = pos;
+            out_row->field_count = 0;
+            return HP_OK;
+        }
     }
 
     const uint8_t *p = src + pos;
@@ -110,7 +112,7 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
     uint64_t cr0 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk0, v_cr);
     uint64_t end0 = lf0 | cr0;
 
-    out_row->field_count = 0;
+    size_t fc = 0;
     size_t field_start = 0;
 
     if (end0 != 0) {
@@ -119,18 +121,19 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
 
         while (delims) {
             uint32_t d_idx = (uint32_t)__builtin_ctzll(delims);
-            out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-            out_row->fields[out_row->field_count].len = d_idx - field_start;
-            out_row->fields[out_row->field_count].has_escapes = false;
-            out_row->field_count++;
+            out_row->fields[fc].ptr = (const char *)(p + field_start);
+            out_row->fields[fc].len = d_idx - field_start;
+            out_row->fields[fc].has_escapes = false;
+            fc++;
             field_start = d_idx + 1;
             delims &= delims - 1;
         }
 
-        out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-        out_row->fields[out_row->field_count].len = end_idx - field_start;
-        out_row->fields[out_row->field_count].has_escapes = false;
-        out_row->field_count++;
+        out_row->fields[fc].ptr = (const char *)(p + field_start);
+        out_row->fields[fc].len = end_idx - field_start;
+        out_row->fields[fc].has_escapes = false;
+        fc++;
+        out_row->field_count = fc;
 
         if (p[end_idx] == '\r' && end_idx + 1 < rem && p[end_idx + 1] == '\n') {
             *consumed = pos + end_idx + 2;
@@ -144,10 +147,10 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
     uint64_t delims = d0;
     while (delims) {
         uint32_t d_idx = (uint32_t)__builtin_ctzll(delims);
-        out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-        out_row->fields[out_row->field_count].len = d_idx - field_start;
-        out_row->fields[out_row->field_count].has_escapes = false;
-        out_row->field_count++;
+        out_row->fields[fc].ptr = (const char *)(p + field_start);
+        out_row->fields[fc].len = d_idx - field_start;
+        out_row->fields[fc].has_escapes = false;
+        fc++;
         field_start = d_idx + 1;
         delims &= delims - 1;
     }
@@ -169,18 +172,19 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
 
                 while (delims1) {
                     uint32_t d_idx = 64 + (uint32_t)__builtin_ctzll(delims1);
-                    out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-                    out_row->fields[out_row->field_count].len = d_idx - field_start;
-                    out_row->fields[out_row->field_count].has_escapes = false;
-                    out_row->field_count++;
+                    out_row->fields[fc].ptr = (const char *)(p + field_start);
+                    out_row->fields[fc].len = d_idx - field_start;
+                    out_row->fields[fc].has_escapes = false;
+                    fc++;
                     field_start = d_idx + 1;
                     delims1 &= delims1 - 1;
                 }
 
-                out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-                out_row->fields[out_row->field_count].len = end_idx - field_start;
-                out_row->fields[out_row->field_count].has_escapes = false;
-                out_row->field_count++;
+                out_row->fields[fc].ptr = (const char *)(p + field_start);
+                out_row->fields[fc].len = end_idx - field_start;
+                out_row->fields[fc].has_escapes = false;
+                fc++;
+                out_row->field_count = fc;
 
                 if (p[end_idx] == '\r' && end_idx + 1 < rem && p[end_idx + 1] == '\n') {
                     *consumed = pos + end_idx + 2;
@@ -194,10 +198,10 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
             uint64_t delims1 = d1;
             while (delims1) {
                 uint32_t d_idx = 64 + (uint32_t)__builtin_ctzll(delims1);
-                out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-                out_row->fields[out_row->field_count].len = d_idx - field_start;
-                out_row->fields[out_row->field_count].has_escapes = false;
-                out_row->field_count++;
+                out_row->fields[fc].ptr = (const char *)(p + field_start);
+                out_row->fields[fc].len = d_idx - field_start;
+                out_row->fields[fc].has_escapes = false;
+                fc++;
                 field_start = d_idx + 1;
                 delims1 &= delims1 - 1;
             }
@@ -218,18 +222,19 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
 
                         while (delims2) {
                             uint32_t d_idx = 128 + (uint32_t)__builtin_ctzll(delims2);
-                            out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-                            out_row->fields[out_row->field_count].len = d_idx - field_start;
-                            out_row->fields[out_row->field_count].has_escapes = false;
-                            out_row->field_count++;
+                            out_row->fields[fc].ptr = (const char *)(p + field_start);
+                            out_row->fields[fc].len = d_idx - field_start;
+                            out_row->fields[fc].has_escapes = false;
+                            fc++;
                             field_start = d_idx + 1;
                             delims2 &= delims2 - 1;
                         }
 
-                        out_row->fields[out_row->field_count].ptr = (const char *)(p + field_start);
-                        out_row->fields[out_row->field_count].len = end_idx2 - field_start;
-                        out_row->fields[out_row->field_count].has_escapes = false;
-                        out_row->field_count++;
+                        out_row->fields[fc].ptr = (const char *)(p + field_start);
+                        out_row->fields[fc].len = end_idx2 - field_start;
+                        out_row->fields[fc].has_escapes = false;
+                        fc++;
+                        out_row->field_count = fc;
 
                         if (p[end_idx2] == '\r' && end_idx2 + 1 < rem && p[end_idx2 + 1] == '\n') {
                             *consumed = pos + end_idx2 + 2;
@@ -243,6 +248,7 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
         }
     }
 
+    out_row->field_count = fc;
     hp_error_t err = hp_csv_parse_row_scalar(parser, p, rem, consumed, out_row, is_eof);
     *consumed += pos;
     return err;

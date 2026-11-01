@@ -148,6 +148,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if (in_f) setvbuf(in_f, NULL, _IONBF, 0);
+    if (out_f) setvbuf(out_f, NULL, _IONBF, 0);
 
     /* Configure default output format if not specified */
     if (!user_specified_out_fmt) {

@@ -100,7 +100,8 @@ def main():
         print(f"\n>>> Benchmarking Tier: {tier_name} ({size_mib:.2f} MiB, {rows:,} rows)...", flush=True)
 
         tools = [
-            ("HyperPipe (AVX-512/AVX2)", [HYPERPIPE_EXE, path, "status == 200", "--select", "host,status,bytes", "--on-error", "skip"]),
+            ("HyperPipe (AVX-512 -> CSV)", [HYPERPIPE_EXE, path, "status == 200", "--select", "host,status,bytes", "--to", "csv", "--on-error", "skip"]),
+            ("HyperPipe (AVX-512 -> NDJSON)", [HYPERPIPE_EXE, path, "status == 200", "--select", "host,status,bytes", "--to", "ndjson", "--on-error", "skip"]),
             ("Perl 5.38", [PERL_EXE, "-F,", "-lane", "print \"$F[0],$F[3],$F[4]\" if $F[3] == 200", path]),
             ("GNU awk (gawk 5.0)", [GAWK_EXE, "-F,", "$4 == 200 { print $1 \",\" $4 \",\" $5 }", path]),
             ("Python 3.15 (csv)", [PYTHON_EXE, "-c", f"""
@@ -133,7 +134,12 @@ with open(r'{path}', 'r', newline='') as f:
         print("-" * 100)
         hp_time = tier_res[0]['elapsed']
         for r in tier_res:
-            speedup = f"{r['elapsed'] / hp_time:.1f}x slower" if r['name'] != "HyperPipe (AVX-512/AVX2)" else "1.0x (baseline)"
+            if r['name'] == tier_res[0]['name']:
+                speedup = "1.0x (baseline)"
+            elif "HyperPipe" in r['name']:
+                speedup = f"{r['elapsed'] / hp_time:.2f}x"
+            else:
+                speedup = f"{r['elapsed'] / hp_time:.1f}x slower"
             rss_str = f"{r['peak_rss']:.2f} MB" if r['peak_rss'] > 0 else "< 6 MB"
             print(f" {r['name']:<28} | {r['elapsed']:>7.3f} s  | {r['mib_s']:>9.2f} MiB/s  | {r['mrows_s']:>8.3f} Mrows/s  | {rss_str:>10} | {speedup}")
 

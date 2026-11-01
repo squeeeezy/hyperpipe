@@ -3,7 +3,7 @@
 
 #include "hp_common.h"
 
-#define HP_DEFAULT_BUFFER_CAPACITY (256 * 1024)   /* 256 KiB ultra-compact L2/L3-aligned ring buffer */
+#define HP_DEFAULT_BUFFER_CAPACITY (512 * 1024)   /* 512 KiB L2/L3-aligned ring buffer */
 #define HP_SIMD_PADDING 64                        /* 64 bytes safety padding for AVX-512 loads */
 
 /*
