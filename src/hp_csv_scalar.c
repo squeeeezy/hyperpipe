@@ -31,6 +31,26 @@ void hp_csv_parser_reset(hp_csv_parser_t *parser) {
     parser->arena_pos = 0;
 }
 
+void hp_csv_parser_free(hp_csv_parser_t *parser) {
+    if (!parser) return;
+    free(parser->unescape_arena);
+    parser->unescape_arena = NULL;
+    parser->arena_cap = 0;
+    parser->arena_pos = 0;
+}
+
+/* Every unescaped byte comes from a distinct byte of the window, so an
+ * arena as large as the window holds any record and never has to move
+ * while field pointers into it are live. */
+static hp_error_t reserve_arena(hp_csv_parser_t *parser, size_t window) {
+    if (parser->arena_cap >= window) return HP_OK;
+    char *arena = (char *)realloc(parser->unescape_arena, window);
+    if (!arena) return HP_ERR_NOMEM;
+    parser->unescape_arena = arena;
+    parser->arena_cap = window;
+    return HP_OK;
+}
+
 hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                                    const uint8_t *src,
                                    size_t len,
@@ -113,7 +133,6 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
         } else {
             size_t skip = parser->scan_quote(src + pos, len - pos);
             if (field_has_escapes) {
-                if (parser->arena_pos + skip >= HP_MAX_ROW_BYTES) return HP_ERR_BUFFER_OVERFLOW;
                 memcpy(parser->unescape_arena + parser->arena_pos, src + pos, skip);
                 parser->arena_pos += skip;
             }
@@ -129,14 +148,14 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
 
             if (pos + 1 < len && src[pos + 1] == '"') {
                 if (!field_has_escapes) {
+                    hp_error_t err = reserve_arena(parser, len);
+                    if (err != HP_OK) return err;
                     field_has_escapes = true;
                     size_t raw_len = pos - field_start;
                     field_arena_start = parser->arena_pos;
-                    if (parser->arena_pos + raw_len + 1 >= HP_MAX_ROW_BYTES) return HP_ERR_BUFFER_OVERFLOW;
                     memcpy(parser->unescape_arena + parser->arena_pos, src + field_start, raw_len);
                     parser->arena_pos += raw_len;
                 }
-                if (parser->arena_pos + 1 >= HP_MAX_ROW_BYTES) return HP_ERR_BUFFER_OVERFLOW;
                 parser->unescape_arena[parser->arena_pos++] = '"';
                 pos += 2;
             } else {
@@ -160,8 +179,10 @@ line").
                 out_row->field_count++;
 
                 pos++;
-                while (pos < len && src[pos] != delim && src[pos] != '\r' && src[pos] != '\n') {
-                    pos++;
+                /* RFC 4180: a closing quote must end the field. Anything else
+                 * ("abc"xyz) is malformed and must not be dropped silently. */
+                if (pos < len && src[pos] != delim && src[pos] != '\r' && src[pos] != '\n') {
+                    return HP_ERR_PARSE_QUOTE;
                 }
 
                 if (pos < len) {

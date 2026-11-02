@@ -369,20 +369,21 @@ static hp_error_t hp_parse_header_span(hp_format_t fmt, const char *span,
     size_t consumed = 0;
     err = hp_csv_parse_row_scalar(&parser, (const uint8_t *)span, len,
                                   &consumed, &row, true);
-    if (err != HP_OK) return HP_ERR_UNSUPPORTED;
+    if (err != HP_OK) err = HP_ERR_UNSUPPORTED;
 
     out->count = 0;
-    for (size_t i = 0; i < row.field_count && i < HP_MAX_COLUMNS; i++) {
+    for (size_t i = 0; err == HP_OK && i < row.field_count && i < HP_MAX_COLUMNS; i++) {
         char name[256];
         size_t flen = row.fields[i].len < sizeof(name) - 1
                           ? row.fields[i].len : sizeof(name) - 1;
         memcpy(name, row.fields[i].ptr, flen);
         name[flen] = '\0';
         out->names[out->count] = strdup(name);
-        if (!out->names[out->count]) return HP_ERR_NOMEM;
-        out->count++;
+        if (!out->names[out->count]) err = HP_ERR_NOMEM;
+        else out->count++;
     }
-    return HP_OK;
+    hp_csv_parser_free(&parser);
+    return err;
 }
 
 static void hp_free_header(hp_header_t *h) {

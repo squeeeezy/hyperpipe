@@ -45,6 +45,8 @@ typedef struct hp_transcoder_s {
     hp_sliding_buffer_t ring_buf;
     hp_reader_t in_reader;        /* input side: stdio + transparent gzip */
     hp_csv_parser_t csv_parser;
+    char *value_arena;            /* decoded NDJSON strings, sized to the line */
+    size_t value_arena_cap;
     hp_json_ser_t json_ser;
     hp_projection_t projection;
     hp_filter_t filter;

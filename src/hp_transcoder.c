@@ -121,33 +121,166 @@ static hp_error_t emit_ndjson_row_pb(hp_page_buffer_t *pb,
     return HP_OK;
 }
 
-/* Writes one CSV field, quoting it whenever the value contains the
- * delimiter, a quote or a line break. type_quoted preserves the string
- * identity of zero-length values: an empty field that arrived as a typed
- * string ("" in the source or "" in NDJSON) must be written back as "",
- * otherwise it degenerates to a blank field and loses its type. Non-empty
- * values keep the classic content-driven rule, which preserves byte
- * identity for data that never needed quoting. */
+/* Copies a field. Most fields are a few bytes long, where a library memcpy
+ * call costs more than the copy itself; up to 32 bytes the copy is done as
+ * two possibly overlapping fixed-size moves that touch only [src, src+len). */
+HP_INLINE uint8_t *copy_field(uint8_t *dst, const char *src, size_t len) {
+    if (len >= 16) {
+        if (len > 32) {
+            memcpy(dst, src, len);
+        } else {
+            memcpy(dst, src, 16);
+            memcpy(dst + len - 16, src + len - 16, 16);
+        }
+    } else if (len >= 8) {
+        memcpy(dst, src, 8);
+        memcpy(dst + len - 8, src + len - 8, 8);
+    } else if (len >= 4) {
+        memcpy(dst, src, 4);
+        memcpy(dst + len - 4, src + len - 4, 4);
+    } else {
+        for (size_t i = 0; i < len; i++) dst[i] = (uint8_t)src[i];
+    }
+    return dst + len;
+}
+
+/* True when any byte of the 64-bit word equals c ("has zero byte" test on
+ * w ^ c, exact as a yes/no answer). */
+HP_INLINE bool word_has_byte(uint64_t w, uint8_t c) {
+    const uint64_t ones = 0x0101010101010101ull;
+    uint64_t x = w ^ (ones * c);
+    return ((x - ones) & ~x & (ones << 7)) != 0;
+}
+
+HP_INLINE bool word_has_csv_special(uint64_t w, uint8_t delim) {
+    return word_has_byte(w, delim) | word_has_byte(w, '"') |
+           word_has_byte(w, '\n') | word_has_byte(w, '\r');
+}
+
+/* Whether a value needs quoting in CSV output, checked eight bytes at a
+ * time; the last word overlaps the previous one instead of falling back to
+ * a byte loop, so only bytes of the value are ever read. */
+static bool has_csv_special(const char *p, size_t len, uint8_t delim) {
+    uint64_t w;
+    if (len < 8) {
+        for (size_t i = 0; i < len; i++) {
+            if (p[i] == delim || p[i] == '"' || p[i] == '\n' || p[i] == '\r') return true;
+        }
+        return false;
+    }
+    for (size_t i = 0; i + 8 <= len; i += 8) {
+        memcpy(&w, p + i, 8);
+        if (word_has_csv_special(w, delim)) return true;
+    }
+    memcpy(&w, p + len - 8, 8);
+    return word_has_csv_special(w, delim);
+}
+
+/* Worst case for one CSV field: every byte a quote that gets doubled, plus
+ * the two enclosing quotes. */
+#define CSV_FIELD_BOUND(len) (2 * (len) + 2)
+
+/* Writes one CSV field at out, quoting it whenever the value contains the
+ * delimiter, a quote or a line break, and returns the new end. The caller
+ * guarantees CSV_FIELD_BOUND(len) free bytes. type_quoted preserves the
+ * string identity of zero-length values: an empty field that arrived as a
+ * typed string ("" in the source or "" in NDJSON) must be written back as
+ * "", otherwise it degenerates to a blank field and loses its type.
+ * Non-empty values keep the classic content-driven rule, which preserves
+ * byte identity for data that never needed quoting. */
+static uint8_t *put_csv_field(uint8_t *out, const char *p, size_t len,
+                              uint8_t delim, bool type_quoted) {
+    bool needs_quotes = (type_quoted && len == 0) || has_csv_special(p, len, delim);
+    if (!needs_quotes) return copy_field(out, p, len);
+    *out++ = '"';
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '"') *out++ = '"';
+        *out++ = (uint8_t)p[i];
+    }
+    *out++ = '"';
+    return out;
+}
+
+/* Page-buffered put_csv_field(). A field too large for one page (only an
+ * enormous value gets there) is streamed through the checked writers. */
 static void write_csv_field_pb(hp_page_buffer_t *pb, const char *p, size_t len,
                                uint8_t delim, bool type_quoted) {
-    bool needs_quotes = (type_quoted && len == 0);
-    for (size_t i = 0; i < len; i++) {
-        if (p[i] == delim || p[i] == '"' || p[i] == '\n' || p[i] == '\r') {
-            needs_quotes = true;
-            break;
-        }
+    if (CSV_FIELD_BOUND(len) <= pb->cap) {
+        if (pb->len + CSV_FIELD_BOUND(len) > pb->cap) hp_page_buffer_flush(pb);
+        uint8_t *end = put_csv_field(pb->data + pb->len, p, len, delim, type_quoted);
+        pb->len = (size_t)(end - pb->data);
+        return;
     }
 
-    if (!needs_quotes) {
+    if (!has_csv_special(p, len, delim)) {
         hp_page_buffer_write(pb, p, len);
-    } else {
-        hp_page_buffer_putc(pb, '"');
-        for (size_t i = 0; i < len; i++) {
-            if (p[i] == '"') hp_page_buffer_putc(pb, '"');
-            hp_page_buffer_putc(pb, (uint8_t)p[i]);
-        }
-        hp_page_buffer_putc(pb, '"');
+        return;
     }
+    hp_page_buffer_putc(pb, '"');
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '"') hp_page_buffer_putc(pb, '"');
+        hp_page_buffer_putc(pb, (uint8_t)p[i]);
+    }
+    hp_page_buffer_putc(pb, '"');
+}
+
+/* Writes one CSV/TSV record parsed from raw_len input bytes. Without a
+ * projection (cols == NULL) the row is emitted at its own width, so ragged
+ * rows keep every field instead of being cut to the header. Projected
+ * columns missing from the row are left empty.
+ *
+ * A field without escapes is copied verbatim only when it is known not to
+ * contain the output delimiter, which holds for CSV-to-CSV and TSV-to-TSV.
+ * Otherwise (quote_clean) every field goes through the quoting rules: a TSV
+ * cell may hold commas, an NDJSON value may hold anything.
+ *
+ * Every field is a slice of the raw record (or its unescaped copy, which is
+ * never longer), so the record's worst-case output size follows from
+ * raw_len alone: the whole record is reserved with one check and written
+ * without per-field bounds checks. Only a record too large for one page
+ * takes the checked path. */
+static void emit_csv_row_pb(hp_page_buffer_t *pb, const hp_row_t *row,
+                            const int64_t *cols, size_t col_count, uint8_t delim,
+                            size_t raw_len, bool quote_clean) {
+    const size_t n = cols ? col_count : row->field_count;
+    /* A projection may name a column twice, so each output field is bounded
+     * by the whole record; a full row's fields partition it. */
+    const size_t bound = cols ? n * (CSV_FIELD_BOUND(raw_len) + 1) + 1
+                              : CSV_FIELD_BOUND(raw_len) + 3 * n + 1;
+
+    if (bound <= pb->cap) {
+        if (pb->len + bound > pb->cap) hp_page_buffer_flush(pb);
+        uint8_t *out = pb->data + pb->len;
+        for (size_t i = 0; i < n; i++) {
+            if (i > 0) *out++ = delim;
+            int64_t idx = cols ? cols[i] : (int64_t)i;
+            if (idx < 0 || (size_t)idx >= row->field_count) continue;
+
+            const hp_str_t *f = &row->fields[idx];
+            if (f->has_escapes || quote_clean) {
+                out = put_csv_field(out, f->ptr, f->len, delim, f->has_escapes);
+            } else {
+                out = copy_field(out, f->ptr, f->len);
+            }
+        }
+        *out++ = '\n';
+        pb->len = (size_t)(out - pb->data);
+        return;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0) hp_page_buffer_putc(pb, delim);
+        int64_t idx = cols ? cols[i] : (int64_t)i;
+        if (idx < 0 || (size_t)idx >= row->field_count) continue;
+
+        const hp_str_t *f = &row->fields[idx];
+        if (f->has_escapes || quote_clean) {
+            write_csv_field_pb(pb, f->ptr, f->len, delim, f->has_escapes);
+        } else {
+            hp_page_buffer_write(pb, f->ptr, f->len);
+        }
+    }
+    hp_page_buffer_putc(pb, '\n');
 }
 
 hp_format_t hp_sniff_format(const uint8_t *sample, size_t len) {
@@ -312,6 +445,10 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
     if (!tc) return;
     hp_sliding_buffer_free(&tc->ring_buf);
     hp_reader_free(&tc->in_reader);
+    hp_csv_parser_free(&tc->csv_parser);
+    free(tc->value_arena);
+    tc->value_arena = NULL;
+    tc->value_arena_cap = 0;
     hp_json_ser_free(&tc->json_ser);
     hp_header_free(&tc->in_header);
     hp_header_free(&tc->out_header);
@@ -433,12 +570,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
         const bool is_csv_out = (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV);
         const uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
 
-        bool proj_is_3 = false;
-        int64_t c0 = -1, c1 = -1, c2 = -1;
-        bool filt_is_single_eq = false;
-        int64_t f_col = -1;
-        const char *f_val = NULL;
-        size_t f_len = 0;
+        const int64_t *out_cols = tc->projection.active ? tc->projection.col_indices : NULL;
+        const bool quote_clean = tc->csv_parser.delim != out_delim;
         bool limit_reached = false;
         bool resyncing = false;   /* set after an oversized-record drop:
                                      discard bytes until the next '\n' */
@@ -538,20 +671,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                     header_processed = true;
 
-                    proj_is_3 = (tc->projection.active && tc->projection.count == 3);
-                    if (proj_is_3) {
-                        c0 = tc->projection.col_indices[0];
-                        c1 = tc->projection.col_indices[1];
-                        c2 = tc->projection.col_indices[2];
-                    }
-
-                    filt_is_single_eq = (tc->filter.count == 1 && tc->filter.preds[0].op == HP_OP_EQ && tc->filter.preds[0].col_index >= 0);
-                    if (filt_is_single_eq) {
-                        f_col = tc->filter.preds[0].col_index;
-                        f_val = tc->filter.preds[0].str_val;
-                        f_len = tc->filter.preds[0].str_val_len;
-                    }
-
                     if (is_csv_out && !tc->config.count_only && !tc->config.summary) {
                         /* An empty header name is written as "" so it stays
                          * distinguishable from an absent cell after a
@@ -573,19 +692,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                 rows_read_local++;
 
-                if (filt_is_single_eq) {
-                    if ((size_t)f_col >= raw_row.field_count) {
-                        src += consumed;
-                        available -= consumed;
-                        continue;
-                    }
-                    const hp_str_t *f = &raw_row.fields[f_col];
-                    if (f->len != f_len || memcmp(f->ptr, f_val, f_len) != 0) {
-                        src += consumed;
-                        available -= consumed;
-                        continue;
-                    }
-                } else if (!hp_filter_matches(&tc->filter, &raw_row)) {
+                if (!hp_filter_matches(&tc->filter, &raw_row)) {
                     src += consumed;
                     available -= consumed;
                     continue;
@@ -619,85 +726,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                 }
 
                 if (is_csv_out) {
-                    if (pb.len + 2048 >= pb.cap) {
-                        hp_page_buffer_flush(&pb);
-                    }
-
-                    if (proj_is_3) {
-                        if ((size_t)c0 < raw_row.field_count &&
-                            (size_t)c1 < raw_row.field_count &&
-                            (size_t)c2 < raw_row.field_count &&
-                            !raw_row.fields[c0].has_escapes &&
-                            !raw_row.fields[c1].has_escapes &&
-                            !raw_row.fields[c2].has_escapes) {
-                            /* Fast path: clean unquoted fields, raw memcpy */
-                            const hp_str_t *f0 = &raw_row.fields[c0];
-                            const hp_str_t *f1 = &raw_row.fields[c1];
-                            const hp_str_t *f2 = &raw_row.fields[c2];
-
-                            memcpy(pb.data + pb.len, f0->ptr, f0->len);
-                            pb.len += f0->len;
-                            pb.data[pb.len++] = out_delim;
-
-                            memcpy(pb.data + pb.len, f1->ptr, f1->len);
-                            pb.len += f1->len;
-                            pb.data[pb.len++] = out_delim;
-
-                            memcpy(pb.data + pb.len, f2->ptr, f2->len);
-                            pb.len += f2->len;
-                        } else {
-                            /* Quoted or short-row: re-serialize each field
-                             * so embedded delimiters/newlines are re-quoted */
-                            const int64_t cols[3] = { c0, c1, c2 };
-                            for (int pi = 0; pi < 3; pi++) {
-                                if (pi > 0) pb.data[pb.len++] = out_delim;
-                                if (cols[pi] >= 0 && (size_t)cols[pi] < raw_row.field_count) {
-                                    const hp_str_t *f = &raw_row.fields[cols[pi]];
-                                    if (!f->has_escapes) {
-                                        memcpy(pb.data + pb.len, f->ptr, f->len);
-                                        pb.len += f->len;
-                                    } else {
-                                        write_csv_field_pb(&pb, f->ptr, f->len, out_delim, f->has_escapes);
-                                    }
-                                }
-                            }
-                        }
-                    } else if (tc->projection.active) {
-                        const size_t proj_cnt = tc->projection.count;
-                        for (size_t i = 0; i < proj_cnt; i++) {
-                            if (i > 0) pb.data[pb.len++] = out_delim;
-                            int64_t col_idx = tc->projection.col_indices[i];
-                            if (col_idx >= 0 && (size_t)col_idx < raw_row.field_count) {
-                                const hp_str_t *f = &raw_row.fields[col_idx];
-                                if (!f->has_escapes) {
-                                    memcpy(pb.data + pb.len, f->ptr, f->len);
-                                    pb.len += f->len;
-                                } else {
-                                    write_csv_field_pb(&pb, f->ptr, f->len, out_delim, f->has_escapes);
-                                }
-                            }
-                        }
-                    } else {
-                        /* Full-row emission: CSV input emits exactly the
-                         * fields each row carries. Ragged rows keep their
-                         * real width instead of being silently truncated to
-                         * the header width - data loss is never the right
-                         * default for a transcoder. (NDJSON input has its
-                         * own emission loop, locked to the first-row
-                         * schema, where late keys genuinely cannot be
-                         * represented without a header rewrite.) */
-                        for (size_t i = 0; i < raw_row.field_count; i++) {
-                            if (i > 0) pb.data[pb.len++] = out_delim;
-                            const hp_str_t *f = &raw_row.fields[i];
-                            if (!f->has_escapes) {
-                                memcpy(pb.data + pb.len, f->ptr, f->len);
-                                pb.len += f->len;
-                            } else {
-                                write_csv_field_pb(&pb, f->ptr, f->len, out_delim, f->has_escapes);
-                            }
-                        }
-                    }
-                    pb.data[pb.len++] = '\n';
+                    emit_csv_row_pb(&pb, &raw_row, out_cols, tc->projection.count, out_delim, consumed,
+                                    quote_clean);
                 } else {
                     /* NDJSON output never mutates the parsed row, so it is
                      * serialized in place. With a projection, hp_project_row
@@ -757,7 +787,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
             }
         }
     } else if (tc->config.in_format == HP_FORMAT_NDJSON) {
-        char val_arena[64 * 1024];
         bool limit_reached = false;
         bool resyncing = false;   /* skip to the next '\n' after an oversized line */
         hp_row_t raw_row;
@@ -843,9 +872,20 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     continue;
                 }
 
+                /* Decoded string values are never longer than their escaped
+                 * source, so an arena as large as the line always suffices. */
+                if (strip_len > tc->value_arena_cap) {
+                    char *arena = (char *)realloc(tc->value_arena, strip_len);
+                    if (!arena) {
+                        hp_page_buffer_flush(&pb);
+                        return HP_ERR_NOMEM;
+                    }
+                    tc->value_arena = arena;
+                    tc->value_arena_cap = strip_len;
+                }
                 err = hp_json_parse_line_ex((const char *)src, strip_len, &tc->in_header,
                                             tc->keymap_active ? &tc->keymap : NULL,
-                                            &raw_row, val_arena, sizeof(val_arena));
+                                            &raw_row, tc->value_arena, tc->value_arena_cap);
                 if (err != HP_OK) {
                     if (tc->config.on_error == HP_ON_ERROR_FAIL) {
                         tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
@@ -944,16 +984,13 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     continue;
                 }
 
-                hp_row_t proj_row;
-                const hp_row_t *out_row_ptr;
-                if (tc->projection.active) {
-                    hp_project_row(&tc->projection, &raw_row, &proj_row);
-                    out_row_ptr = &proj_row;
-                } else {
-                    out_row_ptr = &raw_row;
-                }
-
                 if (tc->config.out_format == HP_FORMAT_NDJSON) {
+                    hp_row_t proj_row;
+                    const hp_row_t *out_row_ptr = &raw_row;
+                    if (tc->projection.active) {
+                        hp_project_row(&tc->projection, &raw_row, &proj_row);
+                        out_row_ptr = &proj_row;
+                    }
                     size_t out_line_len = 0;
                     err = emit_ndjson_row_pb(&pb, &tc->json_ser, &tc->out_header, out_row_ptr, &out_line_len);
                     if (err != HP_OK) {
@@ -962,12 +999,13 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     }
                     tc->stats.bytes_out += out_line_len;
                 } else {
-                    uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                    for (size_t i = 0; i < out_row_ptr->field_count; i++) {
-                        if (i > 0) hp_page_buffer_putc(&pb, out_delim);
-                        write_csv_field_pb(&pb, out_row_ptr->fields[i].ptr, out_row_ptr->fields[i].len, out_delim, out_row_ptr->fields[i].has_escapes);
-                    }
-                    hp_page_buffer_putc(&pb, '\n');
+                    /* Every value is a slice of the line or a decoded copy no
+                     * longer than its source, so the line length bounds the
+                     * record just as it does for CSV input. */
+                    const uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
+                    emit_csv_row_pb(&pb, &raw_row,
+                                    tc->projection.active ? tc->projection.col_indices : NULL,
+                                    tc->projection.count, out_delim, strip_len, true);
                 }
                 rows_emitted_local++;
                 if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {

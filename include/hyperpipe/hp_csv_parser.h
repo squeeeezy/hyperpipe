@@ -3,8 +3,6 @@
 
 #include "hp_common.h"
 
-#define HP_MAX_ROW_BYTES (64 * 1024)
-
 typedef struct hp_csv_parser_s {
     uint8_t delim;
     uint8_t quote;
@@ -13,8 +11,12 @@ typedef struct hp_csv_parser_s {
     bool in_quotes;
     bool quote_just_closed;
 
-    /* Current row reconstruction arena for unescaping '""' -> '"' */
-    char unescape_arena[HP_MAX_ROW_BYTES];
+    /* Unescaped copies ('""' -> '"') of the current record's fields. An
+     * unescaped field is never longer than its source, so the arena is sized
+     * to the parse window on first use and never moves while a record is
+     * being built. Records without escapes never allocate it. */
+    char *unescape_arena;
+    size_t arena_cap;
     size_t arena_pos;
 
     /* Function pointers for vectorized acceleration */
@@ -24,6 +26,7 @@ typedef struct hp_csv_parser_s {
 
 hp_error_t hp_csv_parser_init(hp_csv_parser_t *parser, hp_format_t fmt, hp_simd_mode_t simd);
 void hp_csv_parser_reset(hp_csv_parser_t *parser);
+void hp_csv_parser_free(hp_csv_parser_t *parser);
 
 hp_error_t hp_csv_parse_row(hp_csv_parser_t *parser,
                             const uint8_t *src,

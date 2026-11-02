@@ -752,9 +752,8 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                 /* Escaped string: copy the clean prefix, then decode the
                  * remainder through the exact same rules as before. */
                 size_t prefix = stop - vbegin;
-                if (arena_pos + prefix < arena_size) {
-                    memcpy(value_arena + arena_pos, line + vbegin, prefix);
-                }
+                if (prefix > arena_size - arena_pos) return HP_ERR_BUFFER_OVERFLOW;
+                memcpy(value_arena + arena_pos, line + vbegin, prefix);
                 arena_pos += prefix;
                 pos = stop;
 
@@ -778,8 +777,10 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                                 } else if (cp >= 0xD800 && cp <= 0xDFFF) {
                                     cp = 0xFFFDu; /* lone surrogate */
                                 }
-                                size_t avail = (arena_size > arena_pos + 1) ? arena_size - arena_pos - 1 : 0;
-                                arena_pos += json_utf8_encode(value_arena + arena_pos, avail, cp);
+                                size_t n = json_utf8_encode(value_arena + arena_pos,
+                                                            arena_size - arena_pos, cp);
+                                if (n == 0) return HP_ERR_BUFFER_OVERFLOW;
+                                arena_pos += n;
                                 continue;
                             }
                             /* invalid \u sequence -> fall through, lenient */
@@ -792,10 +793,12 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                         else if (esc == 'f') unescaped = '\f';
                         else if (esc == '"') unescaped = '"';
                         else if (esc == '\\') unescaped = '\\';
-                        if (arena_pos + 1 < arena_size) value_arena[arena_pos++] = unescaped;
+                        if (arena_pos == arena_size) return HP_ERR_BUFFER_OVERFLOW;
+                        value_arena[arena_pos++] = unescaped;
                         pos += 2;
                     } else {
-                        if (arena_pos + 1 < arena_size) value_arena[arena_pos++] = line[pos];
+                        if (arena_pos == arena_size) return HP_ERR_BUFFER_OVERFLOW;
+                        value_arena[arena_pos++] = line[pos];
                         pos++;
                     }
                 }
