@@ -24,16 +24,21 @@ typedef struct hp_transcoder_config_s {
     bool gzip_out;         /* compress output with gzip (requires libz at runtime) */
     bool summary;          /* --summary: aggregate column statistics, no row output */
     const char *schema_path; /* --schema <file>: declared column types (int hints) */
-    /* Parallel workers (hp_parallel.h) only: stop after span_end input bytes
-     * and bind preset_header instead of parsing a header row. Both are
+    /* Parallel workers (hp_parallel.h) only: read exactly span_end input
+     * bytes and bind preset_header instead of parsing a header row. Both are
      * zero/NULL in ordinary single-stream runs. */
     uint64_t span_end;
     const hp_header_t *preset_header;
+    bool lock_schema;      /* NDJSON: keep the first line's keys, never grow */
     /* Optional output sink. When set, every output page goes to it instead
      * of out_stream (hp_transcoder_run then accepts out_stream == NULL); it
      * returns how many bytes it took, and a short count is an I/O error. */
     size_t (*sink)(void *ctx, const void *data, size_t len);
     void *sink_ctx;
+    /* Optional destination for quarantined input, used instead of
+     * quarantine_path (parallel workers keep chunk order this way). */
+    size_t (*quarantine_sink)(void *ctx, const void *data, size_t len);
+    void *quarantine_ctx;
 } hp_transcoder_config_t;
 
 typedef struct hp_transcoder_stats_s {
@@ -60,7 +65,6 @@ typedef struct hp_transcoder_s {
     hp_keymap_t keymap;           /* O(1) NDJSON key lookup, valid when keymap_active */
     bool keymap_active;
     hp_summary_t *summary;        /* --summary accumulator (heap, one per run) */
-    uint64_t span_consumed;       /* input bytes consumed toward config.span_end */
     hp_transcoder_stats_t stats;
     FILE *quarantine_file;
     uint8_t *page_buf_data;

@@ -14,6 +14,11 @@ static const char *const csv_path = "build/test_parallel_input.csv";
 static const char *const ndjson_path = "build/test_parallel_input.ndjson";
 static const int job_counts[] = { 2, 3, 7 };
 
+/* Large enough for several 1 MiB ranges, so chunk boundaries land on every
+ * record shape the writers produce. */
+static const int csv_rows = 250003;
+static const int ndjson_rows = 150003;
+
 /* Writes a deterministic CSV with the shapes a parallel split must handle:
  * quoted commas, doubled quotes, embedded newlines, ragged rows and a header
  * whose width differs from some data rows. */
@@ -160,14 +165,76 @@ static void test_csv_to_csv(void) {
 static void test_csv_filter_and_projection(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
     cfg.select_spec = "name,payload";
-    cfg.where_spec = "id >= 100 and id < 19000";
+    cfg.where_spec = "id >= 100 and id < 140000";
     check_identical(&cfg, csv_path);
 }
 
-static void test_csv_skip_mode(void) {
+/* Skip and quarantine resynchronize at the next line after a stray quote,
+ * which quote-parity cuts cannot reproduce: CSV keeps the sequential path. */
+static void test_csv_skip_mode_runs_sequentially(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
     cfg.on_error = HP_ON_ERROR_SKIP;
-    check_identical(&cfg, csv_path);
+    capture_t par = run_parallel(&cfg, csv_path, 4);
+    CHECK(par.err == HP_ERR_UNSUPPORTED);
+    free(par.data);
+}
+
+/* TSV fields may be quoted too, newlines included */
+static void test_tsv_with_quoted_newlines(void) {
+    const char *tsv_path = "build/test_parallel_input.tsv";
+    FILE *f = fopen(tsv_path, "wb");
+    CHECK(f);
+    fputs("id\tnote\n", f);
+    for (int i = 0; i < 200000; i++) {
+        if (i % 3 == 0) fprintf(f, "%d\t\"two\nlines\t%d\"\n", i, i);
+        else            fprintf(f, "%d\tplain %d\n", i, i);
+    }
+    fclose(f);
+    hp_transcoder_config_t cfg = config(HP_FORMAT_TSV, HP_FORMAT_NDJSON);
+    check_identical(&cfg, tsv_path);
+    remove(tsv_path);
+}
+
+/* Malformed NDJSON lines are quarantined in input order, as sequentially */
+static void test_ndjson_quarantine(void) {
+    const char *dirty_path = "build/test_parallel_dirty.ndjson";
+    const char *q_single = "build/test_parallel_q1.txt";
+    const char *q_parallel = "build/test_parallel_q2.txt";
+    FILE *f = fopen(dirty_path, "wb");
+    CHECK(f);
+    for (int i = 0; i < 150000; i++) {
+        if (i % 997 == 5) fprintf(f, "{\"id\":%d,\"v\"\n", i);
+        else              fprintf(f, "{\"id\":%d,\"v\":\"x%d\"}\n", i, i);
+    }
+    fclose(f);
+
+    hp_transcoder_config_t cfg = config(HP_FORMAT_NDJSON, HP_FORMAT_CSV);
+    cfg.on_error = HP_ON_ERROR_QUARANTINE;
+    cfg.quarantine_path = q_single;
+    capture_t ref = run_single(&cfg, dirty_path);
+    cfg.quarantine_path = q_parallel;
+    capture_t par = run_parallel(&cfg, dirty_path, 5);
+    CHECK(ref.err == HP_OK && par.err == HP_OK);
+    CHECK(ref.stats.rows_dropped > 100);
+    CHECK(par.stats.rows_dropped == ref.stats.rows_dropped);
+    CHECK(par.len == ref.len && memcmp(par.data, ref.data, ref.len) == 0);
+
+    FILE *a = fopen(q_single, "rb"), *b = fopen(q_parallel, "rb");
+    CHECK(a && b);
+    int ca, cb;
+    do {
+        ca = fgetc(a);
+        cb = fgetc(b);
+        CHECK(ca == cb);
+    } while (ca != EOF);
+    fclose(a);
+    fclose(b);
+
+    free(ref.data);
+    free(par.data);
+    remove(dirty_path);
+    remove(q_single);
+    remove(q_parallel);
 }
 
 static void test_csv_count(void) {
@@ -176,14 +243,14 @@ static void test_csv_count(void) {
     cfg.count_only = true;
     capture_t par = run_parallel(&cfg, csv_path, 4);
     CHECK(par.err == HP_OK);
-    /* ids 500..20002 from the loop plus the trailing id=20003 record */
-    CHECK(par.stats.rows_emitted == (20003 - 500) + 1);
+    /* ids 500..csv_rows-1 from the loop plus the trailing id=csv_rows record */
+    CHECK(par.stats.rows_emitted == (uint64_t)(csv_rows - 500) + 1);
     free(par.data);
 }
 
 /* A different row offset moves the chunk boundaries onto other shapes. */
 static void test_csv_other_boundaries(void) {
-    write_test_csv(csv_path, 20011, 3);
+    write_test_csv(csv_path, csv_rows + 8, 3);
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
     check_identical(&cfg, csv_path);
 }
@@ -201,7 +268,7 @@ static void test_ndjson_to_ndjson(void) {
 static void test_ndjson_filter_and_projection(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_NDJSON, HP_FORMAT_AUTO);
     cfg.select_spec = "id,payload";
-    cfg.where_spec = "id >= 100 and id < 19000";
+    cfg.where_spec = "id >= 100 and id < 140000";
     check_identical(&cfg, ndjson_path);
 }
 
@@ -257,13 +324,14 @@ static void test_compressed_input_is_unsupported(void) {
 }
 
 int main(void) {
-    write_test_csv(csv_path, 20003, 0);
-    write_test_ndjson(ndjson_path, 20003, 1);
+    write_test_csv(csv_path, csv_rows, 0);
+    write_test_ndjson(ndjson_path, ndjson_rows, 1);
 
     TAP_RUN(test_csv_to_ndjson);
     TAP_RUN(test_csv_to_csv);
     TAP_RUN(test_csv_filter_and_projection);
-    TAP_RUN(test_csv_skip_mode);
+    TAP_RUN(test_csv_skip_mode_runs_sequentially);
+    TAP_RUN(test_tsv_with_quoted_newlines);
     TAP_RUN(test_csv_count);
     TAP_RUN(test_csv_other_boundaries);
     TAP_RUN(test_ndjson_to_csv);
@@ -271,6 +339,7 @@ int main(void) {
     TAP_RUN(test_ndjson_filter_and_projection);
     TAP_RUN(test_ndjson_count);
     TAP_RUN(test_ndjson_schema_lock);
+    TAP_RUN(test_ndjson_quarantine);
     TAP_RUN(test_compressed_input_is_unsupported);
 
     remove(csv_path);

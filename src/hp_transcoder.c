@@ -300,6 +300,16 @@ static void emit_csv_row_pb(hp_page_buffer_t *pb, const hp_row_t *row,
     hp_page_buffer_putc(pb, '\n');
 }
 
+/* Malformed or oversized input that fault tolerance skipped, byte for byte */
+static void quarantine_write(hp_transcoder_t *tc, const uint8_t *data, size_t len) {
+    if (len == 0) return;
+    if (tc->config.quarantine_sink) {
+        tc->config.quarantine_sink(tc->config.quarantine_ctx, data, len);
+    } else if (tc->quarantine_file) {
+        fwrite(data, 1, len, tc->quarantine_file);
+    }
+}
+
 hp_format_t hp_sniff_format(const uint8_t *sample, size_t len) {
     if (!sample || len == 0) return HP_FORMAT_CSV;
 
@@ -522,6 +532,10 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     /* Input reader: plain stdio passthrough, or transparent inflate when the
      * stream turns out to be gzip. hp_reader_init is re-entry safe. */
     hp_reader_init(&tc->in_reader, in_stream);
+    if (tc->config.span_end) {
+        tc->in_reader.limited = true;
+        tc->in_reader.limit = tc->config.span_end;
+    }
 
     double t0 = get_time_sec();
     bool header_processed = false;
@@ -613,15 +627,6 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
             bool made_progress = false;
 
             while (available > 0) {
-                /* --jobs span enforcement: a row that begins at or past the
-                 * worker's span belongs to the next worker. bytes_in counts
-                 * every byte read so far, so the current row's absolute
-                 * start offset is bytes_in minus the unparsed window size. */
-                if (tc->config.span_end &&
-                    tc->stats.bytes_in - (uint64_t)available >= tc->config.span_end) {
-                    limit_reached = true;
-                    break;
-                }
 
                 size_t consumed = 0;
 
@@ -630,9 +635,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                      * boundary so its tail is never parsed as fake rows */
                     const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
                     size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    if (tc->quarantine_file) {
-                        fwrite(src, 1, skip, tc->quarantine_file);
-                    }
+                    quarantine_write(tc, src, skip);
                     src += skip;
                     available -= skip;
                     made_progress = true;
@@ -649,9 +652,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     }
                     const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
                     size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    if (tc->quarantine_file) {
-                        fwrite(src, 1, skip, tc->quarantine_file);
-                    }
+                    quarantine_write(tc, src, skip);
                     rows_dropped_local++;
                     made_progress = true;
                     src += skip;
@@ -791,9 +792,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                     if (err == HP_ERR_BUFFER_OVERFLOW && tc->config.on_error != HP_ON_ERROR_FAIL) {
                         /* Row larger than the ring buffer: drop the buffered
                          * span and resynchronize at the next line boundary */
-                        if (tc->quarantine_file && available > 0) {
-                            fwrite(src, 1, available, tc->quarantine_file);
-                        }
+                        quarantine_write(tc, src, available);
                         rows_dropped_local++;
                         tc->ring_buf.head = tc->ring_buf.tail;
                         resyncing = true;
@@ -837,25 +836,13 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
             bool made_progress = false;
 
             while (available > 0) {
-                /* --jobs span enforcement, same rule as the CSV loop: a row
-                 * that begins at or past the worker's span belongs to the
-                 * next worker. bytes_in counts every byte read so far, so
-                 * the current line's absolute start offset is bytes_in
-                 * minus the unparsed window size. */
-                if (tc->config.span_end &&
-                    tc->stats.bytes_in - (uint64_t)available >= tc->config.span_end) {
-                    limit_reached = true;
-                    break;
-                }
 
                 if (resyncing) {
                     /* Oversized line was dropped: skip to the next line
                      * boundary so its tail is never parsed as fake rows */
                     const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
                     size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    if (tc->quarantine_file) {
-                        fwrite(src, 1, skip, tc->quarantine_file);
-                    }
+                    quarantine_write(tc, src, skip);
                     src += skip;
                     available -= skip;
                     made_progress = true;
@@ -911,9 +898,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                         hp_page_buffer_flush(&pb);
                         return err;
                     }
-                    if (tc->quarantine_file) {
-                        fwrite(src, 1, line_len, tc->quarantine_file);
-                    }
+                    quarantine_write(tc, src, line_len);
                     rows_dropped_local++;
                     src += line_len;
                     available -= line_len;
@@ -954,12 +939,11 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
                 /* Schema growth mid-stream: single-stream NDJSON output
                  * can follow it (the header line is not yet written).
-                 * Parallel workers keep the preset schema instead: a
-                 * worker's growth order would depend on which rows it
-                 * happens to see first, so keys beyond the first line
-                 * serialize under their column index - the same lock rule
-                 * CSV output documents. */
-                if (!tc->config.preset_header &&
+                 * Parallel runs lock the schema instead: growth order would
+                 * depend on which rows each chunk happens to see first, so
+                 * keys beyond the first line serialize under their column
+                 * index - the same lock rule CSV output documents. */
+                if (!tc->config.lock_schema &&
                     !tc->projection.active && tc->config.out_format == HP_FORMAT_NDJSON &&
                     tc->in_header.count > tc->out_header.count) {
                     for (size_t i = tc->out_header.count; i < tc->in_header.count; i++) {
@@ -1049,9 +1033,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
                         /* Line larger than the ring buffer: quarantine the
                          * buffered span and resynchronize at the next line
                          * boundary so its tail is never parsed as fake rows */
-                        if (tc->quarantine_file && available > 0) {
-                            fwrite(src, 1, available, tc->quarantine_file);
-                        }
+                        quarantine_write(tc, src, available);
                         rows_dropped_local++;
                         tc->ring_buf.head = tc->ring_buf.tail;
                         resyncing = true;

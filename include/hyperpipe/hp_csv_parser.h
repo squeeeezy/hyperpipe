@@ -68,19 +68,4 @@ size_t hp_csv_scan_quote_avx2(const uint8_t *p, size_t len);
 size_t hp_csv_scan_special_avx512(const uint8_t *p, size_t len, uint8_t delim);
 size_t hp_csv_scan_quote_avx512(const uint8_t *p, size_t len);
 
-/* ---- Chunk planner bitmaps (--jobs boundary scan) -------------------------
- *
- * For one chunk of up to 64 bytes, bit i of *nl marks p[i] == '\n' and
- * bit i of *qm marks p[i] == '"'. Only chunk_len bytes are read; callers
- * pass byte ranges that end at a buffer boundary or rely on the masked
- * loads of the SIMD twins. All three implementations return identical
- * bitmaps (differential-tested), so the parallel planner consumes them
- * interchangeably through the dispatch table. */
-void hp_csv_plan_masks_scalar(const uint8_t *p, size_t chunk_len,
-                              uint64_t *nl, uint64_t *qm);
-void hp_csv_plan_masks_avx2(const uint8_t *p, size_t chunk_len,
-                            uint64_t *nl, uint64_t *qm);
-void hp_csv_plan_masks_avx512(const uint8_t *p, size_t chunk_len,
-                              uint64_t *nl, uint64_t *qm);
-
 #endif /* HYPERPIPE_HP_CSV_PARSER_H */

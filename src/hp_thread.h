@@ -59,6 +59,7 @@ static inline void hp_mutex_unlock(hp_mutex_t *m) { ReleaseSRWLockExclusive(m); 
 static inline void hp_cond_init(hp_cond_t *c) { InitializeConditionVariable(c); }
 static inline void hp_cond_destroy(hp_cond_t *c) { (void)c; }
 static inline void hp_cond_signal(hp_cond_t *c) { WakeConditionVariable(c); }
+static inline void hp_cond_broadcast(hp_cond_t *c) { WakeAllConditionVariable(c); }
 static inline void hp_cond_wait(hp_cond_t *c, hp_mutex_t *m) {
     SleepConditionVariableSRW(c, m, INFINITE, 0);
 }
@@ -92,6 +93,7 @@ static inline void hp_mutex_unlock(hp_mutex_t *m) { pthread_mutex_unlock(m); }
 static inline void hp_cond_init(hp_cond_t *c) { pthread_cond_init(c, NULL); }
 static inline void hp_cond_destroy(hp_cond_t *c) { pthread_cond_destroy(c); }
 static inline void hp_cond_signal(hp_cond_t *c) { pthread_cond_signal(c); }
+static inline void hp_cond_broadcast(hp_cond_t *c) { pthread_cond_broadcast(c); }
 static inline void hp_cond_wait(hp_cond_t *c, hp_mutex_t *m) { pthread_cond_wait(c, m); }
 
 static inline int hp_cpu_count(void) {

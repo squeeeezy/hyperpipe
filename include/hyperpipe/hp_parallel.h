@@ -6,23 +6,29 @@
 
 /* --jobs N: parallel chunked pipeline.
  *
- * The input file is split into N chunks at quote-aware line boundaries (a
- * boundary is a newline outside a quoted field, so no record ever straddles
- * two chunks). One worker thread per chunk runs the full transcoder
- * pipeline - parse, filter, project, serialize - into a bounded page queue;
- * the coordinator drains the queues strictly in chunk order, which restores
- * the exact byte stream of the single-threaded run.
+ * The input file is cut into chunks of whole records (a record ends at a
+ * newline outside quotes, so none straddles two chunks). Worker threads run
+ * the full transcoder pipeline - parse, filter, project, serialize - on one
+ * chunk at a time, and the output is assembled strictly in chunk order,
+ * which reproduces the exact byte stream of the single-threaded run.
+ * See src/hp_parallel.c for how chunks are found and scheduled.
  *
- * Scope (deliberate, see docs/ARCHITECTURE.md 7):
+ * Scope:
  *   - CSV, TSV and NDJSON input. NDJSON runs lock the schema to the first
- *     line, the same rule CSV output follows. gzip-compressed input reports
- *     HP_ERR_UNSUPPORTED so the caller falls back to the single-threaded path.
+ *     line, the same rule CSV output follows.
+ *   - HP_ERR_UNSUPPORTED, with the single-threaded path as the fallback, for
+ *     gzip input, for CSV/TSV with --on-error skip or quarantine, and for a
+ *     first record the parsers reject.
  *   - The input must be a regular seekable file.
  *   - Runs on Windows and POSIX (see src/hp_thread.h).
- *   - Memory stays bounded: each worker holds one ring buffer plus at most
- *     a few pages of queued output.
+ *   - Memory stays bounded: at most jobs + 2 chunks (a few MiB of input
+ *     each) are in flight, whatever the input size.
  *   - gzip output with --jobs produces concatenated gzip members, which
  *     every gzip decoder (including this project's own reader) accepts. */
+
+/* Job count for --jobs auto: one per processor (at most 16) for a regular
+ * file large enough to amortize the threads, otherwise 1. */
+int hp_parallel_auto_jobs(const char *input_path);
 
 hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
                            const char *input_path,

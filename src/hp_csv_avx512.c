@@ -221,20 +221,3 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
     *consumed = len;
     return HP_OK;
 }
-
-/* ---- Chunk planner bitmaps ------------------------------------------------
- *
- * AVX-512 twin of hp_csv_plan_masks_scalar: newline and quote bitmaps for
- * one chunk of up to 64 bytes, one compare per bitmap. The masked load
- * touches only enabled lanes, so a short tail chunk is read without any
- * padding guarantee from the caller. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
-#endif
-void hp_csv_plan_masks_avx512(const uint8_t *p, size_t chunk_len,
-                              uint64_t *nl, uint64_t *qm) {
-    __mmask64 len_mask = (chunk_len >= 64) ? ~0ull : ((1ull << chunk_len) - 1);
-    __m512i chunk = _mm512_maskz_loadu_epi8(len_mask, (const void *)p);
-    *nl = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8('\n')) & len_mask;
-    *qm = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8('"')) & len_mask;
-}

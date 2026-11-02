@@ -57,7 +57,6 @@ hp_dispatch_table_t g_hp_dispatch = {
     .json_scan_lit = hp_json_scan_lit_scalar,
     .json_scan_ws = hp_json_scan_ws_scalar,
     .json_struct_masks = hp_json_struct_masks_scalar,
-    .plan_masks = hp_csv_plan_masks_scalar,
     .csv_parse_row = hp_csv_parse_row_scalar
 };
 
@@ -146,7 +145,6 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.json_scan_lit = hp_json_scan_lit_avx512;
             g_hp_dispatch.json_scan_ws = hp_json_scan_ws_avx512;
             g_hp_dispatch.json_struct_masks = hp_json_struct_masks_avx512;
-            g_hp_dispatch.plan_masks = hp_csv_plan_masks_avx512;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx512;
             break;
         case HP_SIMD_AVX2:
@@ -158,7 +156,6 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.json_scan_lit = hp_json_scan_lit_avx2;
             g_hp_dispatch.json_scan_ws = hp_json_scan_ws_avx2;
             g_hp_dispatch.json_struct_masks = hp_json_struct_masks_avx2;
-            g_hp_dispatch.plan_masks = hp_csv_plan_masks_avx2;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx2;
             break;
         case HP_SIMD_SCALAR:

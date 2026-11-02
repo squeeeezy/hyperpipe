@@ -213,39 +213,3 @@ hp_error_t hp_csv_parse_row_avx2(hp_csv_parser_t *parser,
     *consumed = len;
     return HP_OK;
 }
-
-/* ---- Chunk planner bitmaps ------------------------------------------------
- *
- * AVX2 twin of hp_csv_plan_masks_scalar: newline and quote bitmaps for one
- * chunk of up to 64 bytes. movemask produces one status bit per byte, so a
- * 32-byte compare shifts into the correct half of the 64-bit bitmap. The
- * scalar tail handles the trailing < 32 bytes of a chunk. */
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((target("avx2,bmi2")))
-#endif
-void hp_csv_plan_masks_avx2(const uint8_t *p, size_t chunk_len,
-                            uint64_t *nl, uint64_t *qm) {
-    uint64_t n = 0, q = 0;
-    size_t i = 0;
-    const __m256i v_lf    = _mm256_set1_epi8('\n');
-    const __m256i v_quote = _mm256_set1_epi8('"');
-
-    while (i + 32 <= chunk_len) {
-        __m256i chunk = _mm256_loadu_si256((const __m256i *)(p + i));
-        n |= (uint64_t)(uint32_t)_mm256_movemask_epi8(
-                 _mm256_cmpeq_epi8(chunk, v_lf)) << i;
-        q |= (uint64_t)(uint32_t)_mm256_movemask_epi8(
-                 _mm256_cmpeq_epi8(chunk, v_quote)) << i;
-        i += 32;
-    }
-    for (; i < chunk_len; i++) {
-        uint64_t bit = 1ull << i;
-        if (p[i] == '\n') {
-            n |= bit;
-        } else if (p[i] == '"') {
-            q |= bit;
-        }
-    }
-    *nl = n;
-    *qm = q;
-}

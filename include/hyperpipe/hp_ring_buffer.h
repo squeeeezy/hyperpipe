@@ -17,6 +17,8 @@ typedef struct hp_reader_s {
     bool sniffed;              /* gzip magic check already performed */
     bool gz_active;            /* decompression engaged */
     bool eof;                  /* final byte of the logical stream produced */
+    bool limited;              /* stop after `limit` more bytes (plain input) */
+    uint64_t limit;
     hp_gzip_inflate_t gz;      /* decompression state (valid when gz_active) */
 } hp_reader_t;
 
@@ -33,6 +35,8 @@ HP_INLINE void hp_reader_init(hp_reader_t *r, FILE *stream) {
     r->sniffed = false;
     r->gz_active = false;
     r->eof = false;
+    r->limited = false;
+    r->limit = 0;
 }
 
 /* Reads up to cap bytes into dst. *n_out == 0 means logical end of stream.

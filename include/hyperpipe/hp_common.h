@@ -22,21 +22,6 @@
     #define HP_HOT
 #endif
 
-#if defined(_MSC_VER)
-    #include <intrin.h>
-#endif
-
-/* Index of the lowest set bit; x must be non-zero. */
-HP_INLINE unsigned hp_ctz64(uint64_t x) {
-#if defined(_MSC_VER)
-    unsigned long i;
-    _BitScanForward64(&i, x);
-    return (unsigned)i;
-#else
-    return (unsigned)__builtin_ctzll(x);
-#endif
-}
-
 typedef enum hp_error_e {
     HP_OK = 0,
     HP_ERR_GENERIC = -1,

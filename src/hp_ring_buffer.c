@@ -9,7 +9,15 @@ hp_error_t hp_reader_read(hp_reader_t *r, uint8_t *dst, size_t cap, size_t *n_ou
     if (r->eof) return HP_OK;
 
     if (!r->gz_active) {
-        size_t n = fread(dst, 1, cap, r->stream);
+        /* A byte limit marks a span of a plain file (parallel workers). A
+         * span may start anywhere in the data, so it is never sniffed for
+         * the gzip magic. */
+        if (r->limited) {
+            if (cap > r->limit) cap = (size_t)r->limit;
+            r->sniffed = true;
+        }
+        size_t n = cap ? fread(dst, 1, cap, r->stream) : 0;
+        if (r->limited) r->limit -= n;
         if (n == 0) {
             if (ferror(r->stream)) return HP_ERR_IO;
             r->eof = true;
@@ -30,7 +38,7 @@ hp_error_t hp_reader_read(hp_reader_t *r, uint8_t *dst, size_t cap, size_t *n_ou
             }
         }
 
-        if (n < cap && feof(r->stream)) {
+        if ((n < cap && feof(r->stream)) || (r->limited && r->limit == 0)) {
             r->eof = true;
         }
         *n_out = n;

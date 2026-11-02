@@ -273,26 +273,3 @@ hp_error_t hp_csv_parse_row(hp_csv_parser_t *parser,
     }
     return hp_csv_parse_row_scalar(parser, src, len, consumed, out_row, is_eof);
 }
-
-/* ---- Chunk planner bitmaps ------------------------------------------------
- *
- * Portable reference for the --jobs boundary scan: newline and quote
- * positions of one chunk as two 64-bit bitmaps. The parallel planner walks
- * these bitmaps instead of testing every byte, which moves the planning
- * pass (a full sequential read that gates when the last worker can start)
- * from a byte-at-a-time loop to memchr-class speed. The SIMD twins in
- * hp_csv_avx2.c / hp_csv_avx512.c return identical bitmaps. */
-void hp_csv_plan_masks_scalar(const uint8_t *p, size_t chunk_len,
-                              uint64_t *nl, uint64_t *qm) {
-    uint64_t n = 0, q = 0;
-    for (size_t i = 0; i < chunk_len; i++) {
-        uint64_t bit = 1ull << i;
-        if (p[i] == '\n') {
-            n |= bit;
-        } else if (p[i] == '"') {
-            q |= bit;
-        }
-    }
-    *nl = n;
-    *qm = q;
-}

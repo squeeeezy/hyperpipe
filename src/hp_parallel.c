@@ -1,4 +1,19 @@
-/* Parallel chunked pipeline (--jobs N). */
+/* Parallel chunked pipeline (--jobs N).
+ *
+ * The input file is cut at fixed offsets into ranges a few MiB long, several
+ * per thread so the work balances. Each range becomes a chunk of whole
+ * records: the chunk starts at the first record that begins inside its
+ * range. In NDJSON that is the byte after the first newline. In CSV a
+ * newline ends a record only outside quotes, so a first pass counts the
+ * quotes of every range in parallel; a prefix XOR of the counts gives the
+ * quoting state at each cut, and from there the next record start is one
+ * short scan away.
+ *
+ * Worker threads then take chunks in file order and transcode each into its
+ * own memory buffer. The calling thread writes finished chunks strictly in
+ * order, which reproduces the single-threaded byte stream exactly. At most
+ * `window` chunks are claimed ahead of the writer, which bounds memory
+ * independently of the input size. */
 
 #include "hyperpipe/hp_parallel.h"
 #include "hp_thread.h"
@@ -7,151 +22,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #if defined(_WIN32)
     #include <io.h>
 #endif
 
 #define HP_JOB_MAX 64
-#define HP_QUEUE_PAGE_SIZE (256 * 1024)
-/* Total output bytes all non-head workers may buffer while the coordinator
- * drains the head worker in chunk order. The cap is what bounds parallel
- * run memory independently of input size; the coordinator splits it evenly
- * between the non-head workers, so a 2-job run lets the trailing worker
- * buffer up to 64 MiB while 16 jobs get 4 MiB each. */
-#define HP_QUEUE_TOTAL_BUDGET (64u * 1024 * 1024)
-
-/* ---- bounded ordered page queue ------------------------------------------
- * Workers push serialized pages; the coordinator pops them in chunk order.
- * Pushing blocks while the queue holds more than its share of
- * HP_QUEUE_TOTAL_BUDGET, which caps total output memory independent of
- * input size. The stop flag breaks both sides out of their waits when
- * a run is aborted (worker failure, write failure, spawn failure). */
-
-typedef struct hp_page_node_s {
-    struct hp_page_node_s *next;
-    size_t len;
-    uint8_t *data;
-} hp_page_node_t;
-
-typedef struct hp_out_queue_s {
-    hp_mutex_t mu;
-    hp_cond_t not_empty;
-    hp_cond_t not_full;
-    hp_page_node_t *head;
-    hp_page_node_t *tail;
-    size_t bytes;
-    size_t max_bytes;    /* this queue's share of HP_QUEUE_TOTAL_BUDGET */
-    bool producer_done;
-    bool stop;
-} hp_out_queue_t;
-
-static void queue_init(hp_out_queue_t *q, size_t max_bytes) {
-    hp_mutex_init(&q->mu);
-    hp_cond_init(&q->not_empty);
-    hp_cond_init(&q->not_full);
-    q->head = q->tail = NULL;
-    q->bytes = 0;
-    q->max_bytes = max_bytes;
-    q->producer_done = false;
-    q->stop = false;
-}
-
-/* Frees any queued pages and the queue primitives themselves. Only safe
- * after the producing worker has been joined. */
-static void queue_destroy(hp_out_queue_t *q) {
-    hp_page_node_t *n = q->head;
-    while (n) {
-        hp_page_node_t *next = n->next;
-        free(n->data);
-        free(n);
-        n = next;
-    }
-    q->head = q->tail = NULL;
-    hp_mutex_destroy(&q->mu);
-    hp_cond_destroy(&q->not_empty);
-    hp_cond_destroy(&q->not_full);
-}
-
-/* Transcoder output sink: splits the worker's page flushes into queue
- * nodes. A stop request turns into a short write, which the transcoder
- * reports as an I/O error so the worker's run unwinds; bytes delivered
- * before the stop stay valid. */
-static size_t queue_write(void *ctx, const void *data, size_t size) {
-    hp_out_queue_t *q = (hp_out_queue_t *)ctx;
-    const uint8_t *buf = (const uint8_t *)data;
-    size_t off = 0;
-
-    while (off < size) {
-        hp_mutex_lock(&q->mu);
-        while (q->bytes >= q->max_bytes && !q->stop) {
-            hp_cond_wait(&q->not_full, &q->mu);
-        }
-        bool stop = q->stop;
-        hp_mutex_unlock(&q->mu);
-        if (stop) {
-            return off;
-        }
-
-        size_t take = size - off;
-        if (take > HP_QUEUE_PAGE_SIZE) take = HP_QUEUE_PAGE_SIZE;
-
-        hp_page_node_t *node = (hp_page_node_t *)malloc(sizeof(*node));
-        if (!node) return off;
-        node->data = (uint8_t *)malloc(take);
-        if (!node->data) {
-            free(node);
-            return off;
-        }
-        memcpy(node->data, buf + off, take);
-        node->len = take;
-        node->next = NULL;
-
-        hp_mutex_lock(&q->mu);
-        if (q->tail) q->tail->next = node;
-        else q->head = node;
-        q->tail = node;
-        q->bytes += take;
-        hp_mutex_unlock(&q->mu);
-        hp_cond_signal(&q->not_empty);
-
-        off += take;
-    }
-    return size;
-}
-
-static void queue_producer_done(hp_out_queue_t *q) {
-    hp_mutex_lock(&q->mu);
-    q->producer_done = true;
-    hp_mutex_unlock(&q->mu);
-    hp_cond_signal(&q->not_empty);
-}
-
-static void queue_request_stop(hp_out_queue_t *q) {
-    hp_mutex_lock(&q->mu);
-    q->stop = true;
-    hp_mutex_unlock(&q->mu);
-    hp_cond_signal(&q->not_full);
-    hp_cond_signal(&q->not_empty);
-}
-
-/* Pops one page, blocking until a page arrives, the producer finishes, or a
- * stop is requested. Returns NULL in the latter two cases. */
-static hp_page_node_t *queue_pop(hp_out_queue_t *q) {
-    hp_mutex_lock(&q->mu);
-    while (q->head == NULL && !q->producer_done && !q->stop) {
-        hp_cond_wait(&q->not_empty, &q->mu);
-    }
-    hp_page_node_t *node = q->head;
-    if (node) {
-        q->head = node->next;
-        if (!q->head) q->tail = NULL;
-        q->bytes -= node->len;
-        hp_cond_signal(&q->not_full);
-    }
-    hp_mutex_unlock(&q->mu);
-    return node;
-}
+#define HP_RANGE_MIN (1u << 20)
+#define HP_RANGE_MAX (8u << 20)
+#define HP_RANGES_PER_JOB 8
+#define HP_READ_BLOCK (256 * 1024)
+#define HP_HEADER_MAX (64u << 20)
+#define HP_AUTO_MIN_SIZE (16u << 20)
+#define HP_AUTO_MAX_JOBS 16
 
 /* ---- file access ------------------------------------------------------------ */
 
@@ -177,256 +61,382 @@ static bool seek_to(FILE *f, uint64_t offset) {
 #endif
 }
 
-/* ---- worker --------------------------------------------------------------- */
+/* Writes at an absolute offset without using a shared file position, so
+ * several threads can fill one output file at the same time. */
+static bool write_at(FILE *f, uint64_t offset, const uint8_t *data, size_t len) {
+#if defined(_WIN32)
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    while (len > 0) {
+        DWORD part = len > (1u << 30) ? (1u << 30) : (DWORD)len;
+        OVERLAPPED at;
+        memset(&at, 0, sizeof(at));
+        at.Offset = (DWORD)offset;
+        at.OffsetHigh = (DWORD)(offset >> 32);
+        DWORD done = 0;
+        if (!WriteFile(h, data, part, &done, &at) || done == 0) return false;
+        data += done;
+        len -= done;
+        offset += done;
+    }
+#else
+    int fd = fileno(f);
+    while (len > 0) {
+        ssize_t done = pwrite(fd, data, len, (off_t)offset);
+        if (done <= 0) return false;
+        data += done;
+        len -= (size_t)done;
+        offset += (uint64_t)done;
+    }
+#endif
+    return true;
+}
 
-typedef struct hp_worker_s {
-    hp_thread_t thread;
-    const char *input_path;
-    uint64_t chunk_start;
-    uint64_t chunk_end;
-    hp_transcoder_config_t cfg;
-    hp_header_t preset;              /* deep copy for workers > 0 */
-    char *quarantine_part;           /* NULL when not quarantining */
-    hp_out_queue_t queue;
+/* Whether workers may write their chunks straight into the output, and at
+ * which offset the output starts. Only a regular file qualifies, and only
+ * on POSIX: NTFS zero-fills the gap whenever a write lands past the file's
+ * valid data length, so out-of-order chunks would write most of the file
+ * twice. Everything else gets the ordered writer. */
+static bool can_write_at_offsets(FILE *out, uint64_t *base) {
+#if defined(_WIN32)
+    (void)out;
+    (void)base;
+    return false;
+#else
+    uint64_t size;
+    off_t pos = ftello(out);
+    if (pos < 0 || !regular_file_size(out, &size)) return false;
+    *base = (uint64_t)pos;
+    return true;
+#endif
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* ---- record boundaries ---------------------------------------------------------- */
+
+/* Offset just past the first newline at or after `pos` that lies outside
+ * quotes, given the quoting state before `pos`; the file size when the
+ * record runs to the end of the file. */
+static uint64_t scan_to_record_end(FILE *f, uint64_t pos, bool in_quotes,
+                                   bool quote_aware, uint64_t file_size) {
+    uint8_t block[4096];
+    if (!seek_to(f, pos)) return file_size;
+    size_t got;
+    while ((got = fread(block, 1, sizeof(block), f)) > 0) {
+        for (size_t k = 0; k < got; k++, pos++) {
+            if (quote_aware && block[k] == '"') {
+                in_quotes = !in_quotes;
+            } else if (block[k] == '\n' && !in_quotes) {
+                return pos + 1;
+            }
+        }
+    }
+    return file_size;
+}
+
+/* Offset of the first record that starts at or after `from`, given the
+ * quoting state before `from`. The scan begins one byte early because a
+ * newline right before `from` makes `from` itself a record start. */
+static uint64_t next_record_start(FILE *f, uint64_t from, bool in_quotes,
+                                  bool quote_aware, uint64_t file_size) {
+    if (from == 0) return 0;
+    uint8_t prev;
+    if (!seek_to(f, from - 1) || fread(&prev, 1, 1, f) != 1) return file_size;
+    if (quote_aware && prev == '"') in_quotes = !in_quotes;
+    return scan_to_record_end(f, from - 1, in_quotes, quote_aware, file_size);
+}
+
+/* ---- growable output buffer ------------------------------------------------- */
+
+typedef struct hp_buf_s {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} hp_buf_t;
+
+/* Transcoder sink: appends a page to the chunk's buffer. A short count on
+ * allocation failure makes the transcoder report an I/O error. */
+static size_t buf_append(void *ctx, const void *data, size_t len) {
+    hp_buf_t *b = (hp_buf_t *)ctx;
+    if (b->len + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 1u << 20;
+        while (cap < b->len + len) cap *= 2;
+        uint8_t *grown = (uint8_t *)realloc(b->data, cap);
+        if (!grown) return 0;
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    return len;
+}
+
+static void buf_free(hp_buf_t *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = b->cap = 0;
+}
+
+/* ---- shared state ------------------------------------------------------------ */
+
+typedef struct hp_chunk_s {
+    uint64_t cut;              /* raw range start; records start at or after it */
+    bool odd_quotes;           /* the range holds an odd number of quotes */
+    bool cut_in_quotes;        /* quoting state just before `cut` */
+    hp_buf_t out;
+    hp_buf_t quarantine;
     hp_transcoder_stats_t stats;
     hp_error_t err;
-} hp_worker_t;
+    bool done;
+    bool placed;               /* `offset` is final: the worker may write */
+    uint64_t offset;
+} hp_chunk_t;
 
-static void *hp_worker_main(void *arg) {
-    hp_worker_t *w = (hp_worker_t *)arg;
+typedef struct hp_pool_s {
+    const char *path;
+    uint64_t file_size;
+    bool quote_aware;
+    hp_transcoder_config_t cfg;     /* template for every chunk */
+    const hp_header_t *header;      /* bound by chunks after the first */
+    FILE *out;
+    bool positional;                /* workers write their own chunks */
 
-    FILE *in = fopen(w->input_path, "rb");
-    if (!in) {
-        w->err = HP_ERR_IO;
-        queue_producer_done(&w->queue);
-        return NULL;
+    hp_chunk_t *chunks;
+    size_t n_chunks;
+
+    hp_mutex_t mu;
+    hp_cond_t progress;             /* a chunk finished or was written */
+    size_t next;                    /* next range or chunk to claim */
+    size_t written;                 /* chunks already written out */
+    size_t window;                  /* 0: no limit (quote counting) */
+    bool stop;
+
+    /* Written-out buffers kept for reuse: their pages are already mapped,
+     * so later chunks skip both the growth copies and the page faults. */
+    hp_buf_t spare[HP_JOB_MAX + 2];
+    size_t n_spare;
+} hp_pool_t;
+
+/* Claims the next range or chunk. A claimed chunk also takes a spare output
+ * buffer when one is available. */
+static bool claim(hp_pool_t *pool, size_t *index) {
+    hp_mutex_lock(&pool->mu);
+    while (pool->window && !pool->stop && pool->next < pool->n_chunks &&
+           pool->next >= pool->written + pool->window) {
+        hp_cond_wait(&pool->progress, &pool->mu);
     }
-    if (!seek_to(in, w->chunk_start)) {
-        fclose(in);
-        w->err = HP_ERR_IO;
-        queue_producer_done(&w->queue);
-        return NULL;
+    bool ok = !pool->stop && pool->next < pool->n_chunks;
+    if (ok) {
+        *index = pool->next++;
+        if (pool->window && pool->n_spare > 0) {
+            pool->chunks[*index].out = pool->spare[--pool->n_spare];
+        }
     }
+    hp_mutex_unlock(&pool->mu);
+    return ok;
+}
 
-    w->cfg.sink = queue_write;
-    w->cfg.sink_ctx = &w->queue;
-
-    hp_transcoder_t tc;
-    w->err = hp_transcoder_init(&tc, &w->cfg);
-    if (w->err == HP_OK) {
-        w->err = hp_transcoder_run(&tc, in, NULL);
-        w->stats = tc.stats;
-        hp_transcoder_free(&tc);
+/* Returns a written-out buffer to the spare list, or frees it when full */
+static void recycle(hp_pool_t *pool, hp_buf_t *b) {
+    b->len = 0;
+    if (pool->n_spare < sizeof(pool->spare) / sizeof(pool->spare[0])) {
+        pool->spare[pool->n_spare++] = *b;
+        b->data = NULL;
+        b->cap = 0;
+    } else {
+        buf_free(b);
     }
+}
 
-    fclose(in);
-    queue_producer_done(&w->queue);
+static int start_threads(hp_pool_t *pool, int jobs, hp_thread_fn fn, hp_thread_t *threads) {
+    int started = 0;
+    pool->next = 0;
+    while (started < jobs && hp_thread_create(&threads[started], fn, pool)) started++;
+    return started;
+}
+
+/* ---- phase 1: quote parity per range ------------------------------------------ */
+
+/* Written as a plain loop on purpose: compilers vectorize it into byte
+ * compares and subtracts, which runs at memory speed. */
+static size_t count_quotes(const uint8_t *p, size_t n) {
+    size_t quotes = 0;
+    for (size_t i = 0; i < n; i++) quotes += (p[i] == '"');
+    return quotes;
+}
+
+static void *count_quotes_main(void *arg) {
+    hp_pool_t *pool = (hp_pool_t *)arg;
+    FILE *f = fopen(pool->path, "rb");
+    uint8_t *block = (uint8_t *)malloc(HP_READ_BLOCK);
+    size_t i;
+    while (claim(pool, &i)) {
+        hp_chunk_t *c = &pool->chunks[i];
+        uint64_t end = (i + 1 < pool->n_chunks) ? pool->chunks[i + 1].cut : pool->file_size;
+        uint64_t left = end - c->cut;
+        size_t quotes = 0;
+        if (!f || !block || !seek_to(f, c->cut)) {
+            c->err = HP_ERR_IO;
+            left = 0;
+        }
+        while (left > 0) {
+            size_t want = left < HP_READ_BLOCK ? (size_t)left : HP_READ_BLOCK;
+            size_t got = fread(block, 1, want, f);
+            if (got == 0) {
+                c->err = HP_ERR_IO;
+                break;
+            }
+            quotes += count_quotes(block, got);
+            left -= got;
+        }
+        c->odd_quotes = quotes & 1;
+    }
+    free(block);
+    if (f) fclose(f);
     return NULL;
 }
 
-/* ---- chunk planning --------------------------------------------------------- */
+/* ---- phase 2: transcode chunks ------------------------------------------------- */
 
-/* One sequential pass that records chunk starts and captures the header row
- * bytes. A boundary is the end of a line that begins outside a quoted
- * field: RFC 4180 doubles embedded quotes, so a running quote parity tells
- * whether a newline terminates a record. NDJSON input runs with quote_aware
- * = false: a raw newline always ends a line there, matching the
- * single-stream parser.
- *
- * The scan classifies bytes through the dispatchable plan_masks kernel
- * (newline/quote bitmaps per 64-byte chunk) instead of a per-byte branch,
- * because planning reads the whole file before the last worker can start:
- * its speed sets the floor for the entire pipeline. The scan also stops as
- * soon as every chunk boundary is known - the tail of the file belongs to
- * the last worker by construction, so reading it would be pure overhead. */
-static hp_error_t hp_plan_chunks(FILE *f, uint64_t file_size, int jobs,
-                                 bool quote_aware,
-                                 uint64_t *starts, int *n_chunks,
-                                 char **header_span, size_t *header_len) {
-    const uint64_t target = file_size / (uint64_t)jobs;
-    int n = 0;
-    starts[n++] = 0;
+static void *transcode_main(void *arg) {
+    hp_pool_t *pool = (hp_pool_t *)arg;
+    FILE *f = fopen(pool->path, "rb");
+    size_t i;
+    while (claim(pool, &i)) {
+        hp_chunk_t *c = &pool->chunks[i];
+        c->err = f ? HP_OK : HP_ERR_IO;
 
-    *header_span = NULL;
-    *header_len = 0;
-    size_t header_cap = 0;
-
-    void (*masks)(const uint8_t *, size_t, uint64_t *, uint64_t *) =
-        g_hp_dispatch.plan_masks ? g_hp_dispatch.plan_masks
-                                 : hp_csv_plan_masks_scalar;
-
-    uint64_t offset = 0;
-    uint64_t last_boundary = 0;
-    bool in_quotes = false;
-    bool header_done = false;
-
-    if (target == 0) {
-        *n_chunks = 1;
-        return HP_OK;
-    }
-
-    uint8_t buf[1 << 16];
-    while (offset < file_size && n < jobs) {
-        size_t want = sizeof(buf);
-        if (file_size - offset < want) want = (size_t)(file_size - offset);
-        size_t got = fread(buf, 1, want, f);
-        if (got == 0) break;
-
-        /* Header capture: the first raw line, verbatim, independent of
-         * quoting (the same span the single-stream path would call its
-         * header row). The coordinator parses it once and hands it to
-         * every worker > 0 as the preset schema. */
-        if (!header_done) {
-            const uint8_t *hl = (const uint8_t *)memchr(buf, '\n', got);
-            size_t take = hl ? (size_t)(hl - buf) + 1 : got;
-            if (*header_len + take + 1 > header_cap) {
-                size_t new_cap = header_cap ? header_cap * 2 : 8192;
-                while (*header_len + take + 1 > new_cap) new_cap *= 2;
-                char *nb = (char *)realloc(*header_span, new_cap);
-                if (!nb) {
-                    free(*header_span);
-                    *header_span = NULL;
-                    return HP_ERR_NOMEM;
-                }
-                *header_span = nb;
-                header_cap = new_cap;
-            }
-            memcpy(*header_span + *header_len, buf, take);
-            *header_len += take;
-            if (hl) header_done = true;
-        }
-
-        for (size_t base = 0; base < got && n < jobs; base += 64) {
-            size_t cl = (got - base > 64) ? 64 : got - base;
-            uint64_t nl_mask, qm_mask;
-            masks(buf + base, cl, &nl_mask, &qm_mask);
-
-            if (quote_aware && (qm_mask != 0 || in_quotes)) {
-                if (qm_mask == 0) {
-                    /* Parity is odd and the chunk holds no quotes: every
-                     * byte lies inside a quoted field, so no record can
-                     * end here and the entry parity carries over. */
-                    continue;
-                }
-
-                /* Quoted region: walk quotes and newlines in position
-                 * order. A local parity seeded from the chunk entry state
-                 * decides whether a newline ends a record; the chunk exit
-                 * parity is that walk's final value. */
-                bool parity = in_quotes;
-                uint64_t bits = nl_mask | qm_mask;
-                while (bits) {
-                    size_t rel = (size_t)hp_ctz64(bits);
-                    bits &= bits - 1;
-                    if (qm_mask & (1ull << rel)) {
-                        parity = !parity;
-                    } else if (!parity) {
-                        uint64_t line_end = offset + base + rel + 1;
-                        if (line_end - last_boundary >= target && n < jobs &&
-                            line_end < file_size) {
-                            starts[n++] = line_end;
-                            last_boundary = line_end;
-                        }
-                    }
-                }
-                in_quotes = parity;
-            } else {
-                /* Common case: no quotes in this chunk and even parity -
-                 * every newline ends a record. */
-                while (nl_mask) {
-                    size_t rel = (size_t)hp_ctz64(nl_mask);
-                    nl_mask &= nl_mask - 1;
-                    uint64_t line_end = offset + base + rel + 1;
-                    if (line_end - last_boundary >= target && n < jobs &&
-                        line_end < file_size) {
-                        starts[n++] = line_end;
-                        last_boundary = line_end;
-                    }
-                }
+        uint64_t start = 0, end = pool->file_size;
+        if (c->err == HP_OK) {
+            start = next_record_start(f, c->cut, c->cut_in_quotes,
+                                      pool->quote_aware, pool->file_size);
+            if (i + 1 < pool->n_chunks) {
+                const hp_chunk_t *next = &pool->chunks[i + 1];
+                end = next_record_start(f, next->cut, next->cut_in_quotes,
+                                        pool->quote_aware, pool->file_size);
             }
         }
-        offset += got;
-    }
 
-    *n_chunks = n;
-    return HP_OK;
+        /* A record longer than a range leaves the ranges it covers empty */
+        if (c->err == HP_OK && end > start) {
+            hp_transcoder_config_t cfg = pool->cfg;
+            cfg.span_end = end - start;
+            cfg.limit_rows = 0;
+            cfg.lock_schema = true;
+            cfg.preset_header = (i > 0) ? pool->header : NULL;
+            cfg.sink = buf_append;
+            cfg.sink_ctx = &c->out;
+            if (cfg.on_error == HP_ON_ERROR_QUARANTINE) {
+                cfg.quarantine_path = NULL;
+                cfg.quarantine_sink = buf_append;
+                cfg.quarantine_ctx = &c->quarantine;
+            }
+
+            hp_transcoder_t tc;
+            if (!seek_to(f, start)) {
+                c->err = HP_ERR_IO;
+            } else if ((c->err = hp_transcoder_init(&tc, &cfg)) == HP_OK) {
+                c->err = hp_transcoder_run(&tc, f, NULL);
+                c->stats = tc.stats;
+                hp_transcoder_free(&tc);
+            }
+        }
+
+        hp_mutex_lock(&pool->mu);
+        c->done = true;
+        if (c->err != HP_OK) pool->stop = true;
+        hp_cond_broadcast(&pool->progress);
+
+        /* Positional output: once the writer has summed the sizes of the
+         * chunks before this one, the chunk lands at its offset directly */
+        if (pool->positional && c->err == HP_OK) {
+            while (!c->placed && !pool->stop) hp_cond_wait(&pool->progress, &pool->mu);
+            if (c->placed) {
+                hp_mutex_unlock(&pool->mu);
+                bool ok = write_at(pool->out, c->offset, c->out.data, c->out.len);
+                hp_mutex_lock(&pool->mu);
+                if (!ok) {
+                    c->err = HP_ERR_IO;
+                    pool->stop = true;
+                    hp_cond_broadcast(&pool->progress);
+                }
+            }
+            recycle(pool, &c->out);
+        }
+        hp_mutex_unlock(&pool->mu);
+    }
+    if (f) fclose(f);
+    return NULL;
 }
 
-/* Parses the captured header span with the reference scalar parsers so that
- * workers > 0 can bind filter/projection before their first row. CSV/TSV
- * spans parse as one record; NDJSON spans resolve the key order of the
- * first line, exactly as the single-stream path's first row does. A header
- * the reference parsers reject reports HP_ERR_UNSUPPORTED so the CLI falls
- * back to the single-threaded path, whose own fault-tolerance mode owns the
- * offending record (fail, skip or quarantine). */
-static hp_error_t hp_parse_header_span(hp_format_t fmt, const char *span,
-                                       size_t len, hp_header_t *out) {
-    if (fmt == HP_FORMAT_NDJSON) {
-        static hp_row_t probe;       /* scratch: only the key names matter */
-        char *arena = (char *)malloc(len ? len : 1);
-        if (!arena) return HP_ERR_NOMEM;
-        memset(out, 0, sizeof(*out));
-        hp_error_t err = hp_json_parse_line(span, len, out, &probe, arena, len);
+/* ---- header ---------------------------------------------------------------------- */
+
+/* Parses the first record with the reference scalar parsers so chunks after
+ * the first can bind filter and projection before their first row. A header
+ * the parsers reject reports HP_ERR_UNSUPPORTED: the caller then runs the
+ * single-threaded path, whose fault-tolerance mode owns that record. */
+static hp_error_t parse_header(FILE *f, uint64_t file_size, hp_format_t fmt,
+                               bool quote_aware, hp_header_t *out) {
+    memset(out, 0, sizeof(*out));
+    uint64_t len = scan_to_record_end(f, 0, false, quote_aware, file_size);
+    if (len == 0 || len > HP_HEADER_MAX) return HP_ERR_UNSUPPORTED;
+
+    char *span = (char *)malloc((size_t)len);
+    hp_row_t *row = (hp_row_t *)malloc(sizeof(*row));
+    hp_error_t err = (span && row) ? HP_OK : HP_ERR_NOMEM;
+    if (err == HP_OK && (!seek_to(f, 0) || fread(span, 1, (size_t)len, f) != len)) {
+        err = HP_ERR_IO;
+    }
+
+    if (err == HP_OK && fmt == HP_FORMAT_NDJSON) {
+        char *arena = (char *)malloc((size_t)len);
+        err = arena ? hp_json_parse_line(span, (size_t)len, out, row, arena, (size_t)len)
+                    : HP_ERR_NOMEM;
         free(arena);
-        return (err == HP_OK) ? HP_OK : HP_ERR_UNSUPPORTED;
+    } else if (err == HP_OK) {
+        hp_csv_parser_t parser;
+        size_t consumed = 0;
+        err = hp_csv_parser_init(&parser, fmt, HP_SIMD_SCALAR);
+        if (err == HP_OK) {
+            err = hp_csv_parse_row_scalar(&parser, (const uint8_t *)span, (size_t)len,
+                                          &consumed, row, true);
+        }
+        for (size_t i = 0; err == HP_OK && i < row->field_count; i++) {
+            char *name = (char *)malloc(row->fields[i].len + 1);
+            if (!name) {
+                err = HP_ERR_NOMEM;
+                break;
+            }
+            memcpy(name, row->fields[i].ptr, row->fields[i].len);
+            name[row->fields[i].len] = '\0';
+            out->names[out->count++] = name;
+        }
+        hp_csv_parser_free(&parser);
     }
-
-    hp_csv_parser_t parser;
-    hp_error_t err = hp_csv_parser_init(&parser, fmt, HP_SIMD_SCALAR);
-    if (err != HP_OK) return err;
-
-    hp_row_t row;
-    size_t consumed = 0;
-    err = hp_csv_parse_row_scalar(&parser, (const uint8_t *)span, len,
-                                  &consumed, &row, true);
-    if (err != HP_OK) err = HP_ERR_UNSUPPORTED;
-
-    out->count = 0;
-    for (size_t i = 0; err == HP_OK && i < row.field_count && i < HP_MAX_COLUMNS; i++) {
-        char name[256];
-        size_t flen = row.fields[i].len < sizeof(name) - 1
-                          ? row.fields[i].len : sizeof(name) - 1;
-        memcpy(name, row.fields[i].ptr, flen);
-        name[flen] = '\0';
-        out->names[out->count] = strdup(name);
-        if (!out->names[out->count]) err = HP_ERR_NOMEM;
-        else out->count++;
-    }
-    hp_csv_parser_free(&parser);
+    free(span);
+    free(row);
+    if (err != HP_OK && err != HP_ERR_NOMEM && err != HP_ERR_IO) err = HP_ERR_UNSUPPORTED;
     return err;
 }
 
-static void hp_free_header(hp_header_t *h) {
-    for (size_t i = 0; i < h->count; i++) {
-        free(h->names[i]);
-    }
-    h->count = 0;
-}
+/* ---- coordinator ------------------------------------------------------------------ */
 
-/* Appends each worker's quarantine part file to the user-visible quarantine
- * destination, in chunk order, and removes the parts. */
-static void hp_merge_quarantine(const hp_transcoder_config_t *base,
-                                const hp_worker_t *workers, int n_chunks) {
-    if (!base->quarantine_path) return;
-    FILE *dst = fopen(base->quarantine_path, "wb");
-    if (!dst) return;
-    for (int i = 0; i < n_chunks; i++) {
-        if (!workers[i].quarantine_part) continue;
-        FILE *src = fopen(workers[i].quarantine_part, "rb");
-        if (src) {
-            char cp[65536];
-            size_t r;
-            while ((r = fread(cp, 1, sizeof(cp), src)) > 0) {
-                fwrite(cp, 1, r, dst);
-            }
-            fclose(src);
-        }
-        remove(workers[i].quarantine_part);
-    }
-    fclose(dst);
-}
+int hp_parallel_auto_jobs(const char *input_path) {
+    FILE *f = fopen(input_path, "rb");
+    if (!f) return 1;
+    uint64_t size = 0;
+    bool regular = regular_file_size(f, &size);
+    fclose(f);
+    if (!regular || size < HP_AUTO_MIN_SIZE) return 1;
 
-/* ---- coordinator ------------------------------------------------------------- */
+    int n = hp_cpu_count();
+    if (n > HP_AUTO_MAX_JOBS) n = HP_AUTO_MAX_JOBS;
+    return n > 1 ? n : 1;
+}
 
 hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
                            const char *input_path,
@@ -436,223 +446,171 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
     if (!base_cfg || !input_path || !out_stream || jobs <= 1 || !stats_out) {
         return HP_ERR_INVALID_ARG;
     }
-    if (jobs > HP_JOB_MAX) return HP_ERR_INVALID_ARG;
+    if (jobs > HP_JOB_MAX) jobs = HP_JOB_MAX;
+    double t0 = now_seconds();
 
     FILE *probe = fopen(input_path, "rb");
     if (!probe) return HP_ERR_IO;
 
-    /* Regular file only: chunk planning and worker positioning both need
-     * seekable byte offsets. */
     uint64_t file_size = 0;
     if (!regular_file_size(probe, &file_size)) {
         fclose(probe);
         return HP_ERR_INVALID_ARG;
     }
 
-    /* Input sniffing must see the file from offset 0: the gzip magic check
-     * and the format sniff read the same prefix, so a 2-byte magic peek
-     * before the sample would shift the sample past the leading `{` of an
-     * NDJSON file and misclassify it as CSV. */
+    /* The format sniff and the gzip check read the same prefix from offset 0 */
     uint8_t sample[4096];
     size_t have = fread(sample, 1, sizeof(sample), probe);
-    bool is_gzip = (have >= 2 && sample[0] == 0x1F && sample[1] == 0x8B);
-
-    hp_format_t in_fmt = base_cfg->in_format;
-    if (in_fmt == HP_FORMAT_AUTO) {
-        in_fmt = hp_sniff_format(sample, have);
+    if (have >= 2 && sample[0] == 0x1F && sample[1] == 0x8B) {
+        fclose(probe);
+        return HP_ERR_UNSUPPORTED;
     }
-    if (is_gzip) {
+    hp_format_t in_fmt = base_cfg->in_format;
+    if (in_fmt == HP_FORMAT_AUTO) in_fmt = hp_sniff_format(sample, have);
+
+    /* Chunk cuts assume balanced quotes. A stray quote in dirty CSV shifts
+     * them, while the sequential parser resynchronizes at the next line in
+     * skip and quarantine modes, so those modes keep the sequential path.
+     * NDJSON records always end at a newline and stay parallel. */
+    if (in_fmt != HP_FORMAT_NDJSON && base_cfg->on_error != HP_ON_ERROR_FAIL) {
         fclose(probe);
         return HP_ERR_UNSUPPORTED;
     }
 
-    if (!seek_to(probe, 0)) {
-        fclose(probe);
-        return HP_ERR_IO;
-    }
-
-    /* The boundary scan consumes the dispatch table; initialize it for the
-     * requested mode even when hp_parallel_run is the first library entry
-     * the process calls (the CLI initializes it before transcoding, and
-     * workers re-init under the same mutex). */
+    /* The quote count uses the dispatch table: initialize it even when this
+     * is the first library call of the process. */
     hp_dispatch_init(base_cfg->simd_mode);
 
-    bool quote_aware = (in_fmt == HP_FORMAT_CSV);
-    uint64_t *starts = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)jobs);
-    if (!starts) {
-        fclose(probe);
-        return HP_ERR_NOMEM;
+    hp_pool_t pool;
+    memset(&pool, 0, sizeof(pool));
+    pool.path = input_path;
+    pool.file_size = file_size;
+    pool.quote_aware = (in_fmt != HP_FORMAT_NDJSON);
+
+    /* Output format resolves as in hp_transcoder_run: CSV/TSV input
+     * defaults to NDJSON output, NDJSON input to CSV. */
+    pool.cfg = *base_cfg;
+    pool.cfg.in_format = in_fmt;
+    if (pool.cfg.out_format == HP_FORMAT_AUTO) {
+        pool.cfg.out_format = (in_fmt == HP_FORMAT_NDJSON) ? HP_FORMAT_CSV : HP_FORMAT_NDJSON;
     }
 
-    char *header_span = NULL;
-    size_t header_len = 0;
-    int n_chunks = 1;
-    hp_error_t err = hp_plan_chunks(probe, file_size, jobs, quote_aware,
-                                    starts, &n_chunks,
-                                    &header_span, &header_len);
+    hp_header_t header;
+    hp_error_t err = parse_header(probe, file_size, in_fmt, pool.quote_aware, &header);
     fclose(probe);
     if (err != HP_OK) {
-        free(starts);
+        hp_header_free(&header);
         return err;
     }
+    pool.header = &header;
 
-    /* Resolved output format, mirroring hp_transcoder_run's rule: CSV/TSV
-     * input defaults to NDJSON output, NDJSON input defaults to CSV. */
-    hp_transcoder_config_t template_cfg = *base_cfg;
-    template_cfg.in_format = in_fmt;
-    if (template_cfg.out_format == HP_FORMAT_AUTO) {
-        template_cfg.out_format = (in_fmt == HP_FORMAT_NDJSON)
-                                      ? HP_FORMAT_CSV
-                                      : HP_FORMAT_NDJSON;
+    uint64_t range = file_size / ((uint64_t)jobs * HP_RANGES_PER_JOB);
+    if (range < HP_RANGE_MIN) range = HP_RANGE_MIN;
+    if (range > HP_RANGE_MAX) range = HP_RANGE_MAX;
+    pool.n_chunks = (size_t)((file_size + range - 1) / range);
+
+    pool.chunks = (hp_chunk_t *)calloc(pool.n_chunks, sizeof(hp_chunk_t));
+    if (!pool.chunks) {
+        hp_header_free(&header);
+        return HP_ERR_NOMEM;
     }
+    for (size_t i = 0; i < pool.n_chunks; i++) pool.chunks[i].cut = (uint64_t)i * range;
 
-    hp_error_t setup_err = HP_OK;
-    hp_header_t header;
-    memset(&header, 0, sizeof(header));
-    bool have_header = false;
-    if (n_chunks > 1 && header_span) {
-        err = hp_parse_header_span(in_fmt, header_span, header_len, &header);
-        if (err == HP_OK) {
-            have_header = true;
-        } else {
-            /* A header the reference parsers reject degrades to the
-             * single-threaded path instead of failing the run. */
-            setup_err = HP_ERR_UNSUPPORTED;
+    hp_mutex_init(&pool.mu);
+    hp_cond_init(&pool.progress);
+    hp_thread_t threads[HP_JOB_MAX];
+
+    if (pool.quote_aware && pool.n_chunks > 1) {
+        int started = start_threads(&pool, jobs, count_quotes_main, threads);
+        for (int i = 0; i < started; i++) hp_thread_join(threads[i]);
+        if (started == 0) err = HP_ERR_NOMEM;
+
+        bool in_quotes = false;
+        for (size_t i = 0; i < pool.n_chunks; i++) {
+            if (pool.chunks[i].err != HP_OK) err = pool.chunks[i].err;
+            pool.chunks[i].cut_in_quotes = in_quotes;
+            in_quotes ^= pool.chunks[i].odd_quotes;
         }
     }
 
-    hp_worker_t *workers = NULL;
-    if (setup_err == HP_OK) {
-        workers = (hp_worker_t *)calloc((size_t)n_chunks, sizeof(hp_worker_t));
-        if (!workers) setup_err = HP_ERR_NOMEM;
+    FILE *quarantine = NULL;
+    if (err == HP_OK && pool.cfg.on_error == HP_ON_ERROR_QUARANTINE && pool.cfg.quarantine_path) {
+        quarantine = fopen(pool.cfg.quarantine_path, "wb");
+        if (!quarantine) err = HP_ERR_IO;
     }
 
-    for (int i = 0; setup_err == HP_OK && i < n_chunks; i++) {
-        hp_worker_t *w = &workers[i];
-        w->input_path = input_path;
-        w->chunk_start = starts[i];
-        w->chunk_end = (i + 1 < n_chunks) ? starts[i + 1] : file_size;
-        w->err = HP_OK;
-        queue_init(&w->queue, n_chunks > 1
-                                  ? HP_QUEUE_TOTAL_BUDGET / (size_t)(n_chunks - 1)
-                                  : HP_QUEUE_TOTAL_BUDGET);
+    /* Workers write their own chunks when the output allows it; otherwise
+     * this thread writes them below, in chunk order. */
+    uint64_t out_base = 0;
+    fflush(out_stream);
+    pool.out = out_stream;
+    pool.positional = can_write_at_offsets(out_stream, &out_base);
+    uint64_t out_end = out_base;
 
-        w->cfg = template_cfg;
-        w->cfg.span_end = w->chunk_end - w->chunk_start;
-        w->cfg.limit_rows = 0;   /* row limits are a coordinator decision */
-        if (i > 0 && have_header) {
-            /* Deep copy: every worker owns its header strings. */
-            for (size_t k = 0; k < header.count; k++) {
-                w->preset.names[w->preset.count] = strdup(header.names[k]);
-                if (!w->preset.names[w->preset.count]) {
-                    setup_err = HP_ERR_NOMEM;
-                    break;
-                }
-                w->preset.count++;
-            }
-            w->cfg.preset_header = &w->preset;
-        }
-        if (setup_err == HP_OK &&
-            base_cfg->on_error == HP_ON_ERROR_QUARANTINE && base_cfg->quarantine_path) {
-            size_t part_len = strlen(base_cfg->quarantine_path) + 32;
-            w->quarantine_part = (char *)malloc(part_len);
-            if (!w->quarantine_part) {
-                setup_err = HP_ERR_NOMEM;
-            } else {
-                snprintf(w->quarantine_part, part_len, "%s.part%d",
-                         base_cfg->quarantine_path, i);
-                w->cfg.quarantine_path = w->quarantine_part;
-            }
-        }
-    }
-
+    pool.window = (size_t)jobs + 2;
     int started = 0;
-    for (; setup_err == HP_OK && started < n_chunks; started++) {
-        if (!hp_thread_create(&workers[started].thread, hp_worker_main, &workers[started])) {
-            setup_err = HP_ERR_NOMEM;
-            break;
-        }
-    }
-
-    if (setup_err != HP_OK) {
-        /* Unwind deterministically: stop whoever is running, drain their
-         * queues, join, then free everything. workers stays NULL when the
-         * failure happened before allocation (bad header span, OOM). */
-        if (workers) {
-            for (int i = 0; i < started; i++) {
-                queue_request_stop(&workers[i].queue);
-            }
-            for (int i = 0; i < started; i++) {
-                hp_thread_join(workers[i].thread);
-            }
-            for (int i = 0; i < n_chunks; i++) {
-                queue_destroy(&workers[i].queue);
-                free(workers[i].quarantine_part);
-                hp_free_header(&workers[i].preset);
-            }
-        }
-        hp_free_header(&header);
-        free(workers);
-        free(starts);
-        free(header_span);
-        return setup_err;
-    }
-
-    /* Ordered drain: chunk order is output order, so appending each
-     * worker's pages in sequence reproduces the single-threaded byte
-     * stream exactly. An abort (worker error or write failure) stops the
-     * remaining workers early and discards their pages. */
-    hp_error_t run_err = HP_OK;
-    bool aborted = false;
-    for (int i = 0; i < n_chunks; i++) {
-        hp_worker_t *w = &workers[i];
-        if (aborted) queue_request_stop(&w->queue);
-
-        hp_page_node_t *node;
-        while ((node = queue_pop(&w->queue)) != NULL) {
-            if (!aborted && fwrite(node->data, 1, node->len, out_stream) != node->len) {
-                run_err = HP_ERR_IO;
-                aborted = true;
-                queue_request_stop(&w->queue);
-            }
-            free(node->data);
-            free(node);
-        }
-        if (w->err != HP_OK) {
-            if (run_err == HP_OK) run_err = w->err;
-            aborted = true;
-        }
-    }
-
-    for (int i = 0; i < n_chunks; i++) {
-        hp_thread_join(workers[i].thread);
-    }
-
-    if (base_cfg->on_error == HP_ON_ERROR_QUARANTINE) {
-        hp_merge_quarantine(base_cfg, workers, n_chunks);
+    if (err == HP_OK) {
+        started = start_threads(&pool, jobs, transcode_main, threads);
+        if (started == 0) err = HP_ERR_NOMEM;
     }
 
     memset(stats_out, 0, sizeof(*stats_out));
-    for (int i = 0; i < n_chunks; i++) {
-        stats_out->rows_read += workers[i].stats.rows_read;
-        stats_out->rows_emitted += workers[i].stats.rows_emitted;
-        stats_out->rows_dropped += workers[i].stats.rows_dropped;
-        stats_out->bytes_in += workers[i].stats.bytes_in;
-        stats_out->bytes_out += workers[i].stats.bytes_out;
-        if (workers[i].stats.elapsed_seconds > stats_out->elapsed_seconds) {
-            stats_out->elapsed_seconds = workers[i].stats.elapsed_seconds;
+    for (size_t i = 0; err == HP_OK && i < pool.n_chunks; i++) {
+        hp_chunk_t *c = &pool.chunks[i];
+        hp_mutex_lock(&pool.mu);
+        while (!c->done) hp_cond_wait(&pool.progress, &pool.mu);
+        hp_mutex_unlock(&pool.mu);
+
+        if (c->err != HP_OK) {
+            err = c->err;
+        } else if (pool.positional) {
+            c->offset = out_end;
+            out_end += c->out.len;
+        } else if (fwrite(c->out.data, 1, c->out.len, out_stream) != c->out.len) {
+            err = HP_ERR_IO;
         }
+        if (err == HP_OK && quarantine &&
+            fwrite(c->quarantine.data, 1, c->quarantine.len, quarantine) != c->quarantine.len) {
+            err = HP_ERR_IO;
+        }
+
+        stats_out->rows_read += c->stats.rows_read;
+        stats_out->rows_emitted += c->stats.rows_emitted;
+        stats_out->rows_dropped += c->stats.rows_dropped;
+        stats_out->bytes_in += c->stats.bytes_in;
+        stats_out->bytes_out += c->stats.bytes_out;
+        buf_free(&c->quarantine);
+
+        hp_mutex_lock(&pool.mu);
+        if (pool.positional) {
+            c->placed = true;
+        } else {
+            recycle(&pool, &c->out);
+        }
+        pool.written = i + 1;
+        if (err != HP_OK) pool.stop = true;
+        hp_cond_broadcast(&pool.progress);
+        hp_mutex_unlock(&pool.mu);
     }
 
-    for (int i = 0; i < n_chunks; i++) {
-        queue_destroy(&workers[i].queue);
-        free(workers[i].quarantine_part);
-        hp_free_header(&workers[i].preset);
-    }
-    hp_free_header(&header);
-    free(workers);
-    free(starts);
-    free(header_span);
+    hp_mutex_lock(&pool.mu);
+    pool.stop = true;
+    hp_cond_broadcast(&pool.progress);
+    hp_mutex_unlock(&pool.mu);
+    for (int i = 0; i < started; i++) hp_thread_join(threads[i]);
+    for (size_t i = 0; err == HP_OK && i < pool.n_chunks; i++) err = pool.chunks[i].err;
+    if (pool.positional && !seek_to(out_stream, out_end) && err == HP_OK) err = HP_ERR_IO;
 
-    return run_err;
+    if (quarantine) fclose(quarantine);
+    for (size_t i = 0; i < pool.n_chunks; i++) {
+        buf_free(&pool.chunks[i].out);
+        buf_free(&pool.chunks[i].quarantine);
+    }
+    for (size_t i = 0; i < pool.n_spare; i++) buf_free(&pool.spare[i]);
+    free(pool.chunks);
+    hp_cond_destroy(&pool.progress);
+    hp_mutex_destroy(&pool.mu);
+    hp_header_free(&header);
+    stats_out->elapsed_seconds = now_seconds() - t0;
+    return err;
 }

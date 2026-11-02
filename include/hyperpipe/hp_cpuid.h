@@ -31,11 +31,6 @@ typedef struct hp_dispatch_table_s {
      * read, so any chunk_len <= 64 is safe without padding guarantees. */
     void (*json_struct_masks)(const uint8_t *p, size_t chunk_len,
                               uint64_t *qm, uint64_t *bm);
-    /* --jobs chunk planner: newline/quote bitmaps for one <= 64-byte chunk
-     * (contract in hp_csv_parser.h). Consumed by the parallel coordinator's
-     * boundary scan. */
-    void (*plan_masks)(const uint8_t *p, size_t chunk_len,
-                       uint64_t *nl, uint64_t *qm);
     hp_error_t (*csv_parse_row)(hp_csv_parser_t *parser, const uint8_t *src, size_t len, size_t *consumed, hp_row_t *out_row, bool is_eof);
 } hp_dispatch_table_t;
 
