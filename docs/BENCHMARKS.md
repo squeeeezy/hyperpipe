@@ -106,6 +106,85 @@ holds at most `jobs + 2` chunks of a few MiB each.
 
 ## Other tools
 
-Not measured yet for 2.0. The comparison will use miller, jq, qsv, DuckDB
-and awk on the same data and machine, each with the command that produces
-the same output.
+Linux, same data and machine, 7 interleaved rounds, median time, output to
+`/dev/shm`. Peak RSS is measured with GNU time. Versions: qsv 28.0.0 (the
+glibc build, PGO and jemalloc), DuckDB 2.0.0, miller 6.11.0, jq 1.7.1.
+
+Every tool gets the command that produces the same result: qsv uses `sqlp`
+(multi-threaded Polars) or its conversion commands, DuckDB `COPY ... TO`,
+miller and jq their usual pipelines. Results are parsed and compared value
+by value; tools differ in quoting and number formatting, not in content.
+DuckDB is given the NASA schema, since it would infer the mixed
+numbers-and-`-` `bytes` column as JSON and write it back as JSON text.
+`bench/bench_tools.py` holds the exact commands:
+
+```
+python3 bench/bench_tools.py --csv big.csv --ndjson big.ndjson \
+        --small data/nasa_small.csv --out-dir /dev/shm -n 7
+```
+
+**Filter and project, CSV to CSV** (`status == 200`, three columns)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 27 ms | 1.0x | 17 MiB |
+| HyperPipe, one thread | 43 ms | 1.6x | 3 MiB |
+| DuckDB | 127 ms | 4.7x | 271 MiB |
+| qsv sqlp | 167 ms | 6.2x | 231 MiB |
+| miller | 504 ms | 18.7x | 554 MiB |
+
+**CSV to NDJSON**
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 97 ms | 1.0x | 33 MiB |
+| HyperPipe, one thread | 170 ms | 1.8x | 3 MiB |
+| DuckDB | 263 ms | 2.7x | 595 MiB |
+| qsv tojsonl | 939 ms | 9.7x | 246 MiB |
+| miller | 1,280 ms | 13.2x | 565 MiB |
+
+**NDJSON to CSV**
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 66 ms | 1.0x | 27 MiB |
+| HyperPipe, one thread | 192 ms | 2.9x | 3 MiB |
+| DuckDB | 222 ms | 3.4x | 529 MiB |
+| qsv jsonl | 349 ms | 5.3x | 62 MiB |
+| jq | 3,228 ms | 49.0x | 4 MiB |
+| miller | 3,857 ms | 58.6x | 137 MiB |
+
+**NDJSON filter and project** (`status == 404`, two columns, NDJSON out)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 26 ms | 1.0x | 12 MiB |
+| DuckDB | 99 ms | 3.8x | 231 MiB |
+| HyperPipe, one thread | 106 ms | 4.1x | 3 MiB |
+| jq | 1,403 ms | 53.8x | 4 MiB |
+| miller | 3,870 ms | 148.4x | 137 MiB |
+
+**Count matching rows** (`status == 404`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 17 ms | 1.0x | 11 MiB |
+| HyperPipe, one thread | 23 ms | 1.4x | 2 MiB |
+| qsv sqlp | 76 ms | 4.4x | 167 MiB |
+| DuckDB | 91 ms | 5.3x | 156 MiB |
+| miller | 490 ms | 28.6x | 535 MiB |
+
+**Start-up: filter a 5,000-row file**
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 2 ms | 1.0x | 2 MiB |
+| miller | 7 ms | 4.5x | 17 MiB |
+| qsv sqlp | 23 ms | 14.7x | 61 MiB |
+| DuckDB | 39 ms | 24.5x | 51 MiB |
+
+HyperPipe is the fastest on every task, by 2.7x to 150x, in a fraction of
+the memory. On one thread it still beats the multi-threaded DuckDB and qsv
+everywhere except NDJSON filtering, where DuckDB is 7% faster. DuckDB and
+qsv do far more than this - SQL, joins, aggregation; these tasks are the
+ones a stream tool is for.

@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Compare HyperPipe with other tools on the same tasks (POSIX only).
+
+Each task gives every tool the command that produces the same result. The
+outputs are parsed and compared by value, since tools differ in quoting
+and number formatting; a tool whose result differs is reported as DIFF and
+not timed further. Runs interleave the tools round by round; the table
+shows the median time and the peak RSS of the process.
+
+usage: bench_tools.py --csv big.csv --ndjson big.ndjson --small small.csv
+                      [-n 7] [--out-dir /dev/shm] [--hyperpipe PATH]
+"""
+import argparse
+import csv
+import hashlib
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+csv.field_size_limit(1 << 30)
+
+
+GNU_TIME = "/usr/bin/time"
+
+
+def run(cmd, out_path, stdout_to_file):
+    """Runs cmd and returns (seconds, peak RSS in MiB). GNU time reports the
+    peak RSS: a child forked from this process starts with its memory
+    counters, so wait4() alone would overstate small tools."""
+    rss_file = out_path + ".rss"
+    wrapped = [GNU_TIME, "-f", "%M", "-o", rss_file] + cmd if os.path.exists(GNU_TIME) else cmd
+    out = open(out_path, "wb") if stdout_to_file else subprocess.DEVNULL
+    t0 = time.perf_counter()
+    p = subprocess.run(wrapped, stdout=out, stderr=subprocess.PIPE)
+    dt = time.perf_counter() - t0
+    if stdout_to_file:
+        out.close()
+    if p.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed: {p.stderr.decode(errors='replace').strip()[:300]}")
+    rss_kib = 0.0
+    if os.path.exists(rss_file):
+        with open(rss_file) as f:
+            rss_kib = float(f.read().split()[-1])
+        os.remove(rss_file)
+    return dt, rss_kib / 1024.0
+
+
+# Results are reduced to a row count and a hash of the rows' values, read
+# as a stream, so even large outputs need little memory to compare.
+
+def digest_rows(rows):
+    h = hashlib.sha256()
+    n = 0
+    for row in rows:
+        h.update("\x1f".join(row).encode("utf-8", "replace"))
+        h.update(b"\x1e")
+        n += 1
+    return n, h.hexdigest()
+
+
+def read_csv_rows(path):
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        return digest_rows(r for r in csv.reader(f) if r)
+
+
+def read_ndjson_rows(path):
+    def rows(f):
+        for line in f:
+            line = line.strip()
+            if line:
+                obj = json.loads(line)
+                yield [x for k, v in obj.items() for x in (k, "" if v is None else str(v))]
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return digest_rows(rows(f))
+
+
+def read_count(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        numbers = [w for w in f.read().split() if w.isdigit()]
+    return (1, numbers[-1]) if numbers else (0, "")
+
+
+READERS = {"csv": read_csv_rows, "ndjson": read_ndjson_rows, "count": read_count}
+
+
+# DuckDB infers the mixed numbers-and-"-" bytes column as JSON and would
+# write it back as JSON text; the schema says what the column is.
+NASA_COLUMNS = ("{host: 'VARCHAR', timestamp: 'VARCHAR', request: 'VARCHAR', "
+                "status: 'BIGINT', bytes: 'VARCHAR'}")
+
+
+def tasks(a, hp, out):
+    """Each task: name, output kind, {tool: (argv, writes_stdout)}."""
+    q = lambda s: s.replace("'", "''")
+    big, nd, small = a.csv, a.ndjson, a.small
+    return [
+        ("filter + project, CSV to CSV", "csv", {
+            "hyperpipe": ([hp, big, "status == 200", "--select", "host,status,bytes", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "status == 200", "--select", "host,status,bytes", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT host, status, bytes FROM _t_1 WHERE status = 200", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT host, status, bytes FROM read_csv('{q(big)}') WHERE status = 200) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "filter", "$status == 200", "then", "cut", "-o", "-f", "host,status,bytes", big], True),
+        }),
+        ("CSV to NDJSON", "ndjson", {
+            "hyperpipe": ([hp, big, "--to", "ndjson", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--to", "ndjson", "--jobs", "1", "-o", out], False),
+            "qsv tojsonl": (["qsv", "tojsonl", big, "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT * FROM read_csv('{q(big)}', all_varchar = true)) TO '{q(out)}' (FORMAT json)"], False),
+            "miller": (["mlr", "--icsv", "--ojsonl", "cat", big], True),
+        }),
+        ("NDJSON to CSV", "csv", {
+            "hyperpipe": ([hp, nd, "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, nd, "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv jsonl": (["qsv", "jsonl", nd, "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT * FROM read_json('{q(nd)}', columns = {NASA_COLUMNS})) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--ijsonl", "--ocsv", "cat", nd], True),
+            "jq": (["jq", "-rn", '["host", "timestamp", "request", "status", "bytes"], (inputs | [.host, .timestamp, .request, .status, .bytes]) | @csv', nd], True),
+        }),
+        ("NDJSON filter + project", "ndjson", {
+            "hyperpipe": ([hp, nd, "status == 404", "--select", "host,request", "--to", "ndjson", "-o", out], False),
+            "hyperpipe -j1": ([hp, nd, "status == 404", "--select", "host,request", "--to", "ndjson", "--jobs", "1", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT host, request FROM read_json('{q(nd)}', columns = {NASA_COLUMNS}) WHERE status = 404) TO '{q(out)}' (FORMAT json)"], False),
+            "miller": (["mlr", "--ijsonl", "--ojsonl", "filter", "$status == 404", "then", "cut", "-o", "-f", "host,request", nd], True),
+            "jq": (["jq", "-c", "select(.status == 404) | {host, request}", nd], True),
+        }),
+        ("count matching rows", "count", {
+            "hyperpipe": ([hp, big, "status == 404", "--count"], True),
+            "hyperpipe -j1": ([hp, big, "status == 404", "--count", "--jobs", "1"], True),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT count(*) AS n FROM _t_1 WHERE status = 404"], True),
+            "duckdb": (["duckdb", "-noheader", "-list", "-c", f"SELECT count(*) FROM read_csv('{q(big)}') WHERE status = 404"], True),
+            "miller": (["mlr", "--icsv", "--onidx", "filter", "$status == 404", "then", "count", big], True),
+        }),
+        ("startup: filter a 5,000-row file", "csv", {
+            "hyperpipe": ([hp, small, "status == 404", "--to", "csv", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", small, "SELECT * FROM _t_1 WHERE status = 404", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT * FROM read_csv('{q(small)}') WHERE status = 404) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "filter", "$status == 404", small], True),
+        }),
+    ]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--ndjson", required=True)
+    ap.add_argument("--small", required=True)
+    ap.add_argument("-n", type=int, default=7)
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--hyperpipe", default="hyperpipe")
+    a = ap.parse_args()
+    a.csv, a.ndjson, a.small = map(os.path.abspath, (a.csv, a.ndjson, a.small))
+    hp = os.path.abspath(a.hyperpipe) if os.sep in a.hyperpipe else shutil.which(a.hyperpipe)
+
+    tmp = tempfile.mkdtemp(prefix="hptools_", dir=a.out_dir)
+    placeholder = os.path.join(tmp, "OUT")
+    for name, kind, tools in tasks(a, hp, placeholder):
+        print(f"\n## {name}\n", flush=True)
+        ref = None
+        live = {}
+        for tool, (argv, to_stdout) in tools.items():
+            out = os.path.join(tmp, tool.replace(" ", "_"))
+            argv = [x.replace(placeholder, out) for x in argv]
+            if shutil.which(argv[0]) is None and not os.path.exists(argv[0]):
+                print(f"| {tool} | not installed |")
+                continue
+            try:
+                run(argv, out, to_stdout)
+            except RuntimeError as e:
+                print(f"| {tool} | failed: {e} |")
+                continue
+            got = READERS[kind](out)
+            if ref is None:
+                ref = got
+            if got != ref:
+                print(f"| {tool} | DIFF: {got[0]} rows vs {ref[0]}, values differ |")
+                continue
+            live[tool] = (argv, out, to_stdout)
+
+        times = {t: [] for t in live}
+        rss = {t: 0.0 for t in live}
+        for _ in range(a.n):
+            for tool, (argv, out, to_stdout) in live.items():
+                dt, mem = run(argv, out, to_stdout)
+                times[tool].append(dt)
+                rss[tool] = max(rss[tool], mem)
+        fastest = min(statistics.median(v) for v in times.values())
+        print("| Tool | Time | vs fastest | Peak RSS |")
+        print("|---|---:|---:|---:|")
+        for tool in sorted(live, key=lambda t: statistics.median(times[t])):
+            med = statistics.median(times[tool])
+            print(f"| {tool} | {med * 1000:,.0f} ms | {med / fastest:.1f}x | {rss[tool]:,.0f} MiB |", flush=True)
+        for f in os.listdir(tmp):
+            os.remove(os.path.join(tmp, f))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

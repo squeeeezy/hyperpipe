@@ -129,8 +129,20 @@ output to a file. Default settings, compared with 1.5.0:
 | NDJSON filter + projection | 980 MiB/s | 4,420 MiB/s |
 | `--summary` | 360 MiB/s | 1,060 MiB/s |
 
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method, the single-thread
-numbers and other tools on the same data.
+Against other tools on Linux, same data and machine, results checked to be
+equal (median time, peak RSS):
+
+| Task | HyperPipe | DuckDB 2.0 | qsv 28 | miller 6.11 | jq 1.7 |
+|---|---:|---:|---:|---:|---:|
+| filter + project, CSV | 27 ms, 17 MiB | 127 ms, 271 MiB | 167 ms, 231 MiB | 504 ms, 554 MiB | |
+| CSV to NDJSON | 97 ms, 33 MiB | 263 ms, 595 MiB | 939 ms, 246 MiB | 1,280 ms, 565 MiB | |
+| NDJSON to CSV | 66 ms, 27 MiB | 222 ms, 529 MiB | 349 ms, 62 MiB | 3,857 ms, 137 MiB | 3,228 ms, 4 MiB |
+| NDJSON filter + project | 26 ms, 12 MiB | 99 ms, 231 MiB | | 3,870 ms, 137 MiB | 1,403 ms, 4 MiB |
+| count matching rows | 17 ms, 11 MiB | 91 ms, 156 MiB | 76 ms, 167 MiB | 490 ms, 535 MiB | |
+| start-up, 5,000 rows | 2 ms, 2 MiB | 39 ms, 51 MiB | 23 ms, 61 MiB | 7 ms, 17 MiB | |
+
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method, the exact commands
+and the single-thread numbers.
 
 ## Tests
 
