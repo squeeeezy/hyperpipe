@@ -9,7 +9,7 @@
     #include <io.h>
 #endif
 
-#define HP_VERSION "1.5.0"
+#define HP_VERSION "2.0.0"
 
 /* The Windows CRT opens stdin and stdout in text mode: output "\n" becomes
  * "\r\n" and input stops at the first 0x1A byte, which breaks byte-exact
@@ -28,66 +28,57 @@ static bool file_exists(const char *path) {
     return true;
 }
 
-static void print_usage(const char *prog) {
-    fprintf(stderr,
-        "HyperPipe v%s - High-Performance Streaming Transcoder & Filter\n"
-        "Usage: %s [FILE] [FILTER_EXPR] [OPTIONS]\n\n"
-        "Positional Arguments:\n"
-        "  FILE                      Input file path (default: stdin; .gz is transparently decompressed)\n"
-        "  FILTER_EXPR               Natural predicate (e.g. \"status == 200 and bytes > 5000\")\n\n"
-        "Options:\n"
-        "  -i, --input <file>        Explicit input file path\n"
-        "  -o, --output <file>       Output file path (default: stdout; a .gz suffix enables gzip)\n"
-        "  --from <auto|csv|tsv|ndjson> Input format (default: auto-sniff)\n"
-        "  --to <csv|tsv|ndjson>     Output format (default: ndjson for csv/tsv, csv for ndjson)\n"
-        "  --select <columns>        Comma-separated columns to project\n"
-        "  --where <predicate>       Explicit filter predicate\n"
-        "  --count                   Print the number of matching rows to stdout (no row output)\n"
-        "  --head <N>, --limit <N>   Stop after N emitted rows\n"
-        "  --summary                 Print per-column statistics (type, present, empty,\n"
-        "                            min/max, mean) instead of row output\n"
-        "  --schema <file>           Declared column types, one \"name,type\" per line\n"
-        "                            (int hints accelerate numeric filter predicates)\n"
-        "  --jobs <N|auto>           Worker threads for file input (default: auto, one per\n"
-        "                            processor for files of 16 MiB and more; 1 disables)\n"
-        "  --gzip                    Compress the output with gzip (libz is loaded at runtime)\n"
-        "  --on-error <mode>         Fault tolerance: fail (default), skip, quarantine\n"
-        "  --quarantine <file>       Destination file for quarantined malformed rows\n"
-        "  --simd <mode>             SIMD engine: auto (default), avx512, avx2, scalar\n"
-        "  --buffer-size <bytes>     Streaming ring buffer size (default: 524288)\n"
-        "  --stats                   Output performance metrics to stderr\n"
-        "  -v, --version             Display version and host CPU capabilities\n"
-        "  -h, --help                Display this help message\n",
-        HP_VERSION, prog);
+static void print_usage(void) {
+    fputs(
+        "usage: hyperpipe [FILE] [FILTER] [options]\n"
+        "\n"
+        "Filter, project and convert CSV, TSV and NDJSON. Reads FILE or stdin;\n"
+        "the input format is detected and gzip input is decompressed.\n"
+        "\n"
+        "  FILTER                    e.g. \"status == 200 and bytes > 5000\"\n"
+        "  -i, --input FILE          input file\n"
+        "  -o, --output FILE         output file (default stdout; .gz compresses)\n"
+        "  --from auto|csv|tsv|ndjson  input format (default auto)\n"
+        "  --to csv|tsv|ndjson       output format (default: NDJSON for CSV/TSV\n"
+        "                            input, CSV for NDJSON input)\n"
+        "  --select COLUMNS          comma-separated columns to output\n"
+        "  --where FILTER            filter, when not given as an argument\n"
+        "  --count                   print the number of matching rows\n"
+        "  --head N, --limit N       stop after N rows\n"
+        "  --summary                 print per-column statistics instead of rows\n"
+        "  --schema FILE             column types, one \"name,int|string\" per line\n"
+        "  --jobs N|auto             threads for file input (default auto: one per\n"
+        "                            processor for files of 16 MiB or more)\n"
+        "  --gzip                    compress the output (needs zlib at run time)\n"
+        "  --on-error fail|skip|quarantine  malformed records (default fail)\n"
+        "  --quarantine FILE         where quarantined records go\n"
+        "  --simd auto|avx512|avx2|scalar   vector engine (default auto)\n"
+        "  --buffer-size BYTES       input buffer, the largest record (default 524288)\n"
+        "  --stats                   print throughput to stderr\n"
+        "  -v, --version             print version and CPU features\n"
+        "  -h, --help                print this help\n",
+        stderr);
 }
 
 static void print_version(void) {
     hp_cpu_caps_t caps = hp_detect_cpu_caps();
-    printf("HyperPipe v%s (pure C11 vector engine)\n", HP_VERSION);
-    printf("Host CPU Capabilities:\n");
-    printf("  AVX-512 (F/BW/VL): %s (OS state: %s)\n",
-           (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl) ? "YES" : "NO",
-           caps.os_avx512_supported ? "YES" : "NO");
-    printf("  AVX2:             %s (OS state: %s)\n",
-           caps.has_avx2 ? "YES" : "NO",
-           caps.os_avx_supported ? "YES" : "NO");
-    printf("  BMI2:             %s\n", caps.has_bmi2 ? "YES" : "NO");
+    bool avx512 = caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl && caps.os_avx512_supported;
+    bool avx2 = caps.has_avx2 && caps.os_avx_supported;
+    printf("hyperpipe %s\n", HP_VERSION);
+    printf("cpu: avx512 %s, avx2 %s, bmi2 %s\n",
+           avx512 ? "yes" : "no", avx2 ? "yes" : "no", caps.has_bmi2 ? "yes" : "no");
 }
 
 static void print_perf_stats(const hp_transcoder_stats_t *st) {
     double mib_in = (double)st->bytes_in / (1024.0 * 1024.0);
     double mib_out = (double)st->bytes_out / (1024.0 * 1024.0);
-    double sec = st->elapsed_seconds > 0.000001 ? st->elapsed_seconds : 0.000001;
-    fprintf(stderr, "\n=== HyperPipe Performance Profile ===\n");
-    fprintf(stderr, "Processed: %llu rows (%.2f MiB in, %.2f MiB out)\n",
-            (unsigned long long)st->rows_read, mib_in, mib_out);
-    fprintf(stderr, "Emitted:   %llu rows\n", (unsigned long long)st->rows_emitted);
-    if (st->rows_dropped > 0) {
-        fprintf(stderr, "Dropped:   %llu rows (resynchronized via fault-tolerance)\n",
-                (unsigned long long)st->rows_dropped);
-    }
-    fprintf(stderr, "Elapsed:   %.4f s (%.2f MiB/s, %.3f Mrows/s)\n",
-            sec, mib_in / sec, ((double)st->rows_read / 1e6) / sec);
+    double sec = st->elapsed_seconds > 1e-6 ? st->elapsed_seconds : 1e-6;
+    fprintf(stderr, "rows: %llu read, %llu written, %llu dropped\n",
+            (unsigned long long)st->rows_read, (unsigned long long)st->rows_emitted,
+            (unsigned long long)st->rows_dropped);
+    fprintf(stderr, "data: %.2f MiB in, %.2f MiB out\n", mib_in, mib_out);
+    fprintf(stderr, "time: %.4f s, %.0f MiB/s, %.2f M rows/s\n",
+            sec, mib_in / sec, (double)st->rows_read / 1e6 / sec);
 }
 
 int main(int argc, char **argv) {
@@ -113,7 +104,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
+            print_usage();
             return 0;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             print_version();

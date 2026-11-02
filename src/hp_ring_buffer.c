@@ -1,8 +1,8 @@
 #include "hyperpipe/hp_ring_buffer.h"
 
 /* Reads through the reader, engaging transparent gzip decompression when
- * the stream starts with the gzip magic. Plain streams take a single fread
- * with zero overhead beyond the two-byte sniff on the first call. */
+ * the stream starts with the gzip magic. Plain streams cost one fread per
+ * call plus a two-byte check on the first. */
 hp_error_t hp_reader_read(hp_reader_t *r, uint8_t *dst, size_t cap, size_t *n_out) {
     *n_out = 0;
     if (!r || !dst || cap == 0) return HP_ERR_INVALID_ARG;

@@ -62,7 +62,7 @@ typedef struct hp_str_s {
     const char *ptr;
     size_t len;
     /* true when the value originated in quoted/string form ("x,y", "123",
-     * JSON strings). Such values MUST travel through the re-serializing write
+     * JSON strings). Such values must travel through the re-serializing write
      * path (write_csv_field_pb / hp_json_ser_write_string) so embedded
      * delimiters, newlines and quotes are re-escaped on output. Clean
      * zero-copy fields keep this flag false and are emitted with raw memcpy. */
