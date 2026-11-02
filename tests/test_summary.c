@@ -134,9 +134,9 @@ int main(void) {
     test_integration_transcoder();
 
     if (failures == 0) {
-        printf("[test_summary] All summary tests passed.\n");
+        printf("test_summary: ok\n");
         return 0;
     }
-    printf("[test_summary] %d FAILURE(S)\n", failures);
+    printf("test_summary: %d failure(s)\n", failures);
     return 1;
 }

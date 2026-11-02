@@ -236,12 +236,11 @@ static void test_or_and_string_ops(void) {
 }
 
 int main(void) {
-    printf("[test_roundtrip] Running golden file roundtrip tests...\n");
     test_csv_to_ndjson_to_csv();
     test_quoted_csv_roundtrip();
     test_unterminated_quoted_eof();
     test_ndjson_fidelity();
     test_or_and_string_ops();
-    printf("[test_roundtrip] All roundtrip tests passed successfully.\n");
+    printf("test_roundtrip: ok\n");
     return 0;
 }

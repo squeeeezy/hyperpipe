@@ -57,6 +57,6 @@ static void test_fault_tolerant_skip(void) {
 int main(void) {
     test_format_sniffing();
     test_fault_tolerant_skip();
-    printf("test_fault_tolerance passed successfully.\n");
+    printf("test_fault_tolerance: ok\n");
     return 0;
 }

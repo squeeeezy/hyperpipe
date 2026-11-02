@@ -140,6 +140,7 @@ static void fingerprint_csv(const char *doc, size_t len,
 
     *fp_fields = fields;
     *fp_hash = hash;
+    hp_csv_parser_free(&parser);
 }
 
 /* Full-pipeline fidelity check for one document: CSV -> CSV transcode must
@@ -344,7 +345,6 @@ int main(void) {
     const uint64_t base_seed = 0x5EEDC0FFEE000001ULL;
     const size_t iterations = 400;
 
-    printf("[test_chaos] Running chaos fuzzer (%zu adversarial documents)...\n", iterations);
     for (size_t iter = 0; iter < iterations; iter++) {
         uint64_t seed = base_seed + iter * 7919;
         rng_t r = { .s = seed };
@@ -365,14 +365,14 @@ int main(void) {
         if (e0 != HP_OK || f0 == 0) continue;
         roundtrip_check_doc(doc, len, f0, h0);
     }
-    printf("[test_chaos] All chaos invariants held: scalar == AVX2 == AVX-512, roundtrips stable.\n");
+    printf("test_chaos: ok\n");
     return 0;
 }
 
 #else /* _WIN32 */
 
 int main(void) {
-    printf("[test_chaos] Skipped: POSIX memstream APIs unavailable.\n");
+    printf("test_chaos: skipped (no POSIX memstream APIs)\n");
     return 0;
 }
 

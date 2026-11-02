@@ -92,9 +92,8 @@ static void test_filtering(void) {
 }
 
 int main(void) {
-    printf("[test_filter] Running projection and filter tests...\n");
     test_projection();
     test_filtering();
-    printf("[test_filter] All filter and projection tests passed successfully.\n");
+    printf("test_filter: ok\n");
     return 0;
 }

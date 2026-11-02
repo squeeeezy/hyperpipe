@@ -71,6 +71,7 @@ static void parse_fingerprint(const char *doc, size_t len,
         if (!header_seen && row.field_count > 0) header_seen = true;
         fields += row.field_count;
     }
+    hp_csv_parser_free(&parser);
     *fields_out = fields;
     *hash_out = hash;
 }

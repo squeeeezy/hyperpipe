@@ -90,10 +90,9 @@ static void test_boundary_wrap_stress(void) {
 }
 
 int main(void) {
-    printf("[test_ring_buffer] Running tests...\n");
     test_basic_alloc();
     test_feed_and_consume();
     test_boundary_wrap_stress();
-    printf("[test_ring_buffer] All ring buffer tests passed successfully.\n");
+    printf("test_ring_buffer: ok\n");
     return 0;
 }

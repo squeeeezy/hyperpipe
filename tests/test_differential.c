@@ -87,7 +87,6 @@ static void run_differential_test(const char *test_name, const char *csv_input) 
 }
 
 int main(void) {
-    printf("[test_differential] Running differential SIMD validation tests...\n");
 
     /* Test 1: Simple plain ASCII tabular data */
     run_differential_test("Plain ASCII table",
@@ -128,6 +127,6 @@ int main(void) {
         "\"quoted_value\"\n"
         "third_value\n");
 
-    printf("[test_differential] All differential tests PASSED: Scalar == AVX2 == AVX-512.\n");
+    printf("test_differential: ok\n");
     return 0;
 }

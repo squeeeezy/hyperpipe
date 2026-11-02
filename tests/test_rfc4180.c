@@ -44,6 +44,7 @@ static void test_simple_csv(void) {
     assert(strncmp(row.fields[1].ptr, "25", row.fields[1].len) == 0);
     assert(strncmp(row.fields[2].ptr, "London", row.fields[2].len) == 0);
     offset += consumed;
+    hp_csv_parser_free(&parser);
 }
 
 static void test_rfc4180_quotes_and_escapes(void) {
@@ -77,6 +78,7 @@ static void test_rfc4180_quotes_and_escapes(void) {
     /* Field 2: multi\nline\nfield */
     assert(row.fields[2].len == strlen("multi\nline\nfield"));
     assert(strncmp(row.fields[2].ptr, "multi\nline\nfield", row.fields[2].len) == 0);
+    hp_csv_parser_free(&parser);
 }
 
 static void test_empty_fields_and_no_trailing_newline(void) {
@@ -109,6 +111,7 @@ static void test_empty_fields_and_no_trailing_newline(void) {
     assert(row.fields[0].len == 1 && row.fields[0].ptr[0] == 'a');
     assert(row.fields[1].len == 0);
     assert(row.fields[2].len == 1 && row.fields[2].ptr[0] == 'c');
+    hp_csv_parser_free(&parser);
 }
 
 static void test_tsv_parsing(void) {
@@ -138,6 +141,7 @@ static void test_tsv_parsing(void) {
     assert(strncmp(row.fields[0].ptr, "val1", 4) == 0);
     assert(strncmp(row.fields[1].ptr, "val2", 4) == 0);
     assert(strncmp(row.fields[2].ptr, "val3", 4) == 0);
+    hp_csv_parser_free(&parser);
 }
 
 static void test_malformed_quote_errors(void) {
@@ -159,15 +163,15 @@ static void test_malformed_quote_errors(void) {
     const char *csv2 = "foo,\"unclosed quote at eof";
     err = hp_csv_parse_row(&parser, (const uint8_t *)csv2, strlen(csv2), &consumed, &row, true);
     assert(err == HP_ERR_PARSE_QUOTE);
+    hp_csv_parser_free(&parser);
 }
 
 int main(void) {
-    printf("[test_rfc4180] Running RFC 4180 unit suite...\n");
     test_simple_csv();
     test_rfc4180_quotes_and_escapes();
     test_empty_fields_and_no_trailing_newline();
     test_tsv_parsing();
     test_malformed_quote_errors();
-    printf("[test_rfc4180] All RFC 4180 unit tests passed successfully.\n");
+    printf("test_rfc4180: ok\n");
     return 0;
 }

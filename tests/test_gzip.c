@@ -166,18 +166,17 @@ static void test_gzip_multi_member(void) {
 }
 
 int main(void) {
-    printf("[test_gzip] Running gzip integration tests...\n");
     test_gzip_input();
     test_gzip_output();
     test_gzip_multi_member();
-    printf("[test_gzip] All gzip tests passed successfully.\n");
+    printf("test_gzip: ok\n");
     return 0;
 }
 
 #else /* _WIN32 */
 
 int main(void) {
-    printf("[test_gzip] Skipped: POSIX memstream APIs unavailable.\n");
+    printf("test_gzip: skipped (no POSIX memstream APIs)\n");
     return 0;
 }
 

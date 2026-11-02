@@ -262,6 +262,6 @@ int main(void) {
            tc_flt.stats.elapsed_seconds);
     hp_transcoder_free(&tc_flt);
 
-    printf("[test_real_dataset] ALL TESTS PASSED ON REAL PRODUCTION DATASET!\n");
+    printf("test_real_dataset: ok\n");
     return 0;
 }

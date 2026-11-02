@@ -310,9 +310,9 @@ int main(void) {
     remove(path);
 
     if (failures == 0) {
-        printf("[test_parallel] All parallel pipeline tests passed.\n");
+        printf("test_parallel: ok\n");
         return 0;
     }
-    printf("[test_parallel] %d FAILURE(S)\n", failures);
+    printf("test_parallel: %d failure(s)\n", failures);
     return 1;
 }
