@@ -1,362 +1,145 @@
-# HyperPipe Architecture & Systems Specification
+# Architecture
 
-## 1. Overview
-HyperPipe is a bounded $O(1)$ memory streaming structured data transcoder and in-flight projection/filtering engine written in pure ISO C11 with dynamic runtime vector acceleration (AVX-512BW/VL, AVX2, BMI2, and scalar fallback).
+HyperPipe is a library (`src/`, `include/hyperpipe/`) and a thin command line
+front end (`src/hp_main.c`). A run reads records, filters them, projects
+columns and writes them out, holding one record at a time.
 
-### Design rules (v1.4)
-1. **Two behaviors, not two implementations of everything.** Quote-free rows
-   (the overwhelming majority of machine-generated data) take the SIMD chunk
-   loop; any quote in a row hands the WHOLE row to the scalar RFC 4180 state
-   machine. One scalar implementation owns all quoting edge cases, so SIMD
-   and scalar can never disagree on quoted-field semantics.
-2. **Zero-copy row references.** Serialization reads parsed rows in place;
-   only projections materialize a (partial) copy. No 24 KB row struct ever
-   moves per row on the hot path.
-3. **Memoize per-header work, not per-row work.** JSON key fragments are
-   built once per header and re-used for every row.
-
----
-
-## 2. Sliding Linear Ring Buffer ($O(1)$ RSS Guarantee)
-
-Traditional circular buffers suffer from non-contiguous wrap-around boundaries that break SIMD vector loads, forcing branchy split-register handling. HyperPipe solves this using a **Sliding Linear Window with Zero-Copy Vector Padding**:
-
-```mermaid
-flowchart LR
-    subgraph MemoryBuffer["Continuous 64 KB Memory Buffer"]
-        direction LR
-        A["Prefix (0..head)<br/>Parsed & Consumed"] --> B["Active Window (head..tail)<br/>Contiguous Vector Scan Span"]
-        B --> C["Tail Free Space (tail..cap)<br/>Zero-Copy DMA/fread Target"]
-        C --> D["Tail Guard Zone (64 Bytes)<br/>Zero-Padded SIMD Safety Overrun"]
-    end
+```
+reader ─▶ ring buffer ─▶ CSV or NDJSON parser ─▶ filter ─▶ CSV or NDJSON writer ─▶ page buffer ─▶ output
+(gzip)                    (SIMD dispatch)                                           (gzip)
 ```
 
-### Sliding Window Lifecycle (Zero Allocation)
+`hp_transcoder_run()` drives that pipeline for one stream. `hp_parallel_run()`
+runs it on many chunks of a file at once.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Stream as Input Stream (Pipe/Disk)
-    participant Buffer as Sliding Linear Ring Buffer
-    participant Parser as Vectorized SIMD Scanner
-    
-    Stream->>Buffer: Initial block read (fread into tail free space)
-    loop Continuous Streaming
-        Buffer->>Parser: Zero-copy pointer to contiguous active window
-        Parser->>Parser: Vectorized delimiter & quote scanning
-        Parser->>Buffer: Consume parsed row bytes (advance head)
-        alt Active Window Low (head > 0)
-            Buffer->>Buffer: memmove(data, data + head, tail - head)
-            Note over Buffer: Reset head to 0, slide unconsumed bytes to base
-            Stream->>Buffer: fread fills free space (tail to capacity)
-            Buffer->>Buffer: memset 64 trailing bytes to 0 (SIMD guard)
-        end
-    end
-```
+## Input
 
----
+`hp_reader_t` (`src/hp_ring_buffer.c`) wraps a `FILE`. On the first read it
+checks for the gzip magic and, when present, inflates through zlib, which
+`src/hp_gzip.c` loads at run time (`dlopen` or `LoadLibrary`, with the
+current directory removed from the DLL search path). Nothing links against
+zlib; without it gzip reports `HP_ERR_GZIP_UNAVAILABLE` and everything else
+works. A reader can also be limited to a byte count, which parallel workers
+use to read exactly their chunk.
 
-## 3. Vectorized CSV Row Parsers (v1.3 chunk-loop design)
+The sliding buffer (`hp_sliding_buffer_t`) is one contiguous block, 512 KiB
+by default, followed by 64 zero bytes so vector loads may read past the
+last valid byte. Parsers get a pointer and a length; when they need more
+data the unconsumed tail moves to the front and the reader fills the rest.
+A record larger than the buffer is an error, or a dropped record with
+`--on-error skip`.
 
-Both vector engines (`hp_csv_parse_row_avx512`, `hp_csv_parse_row_avx2`) run
-the same three-phase algorithm, differing only in vector width (64 vs 32
-bytes per chunk):
+## CSV and TSV
 
-1. **Chunk loop.** Load the next full vector. If any byte is `"` -> discard
-   partial fields and defer the whole row to the scalar parser (rule 1
-   above). Otherwise extract the delimiter mask and the CR/LF mask:
-   - no CR/LF -> pop every delimiter from the mask (`tzcnt` loop), emit
-     zero-copy fields, advance one chunk;
-   - CR/LF found -> pop delimiters before it, emit the trailing field,
-     report `consumed` (CRLF-aware) and return.
-2. **Byte-wise tail** for the final <64/<32 bytes, same rules.
-3. **Buffer-end protocol.** No terminator before the buffer ends:
-   if not EOF, return `consumed = 0` and let the caller refill (the caller
-   re-parses from scratch); at EOF, emit the trailing (possibly empty) field
-   exactly like the scalar parser, so `a,b,<EOF>` yields three fields on
-   every engine.
+`hp_csv_parse_row_scalar()` (`src/hp_csv_scalar.c`) is the reference RFC 4180
+state machine. It returns one record per call as zero-copy field slices into
+the buffer. Fields that contained `""` are unescaped into a parser arena,
+which is sized to the parse window on first use and never moves while a
+record is built. Every field records whether it was quoted (`has_escapes`),
+so writers can keep its string type and re-quote it.
 
-Invariant guarded on every emit: `field_count < HP_MAX_COLUMNS` (a 64 KB
-comma-line would otherwise overflow the row struct on ANY engine).
+The AVX2 and AVX-512 parsers (`src/hp_csv_avx2.c`, `src/hp_csv_avx512.c`)
+handle quote-free records: each 32- or 64-byte chunk yields delimiter and
+line-end bitmasks, and fields are cut at the set bits. A chunk containing a
+quote hands the whole record to the scalar parser, so quoting rules live in
+one place. All three parsers produce identical rows; `test_differential`
+and `test_chaos` check that.
 
-### AVX2 Scanner Pipeline (32 Bytes / Cycle)
+## NDJSON
 
-```mermaid
-flowchart TD
-    In["Input Stream Chunk (32 Bytes)"] --> Load["_mm256_loadu_si256"]
-    
-    Load --> CmpDelim["_mm256_cmpeq_epi8(',')"]
-    Load --> CmpQuote["_mm256_cmpeq_epi8('\"')"]
-    Load --> CmpLF["_mm256_cmpeq_epi8('\\n')"]
-    Load --> CmpCR["_mm256_cmpeq_epi8('\\r')"]
-    
-    CmpDelim --> OrAll["_mm256_or_si256"]
-    CmpQuote --> OrAll
-    CmpLF --> OrAll
-    CmpCR --> OrAll
-    
-    OrAll --> Movemask["_mm256_movemask_epi8 (Extract 32-bit Mask)"]
-    
-    Movemask --> Check{"Mask == 0 ?"}
-    Check -- Yes --> Skip["Advance 32 Bytes (Zero Branches)"]
-    Check -- No --> CTZ["__builtin_ctz(mask) (Jump Directly to Delimiter)"]
-```
+`hp_json_parse_line_ex()` (`src/hp_json_scalar.c`) parses one line into a row
+whose columns are the keys seen so far. It accepts exactly an RFC 8259
+object of scalar members; anything else is `HP_ERR_PARSE_JSON`.
 
-### AVX-512BW Scanner Pipeline (64 Bytes / Cycle)
+- Values that need no unescaping point into the buffer. Escaped strings are
+  decoded into an arena the transcoder sizes to the line, which always
+  suffices because a decoded string is never longer than its source.
+- Keys resolve through `hp_keymap` (`src/hp_keymap.c`), an open-addressing
+  hash over the header. Keys up to 8 bytes compare as one packed word.
+  Unknown keys extend the header and the map.
+- A structural fast path handles escape-free lines: one vector pass per
+  64-byte chunk gives the quote and backslash bitmaps, keys and string
+  values become spans between quotes, and numbers are checked against the
+  JSON grammar in the same pass. A line it does not fully accept (a
+  backslash, an unknown key, anything irregular) goes to the general path,
+  which either parses it or reports the error. The fast path writes no
+  shared state before it succeeds.
 
-Zen 4 and modern Xeon architectures execute 64-byte vector comparisons returning native `__mmask64` registers:
+## Filter
 
-```mermaid
-flowchart TD
-    Chunk["Input Stream Chunk (64 Bytes)"] --> Load512["_mm512_loadu_si512"]
-    
-    Load512 --> M1["_mm512_cmpeq_epi8_mask(chunk, v_delim)"]
-    Load512 --> M2["_mm512_cmpeq_epi8_mask(chunk, v_quote)"]
-    Load512 --> M3["_mm512_cmpeq_epi8_mask(chunk, v_lf)"]
-    Load512 --> M4["_mm512_cmpeq_epi8_mask(chunk, v_cr)"]
-    
-    M1 --> BitwiseOr["Bitwise OR on k-registers (m1 | m2 | m3 | m4)"]
-    M2 --> BitwiseOr
-    M3 --> BitwiseOr
-    M4 --> BitwiseOr
-    
-    BitwiseOr --> Mask64["64-bit Combined Mask"]
-    Mask64 --> BranchlessJump["_tzcnt_u64(mask) -> Direct Opcode Dispatch"]
-```
+`src/hp_filter.c` parses the filter into up to 16 predicates in OR groups of
+AND terms, and binds column references to the header: a name first, then a
+position. A numeric literal compares numerically against fields that are
+numbers in their whole length; integers compare exactly in int64, everything
+else in double. A text literal compares bytes.
 
----
+`hp_filter_matches()` is inline in the header. It decides the most common
+filter, a single equality, with a byte compare: for a positive integer
+literal a mismatch at a leading digit proves the numbers differ, so
+`status == 500` against `200` costs one byte. Anything else goes to
+`hp_filter_eval()`.
 
-## 4. Fault-Tolerant Streaming State Machine
+## Output
 
-```mermaid
-stateDiagram-v2
-    [*] --> SniffFormat
-    SniffFormat --> StreamIngest: Auto-Sniff Delimiters & Headers
-    
-    state StreamIngest {
-        [*] --> ParseRow
-        ParseRow --> ValidateRow: Check Syntax & Escape Boundaries
-        ValidateRow --> InFlightFilter: Valid Row
-        InFlightFilter --> PageBufferOutput: Predicate Match
-        InFlightFilter --> ParseRow: Filter Reject
-        
-        ValidateRow --> ErrorDispatch: Malformed / Corrupt Row
-        state ErrorDispatch <<choice>>
-        ErrorDispatch --> Abort: on-error fail
-        ErrorDispatch --> ForwardSync: on-error skip / quarantine
-        ForwardSync --> WriteQuarantine: quarantine path configured
-        WriteQuarantine --> ResyncNewline: Write Raw Line
-        ForwardSync --> ResyncNewline: on-error skip
-        ResyncNewline --> ParseRow: SIMD search for next '\\n'
-    }
-    
-    PageBufferOutput --> FlushOutput: Buffer Full (64 KB)
-    FlushOutput --> [*]: Stream EOF
-```
+All output goes through a page buffer (256 KiB) and from there, compressed
+when gzip output is on, to a `FILE` or to a sink callback.
 
----
+- CSV records (`emit_csv_row_pb`): every output field is a slice of the input
+  record or a decoded copy no longer than its source, so the record's worst
+  case size follows from its input length. The record is reserved with one
+  check and written without per-field checks. Fields are copied as-is when
+  they cannot contain the output delimiter; otherwise a word-at-a-time scan
+  decides whether to quote. Records larger than a page take a checked path.
+- NDJSON rows (`hp_json_ser_row_direct`, `src/hp_json_scalar.c`): keys are
+  escaped once per header and copied per row; values are emitted as numbers,
+  literals or escaped strings. The SIMD emitters (`src/hp_json_avx2.c`,
+  `src/hp_json_avx512.c`) scan and copy a string in one pass.
 
-## 5. Dynamic Runtime CPUID Dispatch
+## Streaming loop
 
-CPU capabilities are detected once at process initialization:
+`hp_transcoder_run()` sets up a run and calls `run_records()` with the record
+parser for its format. The loop is inlined per format, so neither copy pays
+an indirect call per record. For each record it binds the header on the
+first one, follows NDJSON schema growth, applies the filter and passes the
+record to `deliver_record()` (summary, count or write). Parse errors go to
+the `--on-error` mode; everything else ends the run.
 
-```mermaid
-flowchart TD
-    Init["hp_dispatch_init()"] --> CPUID["cpuid(EAX=1, EAX=7)"]
-    CPUID --> XCR0["_xgetbv(0) -> OS Vector Support Check"]
-    
-    XCR0 --> Branch{"Features Enabled?"}
-    Branch -- "AVX-512F + BW + VL & OS State" --> Select512["Select AVX-512BW Engine (64B/cycle)"]
-    Branch -- "AVX2 + BMI2 & OS State" --> Select256["Select AVX2 Engine (32B/cycle)"]
-    Branch -- Fallback --> SelectScalar["Select Pure C11 Scalar Fallback"]
-    
-    Select512 --> Table["Populate g_hp_dispatch Function Pointers"]
-    Select256 --> Table
-    SelectScalar --> Table
-```
+## Parallel runs
 
----
+`src/hp_parallel.c`:
 
-## 6. JSON Serializer: Key-Fragment Cache & Zero-Copy Rows
+1. The file is cut at fixed offsets into ranges, eight per thread, between
+   1 and 8 MiB each.
+2. A record ends at a newline outside quotes. For CSV and TSV, threads count
+   the quotes of every range in parallel, and a prefix XOR gives the quoting
+   state at each cut. For NDJSON every newline ends a record.
+3. Each chunk starts at the first record that begins inside its range. A
+   pool of threads takes chunks in order and transcodes each into its own
+   buffer; chunks after the first bind the header read up front.
+4. Chunks are written in order: by the calling thread, or on POSIX regular
+   files by each worker at its offset. At most `jobs + 2` chunks are in
+   flight, and written buffers are reused.
 
-`hp_json_ser_row` is the hottest function on the CSV->NDJSON path (v1.2
-profile: 87% of run time together with escape scanning). Two v1.3 changes:
+Output is byte-identical to a sequential run. CSV and TSV in skip or
+quarantine mode stay sequential, because a stray quote changes the parity
+that the cuts rely on, while the sequential parser resynchronizes after it.
 
-```mermaid
-flowchart LR
-    subgraph PerHeader["Once per header (rare)"]
-        Bind["hp_json_ser_bind_keys()"] --> Frag['frag_buf: "host": "timestamp": ... (escaped)']
-    end
-    subgraph PerRow["Per row (hot)"]
-        Frag --> M["1 x memcpy per key"]
-        V["value typed emit:<br/>number fast check / true / false / null / escape scan"]
-    end
-```
+`src/hp_thread.h` wraps Win32 threads (SRW locks, condition variables,
+`_beginthreadex`) and pthreads behind one small interface.
 
-- **Key fragments.** Keys were re-emitted per row with `strlen` + two stores.
-  They are now pre-escaped once per header (`hp_json_ser_bind_keys`,
-  re-invoked whenever the header is created or grows mid-stream) and emitted
-  with a single `memcpy`. The fragment table self-invalidates on width
-  mismatch, so unbound library users silently get the correct slow path.
-- **Zero-copy rows.** The output path passes `&raw_row` (or a projected
-  3-field copy) instead of copying the full row struct.
-- **Type fast paths.** `is_valid_json_number` rejects string fields with one
-  first-byte test before the grammar check; strings of 8 bytes or less are
-  escape-checked inline without the indirect scanner call.
+## SIMD dispatch
 
-## 7. Parallel Chunked Pipeline (`--jobs`, v1.5)
+`hp_dispatch_init()` (`src/hp_cpuid.c`) reads CPUID and XCR0 once and fills
+`g_hp_dispatch` with the best available kernels. Only the four `*_avx2.c` and
+`*_avx512.c` files are compiled with vector flags; the binary runs on any
+x86-64 CPU, and on other architectures the scalar kernels are used.
 
-One sequential planning pass finds chunk starts: a newline terminates a
-record only when the running quote parity is even (RFC 4180 doubles embedded
-quotes, so parity is sound). The scan classifies bytes through the
-dispatchable `plan_masks` kernels - newline/quote bitmaps per 64-byte chunk
-(AVX-512 / AVX2 / scalar twins, differentially tested) - instead of a
-per-byte branch, and stops as soon as every boundary is known (the file tail
-belongs to the last worker by construction, so reading it would be pure
-overhead). The same pass captures the header row, which workers > 0 receive
-as a preset header - their chunks begin exactly at a data-row boundary, so
-the state after `hp_bind_stream_header` is identical to the single-stream
-path. For NDJSON input the preset is the first line's key order (quote
-parity is skipped: a raw newline always ends a line there, matching the
-single-stream parser).
+## Tests
 
-Each worker runs the unmodified `hp_transcoder_run` over its byte span:
-`span_end` enforcement derives the current row's absolute offset from
-`bytes_in - available` (one predictable branch per row when enabled, in
-both the CSV and NDJSON loops), and worker output flows through an
-`fopencookie` sink into a bounded page queue. Pushing blocks when the
-queue exceeds its share of the 64 MiB total output budget (split evenly
-between the non-head workers), so total memory stays bounded independent
-of input size and job count. The coordinator pops the queues strictly in
-chunk order, which reproduces the single-threaded byte stream exactly -
-the property `test_parallel` asserts in-process and the release gates
-assert end-to-end on the full 102-162 MiB datasets.
-
-Scope decisions: gzip input returns `HP_ERR_UNSUPPORTED` (a compressed
-stream has no seekable offsets) and the CLI falls back with a notice.
-Parallel NDJSON locks the schema to the first line: a worker's growth
-order would depend on which rows it happens to see first, so keys beyond
-the first line serialize under their column index - the same rule CSV
-output documents (enforced by suppressing the out-header growth when a
-preset is bound). A first line the reference parsers reject also degrades
-to the single-threaded path, whose fault-tolerance mode owns the record.
-Quarantine goes through per-worker part files merged in chunk order. The
-dispatch table is mutex-guarded because workers initialize transcoders
-concurrently.
-
-## 8. Fused SIMD JSON String Emitter (v1.4)
-
-Classic JSON string escaping scans the value for escapable bytes and then
-copies it - two passes over every byte. HyperPipe fuses both into one pass:
-
-- clean 32/64-byte chunks move load -> compare-mask -> store (one store per
-  chunk, no memcpy call);
-- a chunk containing an escape candidate flushes its clean prefix with one
-  masked store (AVX-512) or a scalar copy (AVX2), then expands the single
-  special byte;
-- all escaping rules live in one always-inline function,
-  `hp_json_escape_one()`, shared by scalar, AVX2 and AVX-512 paths - the
-  rules cannot drift between kernels.
-
-**Hybrid width policy.** Measured on the reference Xeon, a sustained 512-bit
-store stream throttles the core more than the extra width wins back on
-short fields (pure-64B emit: -2.4% vs v1.3 on the AVX-512 default path).
-Policy: strings under `HP_EMIT_512_THRESHOLD` (192 B) use the 32-byte loop;
-only long values take the 64-byte path. Net effect on the reference host:
-+10.9% W2 vs v1.3. The threshold is a single documented constant.
-
-## 9. Direct-to-Page NDJSON Serialization (v1.4)
-
-`hp_json_ser_row_direct()` serializes a row straight into the caller's
-buffer. The transcoder passes its output page buffer: the hot path writes
-with zero intermediate copies. A per-row worst-case bound (every byte -> 
-6-byte \u00XX expansion) is checked against the remaining page space; on
-overflow the page flushes once and retries, and rows larger than a whole
-page fall back to the growable serializer buffer. The bound is exact-safe:
-the emit loop can never overrun its destination.
-
-## 10. Runtime-Loaded Compression Layer (v1.4)
-
-`src/hp_gzip.c` resolves zlib through `dlopen("libz.so.1")` /
-`LoadLibraryA("zlib1.dll")` on first use. Consequences:
-
-- the zero-dependency property holds: nothing links against zlib, and the
-  binary runs unchanged on systems without it;
-- gzip input is transparent: `hp_reader_t` sniffs the first two bytes of
-  any stream; a gzip magic switches that reader into inflate mode;
-- multi-member gzip files decode fully (member switches re-feed the magic
-  as synthetic input; leftover staging bytes stay queued untouched);
-- gzip output runs at level 1 (Z_BEST_SPEED) - the tool's contract is
-  throughput, and level 1 held 6.1x on the reference log;
-- failures are explicit: `HP_ERR_GZIP_UNAVAILABLE` is a dedicated error
-  code with a dedicated user-facing message.
-
-The zlib `z_stream` is mirrored locally (ABI-stable since 1995), so zlib
-headers are not needed at build time.
-
-## 11. Fuzzing & Fidelity Testing (v1.4)
-
-Three layers, all wired into the build:
-
-1. **Differential suite** (existing): Scalar == AVX2 == AVX-512 bit-for-bit
-   on fixed fixtures and the full real dataset.
-2. **Chaos suite** (`tests/test_chaos.c`): 400 seeded adversarial documents
-   per run. Checks kernel differential equality on hostile fields (embedded
-   quotes, newlines, control and high bytes) plus full-pipeline value
-   fidelity: parse(serialize(parse(x))) == parse(x) with value-level
-   fingerprints. Deterministic regression documents pin every fidelity bug
-   the fuzzer found as a permanent byte-exact case.
-3. **Fuzz harness** (`tests/fuzz_harness.c`): the same invariants as a
-   libFuzzer entry point (OSS-Fuzz ready) and a standalone ASan+UBSan
-   mutation driver (`make fuzz`, 20k iterations by default, plain gcc).
-   `make fuzz-long` scales the budget for release gates (the v1.5 gate ran
-   200k mutations over the 10-seed in-repo corpus and found the
-   unterminated-quoted-EOF fidelity bug fixed in the same release);
-   `make coverage` reports gcov line coverage over the full suite.
-
-Fidelity contract encoded by the tests: values are sacred; quoting is
-canonicalized on output per RFC 4180 content rules (a quoted-origin field
-always travels the re-quoting write path, including the lenient EOF tail
-of an unterminated quoted field); a typed empty cell (`""`) survives as
-`""`; header names are strings (NUL bytes truncate them by design);
-ragged CSV rows keep their real width.
-
-## 12. NDJSON Input: Keymap & Structural Scanner (v1.5)
-
-Three layers, each individually measurable (docs/BENCHMARKS.md 2.3):
-
-1. **Zero-copy spans.** The per-line staging copy is gone; the parser
-   receives a bounded span into the ring buffer, and fields point into it
-   until the row is consumed (the ring head advances once per outer
-   iteration). Only strings containing backslash escapes are decoded into
-   the 64 KiB arena.
-2. **`hp_keymap`.** Open addressing over the running header: FNV-1a for
-   keys over 8 bytes, one multiply-high hash off a packed 8-byte load for
-   the (dominant) short keys, with length + packed-bytes confirmation that
-   avoids touching header memory. Schema growth inserts through the same
-   table; rehashing re-reads the header, so staleness is impossible.
-3. **Structural fast path.** One masked vector pass per 64-byte chunk
-   yields quote and backslash bitmaps; the walker resolves keys and
-   string values as span arithmetic between structural quotes. It aborts
-   to the byte-span scanner on any irregularity (backslash anywhere,
-   unknown key, unexpected byte) *before* mutating header or keymap state,
-   and field assignments are re-reset on fallback - so the general path
-   remains the single source of semantic truth and bit-exactness is
-   testable by construction.
-
-## 13. `--summary` and `--schema` (v1.5)
-
-**`--summary`** folds each matching row into a per-column accumulator
-(`hp_summary_t`, O(columns) memory): inferred type (int / number / string /
-mixed), present/empty/absent counts, numeric min/max/mean and lexicographic
-string bounds. Numeric state upgrades monotonically (int → number →
-mixed), so one streaming pass suffices and no row pointers are retained.
-The table prints after the (empty) row stream; the mode refuses `-o`,
-`--gzip` and `--count` because the table is the run's only output.
-
-**`--schema <file>`** loads declared column types (`name,type` lines, `#`
-comments) and binds them by resolved column name once the header is known.
-A column declared `int` takes a fast int64 span parse in numeric filter
-predicates - no per-row grammar validation - while fractional literals
-still compare correctly against it. The declaration also documents the
-data contract next to the pipeline that uses it.
+`tests/` holds one TAP binary per area, all built and run by `make test`:
+unit tests per module, `test_regressions` with one case per fixed defect,
+`test_parallel` comparing every job count with the sequential output,
+`test_differential` and `test_chaos` comparing the SIMD engines and round
+trips on generated data, and `test_real_dataset` on the NASA log.
+`tests/fuzz_harness.c` checks the same round-trip invariants under libFuzzer
+or its own mutation driver.

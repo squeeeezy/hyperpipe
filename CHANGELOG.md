@@ -3,6 +3,80 @@
 All notable changes to HyperPipe are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] - 2026-11-02
+
+A correctness and speed release. Fifteen defects are fixed, several of them
+silent data loss or memory errors; parallel runs now scale and are the
+default for large files; and every workload is at least as fast as in 1.5.
+
+### Changed (breaking)
+- `--jobs` defaults to `auto`: one thread per processor, at most 16, for
+  regular files of 16 MiB or more. `--jobs 1` restores sequential runs;
+  `--jobs 0` is rejected.
+- NDJSON input must be valid JSON: a complete object per line whose values
+  are strings, numbers, `true`, `false` or `null`. Truncated lines, missing
+  commas, trailing text and invalid escapes are malformed records
+  (`HP_ERR_PARSE_JSON`) handled by `--on-error`.
+- CSV text after a closing quote (`"abc"xyz`) is a malformed record.
+- Numeric predicates compare values: `a == 5000` matches `5000.0` and `5e3`;
+  fields such as `200abc`, `0x10` and `inf` are not numbers.
+- Column references resolve by header name first, by position otherwise.
+- Parallel NDJSON runs lock the schema to the first line in every chunk, so
+  output no longer depends on the job count.
+- CSV and TSV with `--on-error skip` or `quarantine` run sequentially.
+- Errors print as `hyperpipe: <reason>`; `--help`, `--version` and
+  `--stats` use plain text.
+- Library: `hp_csv_parser_free()`, output and quarantine sinks and
+  `lock_schema` in `hp_transcoder_config_t`, `hp_strerror()`,
+  `hp_parallel_auto_jobs()`; `hp_filter_matches()` is inline and calls
+  `hp_filter_eval()`; the `plan_masks` kernels are gone.
+
+### Fixed
+- Heap overflow when a CSV record over 256 KiB was written as CSV.
+- Windows: stdout wrote `\r\n` and stdin stopped at the first 0x1A byte,
+  breaking output and gzip pipes.
+- A single `==` predicate compared bytes, not numbers.
+- Numeric predicates accepted numeric prefixes and rejected the int64
+  minimum.
+- A column named like a number (`2019`) was read as a position.
+- Text after a closing quote was dropped silently.
+- The Makefile did not include its header dependency files, so header
+  changes left stale objects.
+- Quoted CSV fields with `""` escapes over 64 KiB failed.
+- Escaped NDJSON strings over 64 KiB were cut short and read past their
+  buffer.
+- TSV cells containing commas were not quoted in CSV output.
+- `--gzip` wrote records larger than the output page uncompressed.
+- NDJSON accepted malformed lines as rows with wrong values.
+- Failed parallel runs exited without a message.
+- The CMake build left out three source files and could not link.
+- NDJSON keys and CSV header names were cut at 255 bytes, merging columns.
+- Smaller: absent projected columns kept a stale `present` flag; a file
+  handle leaked per positional argument; zlib could load from the current
+  directory; `--buffer-size` accepted garbage.
+
+### Performance
+NASA access log, Ryzen 5 7600X, Windows, default settings against 1.5.0:
+NDJSON to CSV 5.0x, NDJSON filter 4.4x, NDJSON to NDJSON 3.8x, `--summary`
+2.9x, CSV to NDJSON 2.4x, CSV filters 1.8-2.1x. Single-threaded, every
+workload is as fast or faster.
+
+- Parallel runs find chunk boundaries in parallel from per-range quote
+  parity and schedule small chunks from a pool, instead of scanning the
+  whole file first and stalling workers on a shared output budget.
+- `--summary` reads integers without `strtod` (2.9x).
+- CSV records are written with one bounds check, short fields are copied
+  inline, and the quoting decision scans a word at a time.
+- The single-equality filter is decided inline with one byte compare.
+
+### Build and tests
+- Every test runs on Windows and reports TAP; `make test` runs all of them.
+- `tests/test_regressions.c` holds one case per fixed defect.
+- The Makefile uses pattern rules; CMake builds portable binaries (no
+  `-march=native`) and registers every test.
+- `bench/bench_ab.py` compares binaries with interleaved runs and checks
+  that their outputs are identical.
+
 ## [1.5.0] - 2026-11-02
 
 NDJSON input throughput release (+17-44% on NDJSON-input workloads), a
