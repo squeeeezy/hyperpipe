@@ -48,8 +48,8 @@ static void print_usage(const char *prog) {
         "                            min/max, mean) instead of row output\n"
         "  --schema <file>           Declared column types, one \"name,type\" per line\n"
         "                            (int hints accelerate numeric filter predicates)\n"
-        "  --jobs <N>                Parallel chunked pipeline for plain CSV/TSV/NDJSON files\n"
-        "                            input (2-64); other inputs run single-threaded\n"
+        "  --jobs <N|auto>           Worker threads for file input (default: auto, one per\n"
+        "                            processor for files of 16 MiB and more; 1 disables)\n"
         "  --gzip                    Compress the output with gzip (libz is loaded at runtime)\n"
         "  --on-error <mode>         Fault tolerance: fail (default), skip, quarantine\n"
         "  --quarantine <file>       Destination file for quarantined malformed rows\n"
@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
     bool gzip_out = false;
     bool summary_mode = false;
     const char *schema_path = NULL;
-    int jobs = 0;
+    int jobs = 0;              /* 0: auto */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -174,11 +174,14 @@ int main(int argc, char **argv) {
             if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
             char *end = NULL;
             long n = strtol(argv[i], &end, 10);
-            if (end == argv[i] || *end != '\0' || n < 0) {
+            if (strcmp(argv[i], "auto") == 0) {
+                jobs = 0;
+            } else if (end == argv[i] || *end != '\0' || n < 1) {
                 fprintf(stderr, "Error: invalid --jobs value: %s\n", argv[i]);
                 return 1;
+            } else {
+                jobs = (int)n;
             }
-            jobs = (int)n;
         } else if (strcmp(argv[i], "--simd") == 0) {
             if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
             if (strcmp(argv[i], "auto") == 0) simd_mode = HP_SIMD_AUTO;
@@ -235,7 +238,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (jobs > 1) {
+    /* Auto mode only picks the parallel path where it applies and pays off;
+     * an explicit --jobs N reports what keeps it from applying. */
+    const bool jobs_explicit = (jobs != 0);
+    if (!jobs_explicit) {
+        jobs = (input_path && limit_rows == 0 && !summary_mode) ? hp_parallel_auto_jobs(input_path) : 1;
+    }
+
+    if (jobs > 1 && jobs_explicit) {
         if (!input_path) {
             fprintf(stderr, "Error: --jobs requires a regular input file (stdin is not seekable)\n");
             return 1;
@@ -300,11 +310,14 @@ int main(int argc, char **argv) {
     if (jobs > 1) {
         err = hp_parallel_run(&config, input_path, out_f, jobs, &parallel_stats);
         if (err == HP_ERR_UNSUPPORTED) {
-            /* Compressed input cannot be seek-split by workers; a first
-             * line the reference parsers reject may need the
-             * single-stream fault-tolerance mode. Either way the
-             * single-threaded pipeline owns the run. */
-            fprintf(stderr, "Note: --jobs fell back to the single-threaded pipeline (compressed input or unparsable first line)\n");
+            /* gzip input cannot be split, CSV skip/quarantine runs need the
+             * sequential resynchronization, and an unparsable first record
+             * belongs to the fault-tolerance mode: run single-threaded. */
+            if (jobs_explicit) {
+                fprintf(stderr, "Note: --jobs does not apply to this input "
+                                "(gzip, CSV with --on-error skip/quarantine, or unparsable first record); "
+                                "running single-threaded\n");
+            }
         } else {
             ran_parallel = true;
         }
