@@ -319,6 +319,18 @@ static void test_long_names_are_kept_whole(void) {
     CHECK(strcmp(r.out, doc) == 0);
 }
 
+/* Switching to the scalar engine left the NDJSON structural kernel on the
+ * vector version, so "scalar" runs still used AVX code */
+static void test_scalar_engine_replaces_every_kernel(void) {
+    hp_dispatch_init(HP_SIMD_AVX512);
+    hp_dispatch_init(HP_SIMD_SCALAR);
+    CHECK(g_hp_dispatch.active_mode == HP_SIMD_SCALAR);
+    CHECK(g_hp_dispatch.json_struct_masks == hp_json_struct_masks_scalar);
+    CHECK(g_hp_dispatch.csv_parse_row == hp_csv_parse_row_scalar);
+    CHECK(g_hp_dispatch.json_emit_string == hp_json_emit_body_scalar);
+    hp_dispatch_init(HP_SIMD_AUTO);
+}
+
 int main(void) {
     TAP_RUN(test_single_equality_is_numeric);
     TAP_RUN(test_numeric_compare_needs_whole_field);
@@ -335,5 +347,6 @@ int main(void) {
     TAP_RUN(test_valid_ndjson_edge_cases);
     TAP_RUN(test_malformed_ndjson_is_rejected);
     TAP_RUN(test_long_names_are_kept_whole);
+    TAP_RUN(test_scalar_engine_replaces_every_kernel);
     return tap_done();
 }

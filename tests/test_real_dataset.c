@@ -97,7 +97,11 @@ static void test_engines_agree(void) {
 static void test_memory_stays_bounded(void) {
     double mib = (double)peak_rss() / (1024.0 * 1024.0);
     printf("# peak RSS %.2f MiB\n", mib);
+#if defined(__SANITIZE_ADDRESS__)
+    printf("# not checked: AddressSanitizer's shadow memory dominates the RSS\n");
+#else
     CHECK(mib < 8.0);
+#endif
 }
 
 static void test_filter_and_projection(void) {

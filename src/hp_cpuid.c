@@ -132,6 +132,13 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
         selected = HP_SIMD_SCALAR;
     }
 
+    /* Rewrite the table only when the engine changes. Workers initialize
+     * again with the engine already selected, and must not write a table
+     * that other threads are reading. */
+    if (selected == g_hp_dispatch.active_mode) {
+        HP_DISPATCH_UNLOCK();
+        return;
+    }
     g_hp_dispatch.active_mode = selected;
     g_hp_dispatch.active_mode_name = hp_simd_mode_to_string(selected);
 
@@ -167,6 +174,7 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.json_scan_str = hp_json_scan_str_scalar;
             g_hp_dispatch.json_scan_lit = hp_json_scan_lit_scalar;
             g_hp_dispatch.json_scan_ws = hp_json_scan_ws_scalar;
+            g_hp_dispatch.json_struct_masks = hp_json_struct_masks_scalar;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_scalar;
             break;
     }
