@@ -1,20 +1,20 @@
 #include "hyperpipe/hp_transcoder.h"
-#include <assert.h>
+#include "tap.h"
 #include <stdio.h>
 #include <string.h>
 
 static void test_format_sniffing(void) {
     const char *csv_sample = "id,name,role\n1,alice,admin\n";
-    assert(hp_sniff_format((const uint8_t *)csv_sample, strlen(csv_sample)) == HP_FORMAT_CSV);
+    CHECK(hp_sniff_format((const uint8_t *)csv_sample, strlen(csv_sample)) == HP_FORMAT_CSV);
 
     const char *tsv_sample = "id\tname\trole\n1\talice\tadmin\n";
-    assert(hp_sniff_format((const uint8_t *)tsv_sample, strlen(tsv_sample)) == HP_FORMAT_TSV);
+    CHECK(hp_sniff_format((const uint8_t *)tsv_sample, strlen(tsv_sample)) == HP_FORMAT_TSV);
 
     const char *ndjson_sample = "{\"id\":1,\"name\":\"alice\"}\n{\"id\":2,\"name\":\"bob\"}\n";
-    assert(hp_sniff_format((const uint8_t *)ndjson_sample, strlen(ndjson_sample)) == HP_FORMAT_NDJSON);
+    CHECK(hp_sniff_format((const uint8_t *)ndjson_sample, strlen(ndjson_sample)) == HP_FORMAT_NDJSON);
 
     const char *bom_tsv = "\xEF\xBB\xBFid\tname\tage\n";
-    assert(hp_sniff_format((const uint8_t *)bom_tsv, strlen(bom_tsv)) == HP_FORMAT_TSV);
+    CHECK(hp_sniff_format((const uint8_t *)bom_tsv, strlen(bom_tsv)) == HP_FORMAT_TSV);
 }
 
 static void test_fault_tolerant_skip(void) {
@@ -34,7 +34,7 @@ static void test_fault_tolerant_skip(void) {
     };
 
     hp_transcoder_t tc;
-    assert(hp_transcoder_init(&tc, &cfg) == HP_OK);
+    CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
 
     FILE *in_mem = tmpfile();
     FILE *out_mem = tmpfile();
@@ -42,12 +42,12 @@ static void test_fault_tolerant_skip(void) {
     rewind(in_mem);
 
     hp_error_t err = hp_transcoder_run(&tc, in_mem, out_mem);
-    assert(err == HP_OK);
+    CHECK(err == HP_OK);
 
     /* Verify row 1 and row 3 were emitted, row 2 dropped */
-    assert(tc.stats.rows_read == 2);
-    assert(tc.stats.rows_emitted == 2);
-    assert(tc.stats.rows_dropped == 1);
+    CHECK(tc.stats.rows_read == 2);
+    CHECK(tc.stats.rows_emitted == 2);
+    CHECK(tc.stats.rows_dropped == 1);
 
     hp_transcoder_free(&tc);
     fclose(in_mem);
@@ -55,8 +55,7 @@ static void test_fault_tolerant_skip(void) {
 }
 
 int main(void) {
-    test_format_sniffing();
-    test_fault_tolerant_skip();
-    printf("test_fault_tolerance: ok\n");
-    return 0;
+    TAP_RUN(test_format_sniffing);
+    TAP_RUN(test_fault_tolerant_skip);
+    return tap_done();
 }

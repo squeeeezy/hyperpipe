@@ -1,5 +1,5 @@
 #include "hyperpipe/hp_csv_parser.h"
-#include <assert.h>
+#include "tap.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -19,30 +19,30 @@ static void test_simple_csv(void) {
 
     /* Header */
     hp_error_t err = hp_csv_parse_row(&parser, (const uint8_t *)csv + offset, len - offset, &consumed, &row, false);
-    assert(err == HP_OK);
-    assert(consumed > 0);
-    assert(row.field_count == 3);
-    assert(strncmp(row.fields[0].ptr, "name", row.fields[0].len) == 0);
-    assert(strncmp(row.fields[1].ptr, "age", row.fields[1].len) == 0);
-    assert(strncmp(row.fields[2].ptr, "city", row.fields[2].len) == 0);
+    CHECK(err == HP_OK);
+    CHECK(consumed > 0);
+    CHECK(row.field_count == 3);
+    CHECK(strncmp(row.fields[0].ptr, "name", row.fields[0].len) == 0);
+    CHECK(strncmp(row.fields[1].ptr, "age", row.fields[1].len) == 0);
+    CHECK(strncmp(row.fields[2].ptr, "city", row.fields[2].len) == 0);
     offset += consumed;
 
     /* Row 1 */
     err = hp_csv_parse_row(&parser, (const uint8_t *)csv + offset, len - offset, &consumed, &row, false);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(strncmp(row.fields[0].ptr, "Alice", row.fields[0].len) == 0);
-    assert(strncmp(row.fields[1].ptr, "30", row.fields[1].len) == 0);
-    assert(strncmp(row.fields[2].ptr, "New York", row.fields[2].len) == 0);
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(strncmp(row.fields[0].ptr, "Alice", row.fields[0].len) == 0);
+    CHECK(strncmp(row.fields[1].ptr, "30", row.fields[1].len) == 0);
+    CHECK(strncmp(row.fields[2].ptr, "New York", row.fields[2].len) == 0);
     offset += consumed;
 
     /* Row 2 */
     err = hp_csv_parse_row(&parser, (const uint8_t *)csv + offset, len - offset, &consumed, &row, true);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(strncmp(row.fields[0].ptr, "Bob", row.fields[0].len) == 0);
-    assert(strncmp(row.fields[1].ptr, "25", row.fields[1].len) == 0);
-    assert(strncmp(row.fields[2].ptr, "London", row.fields[2].len) == 0);
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(strncmp(row.fields[0].ptr, "Bob", row.fields[0].len) == 0);
+    CHECK(strncmp(row.fields[1].ptr, "25", row.fields[1].len) == 0);
+    CHECK(strncmp(row.fields[2].ptr, "London", row.fields[2].len) == 0);
     offset += consumed;
     hp_csv_parser_free(&parser);
 }
@@ -62,22 +62,22 @@ static void test_rfc4180_quotes_and_escapes(void) {
     size_t consumed = 0;
 
     hp_error_t err = hp_csv_parse_row(&parser, (const uint8_t *)csv, len, &consumed, &row, false);
-    assert(err == HP_OK);
-    assert(consumed == len);
-    assert(row.field_count == 3);
+    CHECK(err == HP_OK);
+    CHECK(consumed == len);
+    CHECK(row.field_count == 3);
 
     /* Field 0 unescaped should be: Hello, "World" */
-    assert(row.fields[0].has_escapes == true);
-    assert(row.fields[0].len == strlen("Hello, \"World\""));
-    assert(strncmp(row.fields[0].ptr, "Hello, \"World\"", row.fields[0].len) == 0);
+    CHECK(row.fields[0].has_escapes == true);
+    CHECK(row.fields[0].len == strlen("Hello, \"World\""));
+    CHECK(strncmp(row.fields[0].ptr, "Hello, \"World\"", row.fields[0].len) == 0);
 
     /* Field 1: 123 */
-    assert(row.fields[1].len == 3);
-    assert(strncmp(row.fields[1].ptr, "123", 3) == 0);
+    CHECK(row.fields[1].len == 3);
+    CHECK(strncmp(row.fields[1].ptr, "123", 3) == 0);
 
     /* Field 2: multi\nline\nfield */
-    assert(row.fields[2].len == strlen("multi\nline\nfield"));
-    assert(strncmp(row.fields[2].ptr, "multi\nline\nfield", row.fields[2].len) == 0);
+    CHECK(row.fields[2].len == strlen("multi\nline\nfield"));
+    CHECK(strncmp(row.fields[2].ptr, "multi\nline\nfield", row.fields[2].len) == 0);
     hp_csv_parser_free(&parser);
 }
 
@@ -97,20 +97,20 @@ static void test_empty_fields_and_no_trailing_newline(void) {
 
     /* Row 1: 3 empty fields */
     hp_error_t err = hp_csv_parse_row(&parser, (const uint8_t *)csv + offset, len - offset, &consumed, &row, false);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(row.fields[0].len == 0);
-    assert(row.fields[1].len == 0);
-    assert(row.fields[2].len == 0);
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(row.fields[0].len == 0);
+    CHECK(row.fields[1].len == 0);
+    CHECK(row.fields[2].len == 0);
     offset += consumed;
 
     /* Row 2 at EOF with no trailing newline */
     err = hp_csv_parse_row(&parser, (const uint8_t *)csv + offset, len - offset, &consumed, &row, true);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(row.fields[0].len == 1 && row.fields[0].ptr[0] == 'a');
-    assert(row.fields[1].len == 0);
-    assert(row.fields[2].len == 1 && row.fields[2].ptr[0] == 'c');
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(row.fields[0].len == 1 && row.fields[0].ptr[0] == 'a');
+    CHECK(row.fields[1].len == 0);
+    CHECK(row.fields[2].len == 1 && row.fields[2].ptr[0] == 'c');
     hp_csv_parser_free(&parser);
 }
 
@@ -128,19 +128,19 @@ static void test_tsv_parsing(void) {
     size_t consumed = 0;
 
     hp_error_t err = hp_csv_parse_row(&parser, (const uint8_t *)tsv + offset, len - offset, &consumed, &row, false);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(strncmp(row.fields[0].ptr, "colA", 4) == 0);
-    assert(strncmp(row.fields[1].ptr, "colB", 4) == 0);
-    assert(strncmp(row.fields[2].ptr, "colC", 4) == 0);
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(strncmp(row.fields[0].ptr, "colA", 4) == 0);
+    CHECK(strncmp(row.fields[1].ptr, "colB", 4) == 0);
+    CHECK(strncmp(row.fields[2].ptr, "colC", 4) == 0);
     offset += consumed;
 
     err = hp_csv_parse_row(&parser, (const uint8_t *)tsv + offset, len - offset, &consumed, &row, true);
-    assert(err == HP_OK);
-    assert(row.field_count == 3);
-    assert(strncmp(row.fields[0].ptr, "val1", 4) == 0);
-    assert(strncmp(row.fields[1].ptr, "val2", 4) == 0);
-    assert(strncmp(row.fields[2].ptr, "val3", 4) == 0);
+    CHECK(err == HP_OK);
+    CHECK(row.field_count == 3);
+    CHECK(strncmp(row.fields[0].ptr, "val1", 4) == 0);
+    CHECK(strncmp(row.fields[1].ptr, "val2", 4) == 0);
+    CHECK(strncmp(row.fields[2].ptr, "val3", 4) == 0);
     hp_csv_parser_free(&parser);
 }
 
@@ -157,21 +157,20 @@ static void test_malformed_quote_errors(void) {
     hp_row_t row;
     size_t consumed = 0;
     hp_error_t err = hp_csv_parse_row(&parser, (const uint8_t *)csv1, strlen(csv1), &consumed, &row, true);
-    assert(err == HP_ERR_PARSE_QUOTE);
+    CHECK(err == HP_ERR_PARSE_QUOTE);
 
     /* Unclosed quote at EOF */
     const char *csv2 = "foo,\"unclosed quote at eof";
     err = hp_csv_parse_row(&parser, (const uint8_t *)csv2, strlen(csv2), &consumed, &row, true);
-    assert(err == HP_ERR_PARSE_QUOTE);
+    CHECK(err == HP_ERR_PARSE_QUOTE);
     hp_csv_parser_free(&parser);
 }
 
 int main(void) {
-    test_simple_csv();
-    test_rfc4180_quotes_and_escapes();
-    test_empty_fields_and_no_trailing_newline();
-    test_tsv_parsing();
-    test_malformed_quote_errors();
-    printf("test_rfc4180: ok\n");
-    return 0;
+    TAP_RUN(test_simple_csv);
+    TAP_RUN(test_rfc4180_quotes_and_escapes);
+    TAP_RUN(test_empty_fields_and_no_trailing_newline);
+    TAP_RUN(test_tsv_parsing);
+    TAP_RUN(test_malformed_quote_errors);
+    return tap_done();
 }

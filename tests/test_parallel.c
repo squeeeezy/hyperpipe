@@ -4,7 +4,7 @@
  * reordered/sparse NDJSON keys and fault-tolerance modes. */
 
 #include "hyperpipe/hp_parallel.h"
-#include "tap.h"
+#include "pipe.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,28 +78,8 @@ static void write_test_ndjson(const char *path, int rows, int variant) {
     fclose(f);
 }
 
-typedef struct capture_s {
-    char *data;
-    size_t len;
-    hp_error_t err;
-    hp_transcoder_stats_t stats;
-} capture_t;
-
-static void read_back(FILE *out, capture_t *c) {
-    fflush(out);
-    long len = ftell(out);
-    CHECK(len >= 0);
-    c->len = (size_t)len;
-    c->data = (char *)malloc(c->len + 1);
-    CHECK(c->data);
-    rewind(out);
-    CHECK(fread(c->data, 1, c->len, out) == c->len);
-    c->data[c->len] = '\0';
-    fclose(out);
-}
-
-static capture_t run_single(const hp_transcoder_config_t *cfg, const char *path) {
-    capture_t c = { 0 };
+static pipe_result_t run_single(const hp_transcoder_config_t *cfg, const char *path) {
+    pipe_result_t c = { 0 };
     FILE *in = fopen(path, "rb");
     FILE *out = tmpfile();
     CHECK(in && out);
@@ -111,37 +91,37 @@ static capture_t run_single(const hp_transcoder_config_t *cfg, const char *path)
         hp_transcoder_free(&tc);
     }
     fclose(in);
-    read_back(out, &c);
+    c.out = pipe_slurp(out, &c.len);
     return c;
 }
 
-static capture_t run_parallel(const hp_transcoder_config_t *cfg, const char *path, int jobs) {
-    capture_t c = { 0 };
+static pipe_result_t run_parallel(const hp_transcoder_config_t *cfg, const char *path, int jobs) {
+    pipe_result_t c = { 0 };
     FILE *out = tmpfile();
     CHECK(out);
     c.err = hp_parallel_run(cfg, path, out, jobs, &c.stats);
-    read_back(out, &c);
+    c.out = pipe_slurp(out, &c.len);
     return c;
 }
 
 /* Every job count must produce the single-threaded bytes exactly. */
 static void check_identical(const hp_transcoder_config_t *cfg, const char *path) {
-    capture_t ref = run_single(cfg, path);
+    pipe_result_t ref = run_single(cfg, path);
     CHECK(ref.err == HP_OK);
     for (size_t j = 0; j < sizeof(job_counts) / sizeof(job_counts[0]); j++) {
-        capture_t par = run_parallel(cfg, path, job_counts[j]);
+        pipe_result_t par = run_parallel(cfg, path, job_counts[j]);
         CHECK(par.err == HP_OK);
-        if (par.len != ref.len || memcmp(par.data, ref.data, ref.len) != 0) {
+        if (par.len != ref.len || memcmp(par.out, ref.out, ref.len) != 0) {
             size_t k = 0;
-            while (k < ref.len && k < par.len && ref.data[k] == par.data[k]) k++;
+            while (k < ref.len && k < par.len && ref.out[k] == par.out[k]) k++;
             fprintf(stderr, "jobs=%d: %zu vs %zu bytes, first difference at %zu\n",
                     job_counts[j], par.len, ref.len, k);
         }
-        CHECK(par.len == ref.len && memcmp(par.data, ref.data, ref.len) == 0);
+        CHECK(par.len == ref.len && memcmp(par.out, ref.out, ref.len) == 0);
         CHECK(par.stats.rows_emitted == ref.stats.rows_emitted);
-        free(par.data);
+        pipe_free(&par);
     }
-    free(ref.data);
+    pipe_free(&ref);
 }
 
 static hp_transcoder_config_t config(hp_format_t in, hp_format_t out) {
@@ -174,9 +154,9 @@ static void test_csv_filter_and_projection(void) {
 static void test_csv_skip_mode_runs_sequentially(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
     cfg.on_error = HP_ON_ERROR_SKIP;
-    capture_t par = run_parallel(&cfg, csv_path, 4);
+    pipe_result_t par = run_parallel(&cfg, csv_path, 4);
     CHECK(par.err == HP_ERR_UNSUPPORTED);
-    free(par.data);
+    pipe_free(&par);
 }
 
 /* TSV fields may be quoted too, newlines included */
@@ -211,13 +191,13 @@ static void test_ndjson_quarantine(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_NDJSON, HP_FORMAT_CSV);
     cfg.on_error = HP_ON_ERROR_QUARANTINE;
     cfg.quarantine_path = q_single;
-    capture_t ref = run_single(&cfg, dirty_path);
+    pipe_result_t ref = run_single(&cfg, dirty_path);
     cfg.quarantine_path = q_parallel;
-    capture_t par = run_parallel(&cfg, dirty_path, 5);
+    pipe_result_t par = run_parallel(&cfg, dirty_path, 5);
     CHECK(ref.err == HP_OK && par.err == HP_OK);
     CHECK(ref.stats.rows_dropped > 100);
     CHECK(par.stats.rows_dropped == ref.stats.rows_dropped);
-    CHECK(par.len == ref.len && memcmp(par.data, ref.data, ref.len) == 0);
+    CHECK(par.len == ref.len && memcmp(par.out, ref.out, ref.len) == 0);
 
     FILE *a = fopen(q_single, "rb"), *b = fopen(q_parallel, "rb");
     CHECK(a && b);
@@ -230,8 +210,8 @@ static void test_ndjson_quarantine(void) {
     fclose(a);
     fclose(b);
 
-    free(ref.data);
-    free(par.data);
+    pipe_free(&ref);
+    pipe_free(&par);
     remove(dirty_path);
     remove(q_single);
     remove(q_parallel);
@@ -241,11 +221,11 @@ static void test_csv_count(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
     cfg.where_spec = "id >= 500";
     cfg.count_only = true;
-    capture_t par = run_parallel(&cfg, csv_path, 4);
+    pipe_result_t par = run_parallel(&cfg, csv_path, 4);
     CHECK(par.err == HP_OK);
     /* ids 500..csv_rows-1 from the loop plus the trailing id=csv_rows record */
     CHECK(par.stats.rows_emitted == (uint64_t)(csv_rows - 500) + 1);
-    free(par.data);
+    pipe_free(&par);
 }
 
 /* A different row offset moves the chunk boundaries onto other shapes. */
@@ -276,13 +256,13 @@ static void test_ndjson_count(void) {
     hp_transcoder_config_t cfg = config(HP_FORMAT_NDJSON, HP_FORMAT_NDJSON);
     cfg.where_spec = "id >= 500";
     cfg.count_only = true;
-    capture_t ref = run_single(&cfg, ndjson_path);
-    capture_t par = run_parallel(&cfg, ndjson_path, 4);
+    pipe_result_t ref = run_single(&cfg, ndjson_path);
+    pipe_result_t par = run_parallel(&cfg, ndjson_path, 4);
     CHECK(ref.err == HP_OK && par.err == HP_OK);
     CHECK(ref.stats.rows_emitted > 0);
     CHECK(par.stats.rows_emitted == ref.stats.rows_emitted);
-    free(ref.data);
-    free(par.data);
+    pipe_free(&ref);
+    pipe_free(&par);
 }
 
 /* Rows 0..2999 carry {id,v}; later rows add a key. The single-threaded run
@@ -299,11 +279,11 @@ static void test_ndjson_schema_lock(void) {
     fclose(f);
 
     hp_transcoder_config_t cfg = config(HP_FORMAT_NDJSON, HP_FORMAT_NDJSON);
-    capture_t par = run_parallel(&cfg, grow_path, 4);
+    pipe_result_t par = run_parallel(&cfg, grow_path, 4);
     CHECK(par.err == HP_OK);
     CHECK(par.stats.rows_emitted == 4000);
-    CHECK(strstr(par.data, "\"col_2\":3000") != NULL);
-    free(par.data);
+    CHECK(strstr(par.out, "\"col_2\":3000") != NULL);
+    pipe_free(&par);
     remove(grow_path);
 }
 
@@ -317,9 +297,9 @@ static void test_compressed_input_is_unsupported(void) {
     fclose(f);
 
     hp_transcoder_config_t cfg = config(HP_FORMAT_CSV, HP_FORMAT_AUTO);
-    capture_t par = run_parallel(&cfg, gz_path, 4);
+    pipe_result_t par = run_parallel(&cfg, gz_path, 4);
     CHECK(par.err == HP_ERR_UNSUPPORTED);
-    free(par.data);
+    pipe_free(&par);
     remove(gz_path);
 }
 

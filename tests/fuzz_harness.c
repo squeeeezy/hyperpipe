@@ -26,10 +26,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
-#include <sys/stat.h>
-#endif
-
 #define FUZZ_DOC_CAP (256 * 1024)
 
 /* Compact FNV-1a fingerprint of a full parse.
@@ -140,6 +136,66 @@ static void ndjson_fingerprint(const char *doc, size_t len,
     *hash_out = hash;
 }
 
+/* Input as a stream: fmemopen where it exists, which keeps libFuzzer fast,
+ * and a temporary file elsewhere. NULL for an empty input. */
+static FILE *input_stream(const char *data, size_t len) {
+    if (len == 0) return NULL;
+#if defined(_WIN32)
+    FILE *f = tmpfile();
+    if (!f) abort();
+    fwrite(data, 1, len, f);
+    rewind(f);
+    return f;
+#else
+    FILE *f = fmemopen((void *)data, len, "rb");
+    if (!f) abort();
+    return f;
+#endif
+}
+
+typedef struct out_buf_s {
+    char *data;
+    size_t len;
+    size_t cap;
+} out_buf_t;
+
+static size_t out_append(void *ctx, const void *data, size_t len) {
+    out_buf_t *b = (out_buf_t *)ctx;
+    if (b->len + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->len + len) cap *= 2;
+        char *grown = (char *)realloc(b->data, cap);
+        if (!grown) abort();
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    return len;
+}
+
+/* Transcodes doc with cfg into out (through the output sink) */
+static hp_error_t transcode(hp_transcoder_config_t cfg, const char *doc, size_t size, out_buf_t *out) {
+    FILE *in = input_stream(doc, size);
+    if (!in) return HP_ERR_INVALID_ARG;
+    cfg.sink = out_append;
+    cfg.sink_ctx = out;
+    hp_transcoder_t tc;
+    if (hp_transcoder_init(&tc, &cfg) != HP_OK) abort();
+    hp_error_t err = hp_transcoder_run(&tc, in, NULL);
+    hp_transcoder_free(&tc);
+    fclose(in);
+    return err;
+}
+
+static void save_failing_input(const char *path, const char *doc, size_t size) {
+    FILE *dump = fopen(path, "wb");
+    if (dump) {
+        fwrite(doc, 1, size, dump);
+        fclose(dump);
+    }
+}
+
 static int check_input(const uint8_t *data, size_t size) {
     if (size > FUZZ_DOC_CAP) return 0;
     const char *doc = (const char *)data;
@@ -156,83 +212,51 @@ static int check_input(const uint8_t *data, size_t size) {
         parse_fingerprint(doc, size, &f0, &h0);
     }
 
-#if !defined(_WIN32)
-    /* Full-pipeline roundtrip; oversized or unterminated-quote documents
-     * may legitimately fail parsing in fail mode, which is fine - the
-     * invariant is "no crash", plus fingerprint stability when it passes. */
-    hp_transcoder_config_t cfg = {
+    /* Full-pipeline round trip. Oversized or unterminated documents may
+     * fail in fail mode, which is fine: the invariant is "no crash", plus a
+     * stable fingerprint whenever the run succeeds. */
+    const hp_transcoder_config_t csv = {
         .in_format = HP_FORMAT_CSV,
         .out_format = HP_FORMAT_CSV,
         .simd_mode = HP_SIMD_AVX2,
     };
-    hp_transcoder_t tc;
-    if (hp_transcoder_init(&tc, &cfg) != HP_OK) abort();
-
-    FILE *fin = fmemopen((void *)doc, size, "rb");
-    if (!fin) { hp_transcoder_free(&tc); return 0; }
-    char *mem = NULL;
-    size_t dummy = 0;
-    FILE *fout = open_memstream(&mem, &dummy);
-    if (!fout) { fclose(fin); hp_transcoder_free(&tc); return 0; }
-
-    hp_error_t err = hp_transcoder_run(&tc, fin, fout);
-    fclose(fin);
-    fclose(fout);
-    hp_transcoder_free(&tc);
-
-    if (err == HP_OK && !header_has_nul) {
+    out_buf_t out = { 0 };
+    if (transcode(csv, doc, size, &out) == HP_OK && !header_has_nul) {
         uint64_t f1, h1;
-        parse_fingerprint(mem, dummy, &f1, &h1);
+        parse_fingerprint(out.data, out.len, &f1, &h1);
         if (f0 > 0 && (f0 != f1 || h0 != h1)) {
-            fprintf(stderr, "fuzz: roundtrip drift (fields %llu -> %llu)\n",
+            fprintf(stderr, "fuzz: round trip drift (fields %llu -> %llu)\n",
                     (unsigned long long)f0, (unsigned long long)f1);
-            FILE *dump = fopen("/tmp/fuzz_fail_input.bin", "wb");
-            if (dump) { fwrite(doc, 1, size, dump); fclose(dump); }
+            save_failing_input("fuzz_fail_input.csv", doc, size);
             abort();
         }
     }
-    free(mem);
+    free(out.data);
 
-    /* NDJSON roundtrip through the structural fast path (AVX2 dispatch on
-     * x86, scalar elsewhere - both must satisfy the same invariant). */
+    /* NDJSON round trip through the structural fast path (AVX2 dispatch on
+     * x86, scalar elsewhere; both must satisfy the same invariant) */
     if (!header_has_nul) {
         uint64_t nf0 = 0, nh0 = 0;
         ndjson_fingerprint(doc, size, &nf0, &nh0);
 
-        hp_transcoder_config_t jcfg = {
+        const hp_transcoder_config_t ndjson = {
             .in_format = HP_FORMAT_NDJSON,
             .out_format = HP_FORMAT_NDJSON,
             .simd_mode = HP_SIMD_AVX2,
         };
-        hp_transcoder_t jtc;
-        if (hp_transcoder_init(&jtc, &jcfg) != HP_OK) abort();
-
-        FILE *jin = fmemopen((void *)doc, size, "rb");
-        if (!jin) { hp_transcoder_free(&jtc); return 0; }
-        char *jmem = NULL;
-        size_t jdummy = 0;
-        FILE *jout = open_memstream(&jmem, &jdummy);
-        if (!jout) { fclose(jin); hp_transcoder_free(&jtc); return 0; }
-
-        hp_error_t jerr = hp_transcoder_run(&jtc, jin, jout);
-        fclose(jin);
-        fclose(jout);
-        hp_transcoder_free(&jtc);
-
-        if (jerr == HP_OK) {
+        out_buf_t jout = { 0 };
+        if (transcode(ndjson, doc, size, &jout) == HP_OK) {
             uint64_t nf1 = 0, nh1 = 0;
-            ndjson_fingerprint(jmem, jdummy, &nf1, &nh1);
+            ndjson_fingerprint(jout.data, jout.len, &nf1, &nh1);
             if (nf0 > 0 && (nf0 != nf1 || nh0 != nh1)) {
-                fprintf(stderr, "fuzz: ndjson roundtrip drift (fields %llu -> %llu)\n",
+                fprintf(stderr, "fuzz: ndjson round trip drift (fields %llu -> %llu)\n",
                         (unsigned long long)nf0, (unsigned long long)nf1);
-                FILE *dump = fopen("/tmp/fuzz_fail_input.json", "wb");
-                if (dump) { fwrite(doc, 1, size, dump); fclose(dump); }
+                save_failing_input("fuzz_fail_input.ndjson", doc, size);
                 abort();
             }
         }
-        free(jmem);
+        free(jout.data);
     }
-#endif /* !defined(_WIN32) */
 
     return 0;
 }
@@ -281,7 +305,7 @@ int main(int argc, char **argv) {
     size_t iterations = 20000;
     if (argc > 1) iterations = (size_t)strtoull(argv[1], NULL, 10) * 1000;
 
-    printf("[fuzz] standalone driver: %zu iterations (no libFuzzer)\n", iterations);
+    printf("fuzz: %zu iterations\n", iterations);
 
     /* Seed files provided on the command line run verbatim first */
     for (int i = 1; i < argc; i++) {
@@ -330,7 +354,7 @@ int main(int argc, char **argv) {
         }
         check_input(doc, len);
     }
-    printf("[fuzz] done: all invariants held\n");
+    printf("fuzz: ok\n");
     return 0;
 }
 

@@ -1,5 +1,5 @@
 #include "hyperpipe/hp_transcoder.h"
-#include <assert.h>
+#include "tap.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -21,10 +21,10 @@ static void test_csv_to_ndjson_to_csv(void) {
         .simd_mode = HP_SIMD_AUTO
     };
     hp_transcoder_t tc_json;
-    assert(hp_transcoder_init(&tc_json, &cfg_to_json) == HP_OK);
+    CHECK(hp_transcoder_init(&tc_json, &cfg_to_json) == HP_OK);
     FILE *in1 = fopen("rt_orig.csv", "rb");
     FILE *out1 = fopen("rt_stage1.ndjson", "wb");
-    assert(hp_transcoder_run(&tc_json, in1, out1) == HP_OK);
+    CHECK(hp_transcoder_run(&tc_json, in1, out1) == HP_OK);
     fclose(in1);
     fclose(out1);
     hp_transcoder_free(&tc_json);
@@ -36,10 +36,10 @@ static void test_csv_to_ndjson_to_csv(void) {
         .simd_mode = HP_SIMD_AUTO
     };
     hp_transcoder_t tc_csv;
-    assert(hp_transcoder_init(&tc_csv, &cfg_to_csv) == HP_OK);
+    CHECK(hp_transcoder_init(&tc_csv, &cfg_to_csv) == HP_OK);
     FILE *in2 = fopen("rt_stage1.ndjson", "rb");
     FILE *out2 = fopen("rt_final.csv", "wb");
-    assert(hp_transcoder_run(&tc_csv, in2, out2) == HP_OK);
+    CHECK(hp_transcoder_run(&tc_csv, in2, out2) == HP_OK);
     fclose(in2);
     fclose(out2);
     hp_transcoder_free(&tc_csv);
@@ -54,9 +54,8 @@ static void test_csv_to_ndjson_to_csv(void) {
     remove("rt_stage1.ndjson");
     remove("rt_final.csv");
 
-    assert(final_len == strlen(orig_csv));
-    assert(memcmp(final_buf, orig_csv, final_len) == 0);
-    printf("  [PASS] CSV -> NDJSON -> CSV roundtrip verified.\n");
+    CHECK(final_len == strlen(orig_csv));
+    CHECK(memcmp(final_buf, orig_csv, final_len) == 0);
 }
 
 static void test_quoted_csv_roundtrip(void) {
@@ -78,10 +77,10 @@ static void test_quoted_csv_roundtrip(void) {
         .simd_mode = HP_SIMD_SCALAR
     };
     hp_transcoder_t tc;
-    assert(hp_transcoder_init(&tc, &cfg_pass) == HP_OK);
+    CHECK(hp_transcoder_init(&tc, &cfg_pass) == HP_OK);
     FILE *in = fopen("rt2_orig.csv", "rb");
     FILE *out = fopen("rt2_final.csv", "wb");
-    assert(hp_transcoder_run(&tc, in, out) == HP_OK);
+    CHECK(hp_transcoder_run(&tc, in, out) == HP_OK);
     fclose(in); fclose(out);
     hp_transcoder_free(&tc);
 
@@ -92,9 +91,8 @@ static void test_quoted_csv_roundtrip(void) {
     remove("rt2_orig.csv");
     remove("rt2_final.csv");
 
-    assert(len == strlen(orig));
-    assert(memcmp(buf, orig, len) == 0 && "quoted CSV roundtrip must be byte-identical");
-    printf("  [PASS] Quoted CSV (embedded comma/newline/quotes) round-trip is byte-identical.\n");
+    CHECK(len == strlen(orig));
+    CHECK(memcmp(buf, orig, len) == 0 && "quoted CSV roundtrip must be byte-identical");
 }
 
 static void test_unterminated_quoted_eof(void) {
@@ -117,11 +115,11 @@ static void test_unterminated_quoted_eof(void) {
 
     for (int pass = 0; pass < 2; pass++) {
         hp_transcoder_t tc;
-        assert(hp_transcoder_init(&tc, &cfg) == HP_OK);
+        CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
         FILE *in = fopen(pass == 0 ? "rt4_orig.csv" : "rt4_stage1.csv", "rb");
         FILE *out = fopen(pass == 0 ? "rt4_stage1.csv" : "rt4_stage2.csv", "wb");
-        assert(in && out);
-        assert(hp_transcoder_run(&tc, in, out) == HP_OK);
+        CHECK(in && out);
+        CHECK(hp_transcoder_run(&tc, in, out) == HP_OK);
         fclose(in);
         fclose(out);
         hp_transcoder_free(&tc);
@@ -138,10 +136,9 @@ static void test_unterminated_quoted_eof(void) {
     remove("rt4_stage1.csv");
     remove("rt4_stage2.csv");
 
-    assert(len1 > 0);
-    assert(len1 == len2 && memcmp(buf1, buf2, len1) == 0 &&
+    CHECK(len1 > 0);
+    CHECK(len1 == len2 && memcmp(buf1, buf2, len1) == 0 &&
            "unterminated-quoted EOF tail must reach a stable fixed point");
-    printf("  [PASS] Unterminated quoted field at EOF round-trips stably.\n");
 }
 
 static void test_ndjson_fidelity(void) {
@@ -162,10 +159,10 @@ static void test_ndjson_fidelity(void) {
         .simd_mode = HP_SIMD_SCALAR
     };
     hp_transcoder_t tc;
-    assert(hp_transcoder_init(&tc, &cfg) == HP_OK);
+    CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
     FILE *in = fopen("rt3_orig.ndjson", "rb");
     FILE *out = fopen("rt3_final.ndjson", "wb");
-    assert(hp_transcoder_run(&tc, in, out) == HP_OK);
+    CHECK(hp_transcoder_run(&tc, in, out) == HP_OK);
     fclose(in); fclose(out);
     hp_transcoder_free(&tc);
 
@@ -178,17 +175,16 @@ static void test_ndjson_fidelity(void) {
     buf[len] = '\0';
 
     /* 1. Unicode escapes decoded (accented char + surrogate-pair emoji) */
-    assert(strstr(buf, "caf\xc3\xa9 \xf0\x9f\x98\x80") != NULL && "\\u decoding failed");
+    CHECK(strstr(buf, "caf\xc3\xa9 \xf0\x9f\x98\x80") != NULL && "\\u decoding failed");
     /* 2. Reordered keys land in schema order (host,status,a,b) with correct values */
-    assert(strstr(buf, "{\"status\":404,\"a\":2,\"b\":\"x\"}") != NULL && "key reorder failed");
+    CHECK(strstr(buf, "{\"status\":404,\"a\":2,\"b\":\"x\"}") != NULL && "key reorder failed");
     /* 3. Heterogeneous key 'b' keeps its name (was col_2) */
-    assert(strstr(buf, "\"b\":\"x\"") != NULL && "heterogeneous key lost");
+    CHECK(strstr(buf, "\"b\":\"x\"") != NULL && "heterogeneous key lost");
     /* 4. Sparse rows omit absent keys (host absent here) instead of emitting empties */
-    assert(strstr(buf, "{\"host\":\"null\",\"status\":200,\"a\":3}") != NULL && "sparse row failed");
+    CHECK(strstr(buf, "{\"host\":\"null\",\"status\":200,\"a\":3}") != NULL && "sparse row failed");
     /* 5. Type fidelity: the STRING "null" stays a string (was JSON null) */
-    assert(strstr(buf, "\"host\":\"null\"") != NULL && "string 'null' mangled to null literal");
+    CHECK(strstr(buf, "\"host\":\"null\"") != NULL && "string 'null' mangled to null literal");
 
-    printf("  [PASS] NDJSON fidelity: \\u escapes, key reorder, heterogeneous schema, types.\n");
 }
 
 static void test_or_and_string_ops(void) {
@@ -210,10 +206,10 @@ static void test_or_and_string_ops(void) {
         .where_spec = "url startswith /api and st == 200 or url contains .js"
     };
     hp_transcoder_t tc;
-    assert(hp_transcoder_init(&tc, &cfg) == HP_OK);
+    CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
     FILE *in = fopen("rt4.csv", "rb");
     FILE *out = fopen("rt4.out", "wb");
-    assert(hp_transcoder_run(&tc, in, out) == HP_OK);
+    CHECK(hp_transcoder_run(&tc, in, out) == HP_OK);
     fclose(in); fclose(out);
     uint64_t emitted = tc.stats.rows_emitted;
     hp_transcoder_free(&tc);
@@ -229,18 +225,16 @@ static void test_or_and_string_ops(void) {
     /* Group 1 (startswith /api AND st == 200): /api/v1
      * Group 2 (contains .js): /static/x.js
      * /api/v2 (404) must NOT match either group. */
-    assert(emitted == 2 && "or-group filter emitted wrong row count");
-    assert(strstr(buf, "/api/v1") != NULL && strstr(buf, "/static/x.js") != NULL);
-    assert(strstr(buf, "/api/v2") == NULL);
-    printf("  [PASS] or-groups + startswith/contains operators.\n");
+    CHECK(emitted == 2 && "or-group filter emitted wrong row count");
+    CHECK(strstr(buf, "/api/v1") != NULL && strstr(buf, "/static/x.js") != NULL);
+    CHECK(strstr(buf, "/api/v2") == NULL);
 }
 
 int main(void) {
-    test_csv_to_ndjson_to_csv();
-    test_quoted_csv_roundtrip();
-    test_unterminated_quoted_eof();
-    test_ndjson_fidelity();
-    test_or_and_string_ops();
-    printf("test_roundtrip: ok\n");
-    return 0;
+    TAP_RUN(test_csv_to_ndjson_to_csv);
+    TAP_RUN(test_quoted_csv_roundtrip);
+    TAP_RUN(test_unterminated_quoted_eof);
+    TAP_RUN(test_ndjson_fidelity);
+    TAP_RUN(test_or_and_string_ops);
+    return tap_done();
 }

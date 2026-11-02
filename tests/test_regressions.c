@@ -1,12 +1,9 @@
 /* End-to-end regression tests: each case drives the full transcoder over an
- * in-memory input and pins one previously observed defect. Uses tmpfile()
- * instead of fmemopen() so the suite also runs on Windows. */
+ * in-memory input and pins one previously observed defect. */
 
-#include "hyperpipe/hp_transcoder.h"
-#include "tap.h"
-#include <stdio.h>
-#include <string.h>
+#include "pipe.h"
 
+/* The first 4 KiB of output by value, which keeps the cases short */
 typedef struct run_result_s {
     hp_error_t err;
     char out[4096];
@@ -14,28 +11,12 @@ typedef struct run_result_s {
 } run_result_t;
 
 static run_result_t run_config(const char *input, const hp_transcoder_config_t *cfg) {
-    run_result_t r;
-    memset(&r, 0, sizeof(r));
-
-    FILE *in = tmpfile();
-    FILE *out = tmpfile();
-    CHECK(in && out);
-    fwrite(input, 1, strlen(input), in);
-    rewind(in);
-
-    hp_transcoder_t tc;
-    r.err = hp_transcoder_init(&tc, cfg);
-    if (r.err == HP_OK) {
-        r.err = hp_transcoder_run(&tc, in, out);
-        r.rows_emitted = tc.stats.rows_emitted;
-        hp_transcoder_free(&tc);
-    }
-
-    rewind(out);
-    size_t n = fread(r.out, 1, sizeof(r.out) - 1, out);
+    pipe_result_t p = pipe_run_str(cfg, input);
+    run_result_t r = { .err = p.err, .rows_emitted = p.stats.rows_emitted };
+    size_t n = p.len < sizeof(r.out) - 1 ? p.len : sizeof(r.out) - 1;
+    memcpy(r.out, p.out, n);
     r.out[n] = '\0';
-    fclose(in);
-    fclose(out);
+    pipe_free(&p);
     return r;
 }
 
@@ -242,37 +223,19 @@ static void test_gzip_output_covers_oversized_records(void) {
     memset(csv + 4, 'x', field_len);
     strcpy(csv + 4 + field_len, ",1\n");
 
-    FILE *in = tmpfile(), *packed = tmpfile(), *plain = tmpfile();
-    CHECK(in && packed && plain);
-    fputs(csv, in);
-    rewind(in);
-
-    hp_transcoder_config_t cfg = { .out_format = HP_FORMAT_CSV, .gzip_out = true };
-    hp_transcoder_t tc;
-    CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
-    hp_error_t err = hp_transcoder_run(&tc, in, packed);
-    hp_transcoder_free(&tc);
-    if (err == HP_ERR_GZIP_UNAVAILABLE) {
-        printf("# zlib not available, gzip round trip not exercised\n");
+    const hp_transcoder_config_t pack = { .out_format = HP_FORMAT_CSV, .gzip_out = true };
+    const hp_transcoder_config_t unpack = { .out_format = HP_FORMAT_CSV };
+    pipe_result_t packed = pipe_run_str(&pack, csv);
+    if (packed.err == HP_ERR_GZIP_UNAVAILABLE) {
+        printf("# zlib not found, gzip round trip not exercised\n");
     } else {
-        CHECK(err == HP_OK);
-        rewind(packed);
-        hp_transcoder_config_t back = { .out_format = HP_FORMAT_CSV };
-        CHECK(hp_transcoder_init(&tc, &back) == HP_OK);
-        CHECK(hp_transcoder_run(&tc, packed, plain) == HP_OK);
-        hp_transcoder_free(&tc);
-
-        size_t total = strlen(csv);
-        char *got = malloc(total + 1);
-        CHECK(got);
-        rewind(plain);
-        CHECK(fread(got, 1, total + 1, plain) == total);
-        CHECK(memcmp(got, csv, total) == 0);
-        free(got);
+        CHECK(packed.err == HP_OK);
+        pipe_result_t plain = pipe_run(&unpack, packed.out, packed.len);
+        CHECK(plain.err == HP_OK);
+        CHECK(strcmp(plain.out, csv) == 0);
+        pipe_free(&plain);
     }
-    fclose(in);
-    fclose(packed);
-    fclose(plain);
+    pipe_free(&packed);
     free(csv);
 }
 

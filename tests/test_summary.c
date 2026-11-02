@@ -1,142 +1,76 @@
-/* test_summary: --summary column statistics.
- *
- * Unit part feeds hand-built rows directly into hp_summary_observe.
- * Integration part runs the full transcoder with config.summary over an
- * NDJSON stream that exercises sparse rows, schema growth and mixed column
- * types, capturing the printed table through fmemopen. */
+/* --summary column statistics: the accumulator over hand-built rows, and
+ * the full transcoder over an NDJSON stream with sparse rows, schema growth
+ * and mixed column types. */
 
 #include "hyperpipe/hp_summary.h"
-#include "hyperpipe/hp_transcoder.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "pipe.h"
 
-static int failures = 0;
-
-#define CHECK(cond, msg) \
-    do { \
-        if (cond) { \
-            printf("  [PASS] %s\n", msg); \
-        } else { \
-            printf("  [FAIL] %s\n", msg); \
-            failures++; \
-        } \
-    } while (0)
-
-static void set_field(hp_row_t *row, size_t idx, const char *val, size_t len,
-                      bool escapes, bool present) {
+static void set_field(hp_row_t *row, size_t idx, const char *val, bool quoted, bool present) {
     row->fields[idx].ptr = val;
-    row->fields[idx].len = len;
-    row->fields[idx].has_escapes = escapes;
+    row->fields[idx].len = strlen(val);
+    row->fields[idx].has_escapes = quoted;
     row->fields[idx].present = present;
     if (idx + 1 > row->field_count) row->field_count = idx + 1;
 }
 
-static void test_unit_accumulator(void) {
-    printf("[test_summary] unit: accumulator over hand-built rows\n");
-
-    hp_summary_t s;
+static void test_accumulator(void) {
+    static hp_summary_t s;
     hp_summary_init(&s);
 
-    hp_header_t header;
-    memset(&header, 0, sizeof(header));
+    hp_header_t header = { .count = 3 };
     header.names[0] = (char *)"status";
     header.names[1] = (char *)"host";
     header.names[2] = (char *)"bytes";
-    header.count = 3;
 
-    hp_row_t r1, r2, r3;
-    memset(&r1, 0, sizeof(r1));
-    memset(&r2, 0, sizeof(r2));
-    memset(&r3, 0, sizeof(r3));
-    r1.field_count = r2.field_count = r3.field_count = 3;
-
-    /* row 1: status=200, host="web-1", bytes=1024 */
-    set_field(&r1, 0, "200", 3, false, true);
-    set_field(&r1, 1, "web-1", 5, true, true);
-    set_field(&r1, 2, "1024", 4, false, true);
-    /* row 2: status=404, host absent, bytes=512 */
-    set_field(&r2, 0, "404", 3, false, true);
-    set_field(&r2, 1, "", 0, false, false);
-    set_field(&r2, 2, "512", 3, false, true);
-    /* row 3: status absent, host="", bytes=not-a-number */
-    set_field(&r3, 0, "", 0, false, false);
-    set_field(&r3, 1, "", 0, true, true);
-    set_field(&r3, 2, "abc", 3, true, true);
+    static hp_row_t r1, r2, r3;
+    set_field(&r1, 0, "200", false, true);
+    set_field(&r1, 1, "web-1", true, true);
+    set_field(&r1, 2, "1024", false, true);
+    set_field(&r2, 0, "404", false, true);
+    set_field(&r2, 1, "", false, false);      /* host absent */
+    set_field(&r2, 2, "512", false, true);
+    set_field(&r3, 0, "", false, false);      /* status absent */
+    set_field(&r3, 1, "", true, true);        /* host empty */
+    set_field(&r3, 2, "abc", true, true);     /* bytes not a number */
 
     hp_summary_observe(&s, &header, &r1);
     hp_summary_observe(&s, &header, &r2);
     hp_summary_observe(&s, &header, &r3);
 
-    char buf[4096];
-    FILE *cap = fmemopen(buf, sizeof(buf), "w");
-    hp_summary_print(&s, cap);
-    fclose(cap);
+    FILE *f = tmpfile();
+    CHECK(f);
+    hp_summary_print(&s, f);
+    size_t len;
+    char *table = pipe_slurp(f, &len);
 
-    CHECK(s.rows == 3, "observed row count is 3");
-    CHECK(s.cols[0].num_count == 2 && s.cols[0].int_count == 2,
-          "status column: 2 integer values");
-    CHECK(s.cols[0].absent == 1, "status column: 1 absent row");
-    CHECK(strstr(buf, "int") != NULL, "status column typed int");
-    CHECK(strstr(buf, "200") != NULL && strstr(buf, "404") != NULL,
-          "status min/max present in table");
-    CHECK(s.cols[2].num_count == 2 && s.cols[2].has_string,
-          "bytes column mixes numbers and strings");
-    CHECK(strstr(buf, "mixed") != NULL, "bytes column typed mixed");
-    CHECK(s.cols[1].absent == 1 && s.cols[1].empty == 1,
-          "host column: one absent, one empty");
+    CHECK(s.rows == 3);
+    CHECK(s.cols[0].num_count == 2 && s.cols[0].int_count == 2 && s.cols[0].absent == 1);
+    CHECK(s.cols[1].absent == 1 && s.cols[1].empty == 1);
+    CHECK(s.cols[2].num_count == 2 && s.cols[2].has_string);
+    CHECK(strstr(table, "int") && strstr(table, "200") && strstr(table, "404"));
+    CHECK(strstr(table, "mixed"));
+    free(table);
 }
 
-static void test_integration_transcoder(void) {
-    printf("[test_summary] integration: transcoder over NDJSON input\n");
-
-    const char *input =
+static void test_transcoder_summary(void) {
+    const hp_transcoder_config_t cfg = {
+        .in_format = HP_FORMAT_NDJSON,
+        .out_format = HP_FORMAT_CSV,     /* ignored by summary mode */
+        .summary = true,
+    };
+    pipe_result_t r = pipe_run_str(&cfg,
         "{\"a\":1,\"b\":\"x\"}\n"
         "{\"a\":2,\"b\":\"y\"}\n"
-        "{\"a\":3,\"c\":\"late\"}\n";
-
-    FILE *in = fmemopen((void *)input, strlen(input), "r");
-    char out_buf[8192];
-    memset(out_buf, 0, sizeof(out_buf));
-    FILE *out = fmemopen(out_buf, sizeof(out_buf), "w");
-
-    hp_transcoder_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.in_format = HP_FORMAT_NDJSON;
-    cfg.out_format = HP_FORMAT_CSV;   /* ignored by summary mode */
-    cfg.summary = true;
-
-    hp_transcoder_t tc;
-    hp_error_t err = hp_transcoder_init(&tc, &cfg);
-    if (err != HP_OK) {
-        printf("  [FAIL] transcoder init (code %d)\n", err);
-        failures++;
-        fclose(in);
-        fclose(out);
-        return;
-    }
-    err = hp_transcoder_run(&tc, in, out);
-    hp_transcoder_free(&tc);
-    fclose(in);
-    fclose(out);
-
-    CHECK(err == HP_OK, "run completed");
-    CHECK(strstr(out_buf, "column") != NULL, "table header printed");
-    CHECK(strstr(out_buf, "rows: 3") != NULL, "row count footer");
-    CHECK(strstr(out_buf, "int") != NULL, "column a typed int");
-    CHECK(strstr(out_buf, "late") != NULL, "column c value captured");
-    CHECK(strstr(out_buf, "3") != NULL && strstr(out_buf, "1") != NULL,
-          "column a min/max values");
+        "{\"a\":3,\"c\":\"late\"}\n");
+    CHECK(r.err == HP_OK);
+    CHECK(strstr(r.out, "column") && strstr(r.out, "rows: 3"));
+    CHECK(strstr(r.out, "int"));
+    CHECK(strstr(r.out, "late"));    /* the column that appears on row 3 */
+    pipe_free(&r);
 }
 
 int main(void) {
-    test_unit_accumulator();
-    test_integration_transcoder();
-
-    if (failures == 0) {
-        printf("test_summary: ok\n");
-        return 0;
-    }
-    printf("test_summary: %d failure(s)\n", failures);
-    return 1;
+    TAP_RUN(test_accumulator);
+    TAP_RUN(test_transcoder_summary);
+    return tap_done();
 }
