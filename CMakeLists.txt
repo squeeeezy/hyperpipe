@@ -1,84 +1,63 @@
 cmake_minimum_required(VERSION 3.20)
-project(hyperpipe C)
+project(hyperpipe VERSION 2.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-
-if(MSVC)
-    add_compile_options(/W4 /WX /O2)
-else()
-    add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3 -march=native)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
 endif()
 
-include_directories(include)
+find_package(Threads REQUIRED)
 
-# Static library for core engine
-set(HYPERPIPE_SOURCES
-    src/hp_ring_buffer.c
-    src/hp_gzip.c
+add_library(hyperpipe_core STATIC
     src/hp_cpuid.c
-    src/hp_csv_scalar.c
     src/hp_csv_avx2.c
     src/hp_csv_avx512.c
-    src/hp_json_scalar.c
+    src/hp_csv_scalar.c
+    src/hp_filter.c
+    src/hp_gzip.c
     src/hp_json_avx2.c
     src/hp_json_avx512.c
-    src/hp_filter.c
+    src/hp_json_scalar.c
+    src/hp_keymap.c
+    src/hp_parallel.c
+    src/hp_ring_buffer.c
+    src/hp_summary.c
     src/hp_transcoder.c
 )
-
-add_library(hyperpipe_core STATIC ${HYPERPIPE_SOURCES})
-
-# Target-specific SIMD instruction flags for GNU/Clang
-if(NOT MSVC)
-    set_source_files_properties(src/hp_csv_avx2.c src/hp_json_avx2.c
-        PROPERTIES COMPILE_FLAGS "-mavx2 -mbmi2")
-    set_source_files_properties(src/hp_csv_avx512.c src/hp_json_avx512.c
-        PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx2 -mbmi2")
-endif()
-
-# CLI Executable
-add_executable(hyperpipe src/hp_main.c)
-target_link_libraries(hyperpipe PRIVATE hyperpipe_core ${CMAKE_DL_LIBS})
-
-# Tests
-enable_testing()
-
-add_executable(test_rfc4180 tests/test_rfc4180.c)
-target_link_libraries(test_rfc4180 PRIVATE hyperpipe_core)
-add_test(NAME test_rfc4180 COMMAND test_rfc4180)
-
-add_executable(test_ring_buffer tests/test_ring_buffer.c)
-target_link_libraries(test_ring_buffer PRIVATE hyperpipe_core)
-add_test(NAME test_ring_buffer COMMAND test_ring_buffer)
-
-add_executable(test_differential tests/test_differential.c)
-target_link_libraries(test_differential PRIVATE hyperpipe_core)
-add_test(NAME test_differential COMMAND test_differential)
-
-add_executable(test_filter tests/test_filter.c)
-target_link_libraries(test_filter PRIVATE hyperpipe_core)
-add_test(NAME test_filter COMMAND test_filter)
-
-add_executable(test_roundtrip tests/test_roundtrip.c)
-target_link_libraries(test_roundtrip PRIVATE hyperpipe_core)
-add_test(NAME test_roundtrip COMMAND test_roundtrip)
-
-add_executable(test_fault_tolerance tests/test_fault_tolerance.c)
-target_link_libraries(test_fault_tolerance PRIVATE hyperpipe_core)
-add_test(NAME test_fault_tolerance COMMAND test_fault_tolerance)
-
-add_executable(test_real_dataset tests/test_real_dataset.c)
-target_link_libraries(test_real_dataset PRIVATE hyperpipe_core)
+target_include_directories(hyperpipe_core PUBLIC include)
+target_compile_definitions(hyperpipe_core PUBLIC _POSIX_C_SOURCE=200809L _FILE_OFFSET_BITS=64)
+target_link_libraries(hyperpipe_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
-    target_link_libraries(test_real_dataset PRIVATE psapi)
+    target_link_libraries(hyperpipe_core PUBLIC psapi)
 endif()
-add_test(NAME test_real_dataset COMMAND test_real_dataset)
 
-# Benchmark harness
+if(MSVC)
+    target_compile_options(hyperpipe_core PUBLIC /W4 /WX)
+else()
+    target_compile_options(hyperpipe_core PUBLIC -Wall -Wextra -Wpedantic -Werror)
+    # Only these units use vector instructions; runtime dispatch decides
+    # whether they run, so the binary stays portable across x86 CPUs.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+        set_source_files_properties(src/hp_csv_avx2.c src/hp_json_avx2.c
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mbmi2")
+        set_source_files_properties(src/hp_csv_avx512.c src/hp_json_avx512.c
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx2;-mbmi2")
+    endif()
+endif()
+
+add_executable(hyperpipe src/hp_main.c)
+target_link_libraries(hyperpipe PRIVATE hyperpipe_core)
+
 add_executable(bench_hyperpipe bench/bench_main.c)
 target_link_libraries(bench_hyperpipe PRIVATE hyperpipe_core)
-if(WIN32)
-    target_link_libraries(bench_hyperpipe PRIVATE psapi)
-endif()
+
+enable_testing()
+file(GLOB test_sources CONFIGURE_DEPENDS tests/test_*.c)
+foreach(source IN LISTS test_sources)
+    get_filename_component(name ${source} NAME_WE)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE hyperpipe_core)
+    add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endforeach()
