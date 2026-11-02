@@ -1,0 +1,3 @@
+{"host":"h1","status":200,"bytes":1024}
+{"host":"h2","status":404}
+{"status":500,"bytes":0,"late":true}

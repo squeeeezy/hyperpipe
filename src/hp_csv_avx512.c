@@ -1,6 +1,17 @@
 #include "hyperpipe/hp_csv_parser.h"
 #include <immintrin.h>
 
+/* AVX-512 CSV row parser.
+ *
+ * Strategy: rows WITHOUT quote characters (the overwhelming majority in
+ * machine-generated data) are parsed entirely with vectorized chunk scans.
+ * The loop walks 64-byte chunks, pops field boundaries out of the delimiter
+ * bitmask, and stops at the first CR/LF. A single quote anywhere in the row
+ * discards the partial state and falls back to the RFC 4180 scalar state
+ * machine, which owns all quoting edge cases (doubled quotes, quoted
+ * delimiters, quoted newlines). This keeps two code paths and two behaviors:
+ * SIMD for clean rows, scalar for tricky rows. */
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
 #endif
@@ -61,6 +72,19 @@ size_t hp_csv_scan_quote_avx512(const uint8_t *p, size_t len) {
     return len;
 }
 
+/* Emit one zero-copy field into out_row. Returns false when the row ran out
+ * of column slots (caller maps that to HP_ERR_BUFFER_OVERFLOW). */
+HP_INLINE bool avx512_emit_field(hp_row_t *out_row, size_t *fc,
+                                 const uint8_t *base, size_t start, size_t end) {
+    if (*fc >= HP_MAX_COLUMNS) return false;
+    out_row->fields[*fc].ptr = (const char *)(base + start);
+    out_row->fields[*fc].len = end - start;
+    out_row->fields[*fc].has_escapes = false;
+    out_row->fields[*fc].present = true;
+    (*fc)++;
+    return true;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
 #endif
@@ -75,22 +99,16 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
         return hp_csv_parse_row_scalar(parser, src, len, consumed, out_row, is_eof);
     }
 
+    *consumed = 0;
+    out_row->field_count = 0;
+
     size_t pos = 0;
     if (__builtin_expect(src[0] == '\r' || src[0] == '\n', 0)) {
         while (pos < len && (src[pos] == '\r' || src[pos] == '\n')) pos++;
         if (pos >= len) {
             *consumed = pos;
-            out_row->field_count = 0;
             return HP_OK;
         }
-    }
-
-    const uint8_t *p = src + pos;
-    size_t rem = len - pos;
-    if (rem < 64) {
-        hp_error_t err = hp_csv_parse_row_scalar(parser, p, rem, consumed, out_row, is_eof);
-        *consumed += pos;
-        return err;
     }
 
     const uint8_t delim = parser->delim;
@@ -99,157 +117,124 @@ hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
     const __m512i v_lf    = _mm512_set1_epi8('\n');
     const __m512i v_cr    = _mm512_set1_epi8('\r');
 
-    __m512i chunk0 = _mm512_loadu_si512((const void *)p);
-    uint64_t q0 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk0, v_quote);
-    if (q0 != 0) {
-        hp_error_t err = hp_csv_parse_row_scalar(parser, p, rem, consumed, out_row, is_eof);
-        *consumed += pos;
-        return err;
-    }
-
-    uint64_t d0 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk0, v_delim);
-    uint64_t lf0 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk0, v_lf);
-    uint64_t cr0 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk0, v_cr);
-    uint64_t end0 = lf0 | cr0;
-
     size_t fc = 0;
-    size_t field_start = 0;
+    size_t field_start = pos;
 
-    if (end0 != 0) {
-        uint32_t end_idx = (uint32_t)__builtin_ctzll(end0);
-        uint64_t delims = d0 & ((end_idx < 64) ? ((1ULL << end_idx) - 1) : ~0ULL);
+    /* ---- Phase 1: vectorized scan over full 64-byte chunks ---- */
+    while (pos + 64 <= len) {
+        __m512i chunk = _mm512_loadu_si512((const void *)(src + pos));
 
-        while (delims) {
-            uint32_t d_idx = (uint32_t)__builtin_ctzll(delims);
-            out_row->fields[fc].ptr = (const char *)(p + field_start);
-            out_row->fields[fc].len = d_idx - field_start;
-            out_row->fields[fc].has_escapes = false;
-            fc++;
-            field_start = d_idx + 1;
-            delims &= delims - 1;
+        if (__builtin_expect((uint64_t)_mm512_cmpeq_epi8_mask(chunk, v_quote) != 0, 0)) {
+            /* Quoted row: discard partial fields, let the scalar state
+             * machine re-parse the whole row with quote semantics. */
+            out_row->field_count = 0;
+            return hp_csv_parse_row_scalar(parser, src, len, consumed, out_row, is_eof);
         }
 
-        out_row->fields[fc].ptr = (const char *)(p + field_start);
-        out_row->fields[fc].len = end_idx - field_start;
-        out_row->fields[fc].has_escapes = false;
-        fc++;
+        uint64_t delims = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, v_delim);
+        uint64_t ends = (uint64_t)(_mm512_cmpeq_epi8_mask(chunk, v_lf) |
+                                   _mm512_cmpeq_epi8_mask(chunk, v_cr));
+
+        if (ends == 0) {
+            while (delims) {
+                uint32_t d_idx = (uint32_t)__builtin_ctzll(delims);
+                if (!avx512_emit_field(out_row, &fc, src, field_start, pos + d_idx)) {
+                    return HP_ERR_BUFFER_OVERFLOW;
+                }
+                field_start = pos + d_idx + 1;
+                delims &= delims - 1;
+            }
+            pos += 64;
+            continue;
+        }
+
+        /* Row terminator found inside this chunk: emit the fields before it
+         * plus the trailing field, then report the consumed byte count. */
+        uint32_t end_rel = (uint32_t)__builtin_ctzll(ends);
+        uint64_t before = (end_rel < 64) ? (delims & ((1ULL << end_rel) - 1)) : delims;
+        while (before) {
+            uint32_t d_idx = (uint32_t)__builtin_ctzll(before);
+            if (!avx512_emit_field(out_row, &fc, src, field_start, pos + d_idx)) {
+                return HP_ERR_BUFFER_OVERFLOW;
+            }
+            field_start = pos + d_idx + 1;
+            before &= before - 1;
+        }
+        if (!avx512_emit_field(out_row, &fc, src, field_start, pos + end_rel)) {
+            return HP_ERR_BUFFER_OVERFLOW;
+        }
         out_row->field_count = fc;
 
-        if (p[end_idx] == '\r' && end_idx + 1 < rem && p[end_idx + 1] == '\n') {
-            *consumed = pos + end_idx + 2;
+        if (src[pos + end_rel] == '\r' && pos + end_rel + 1 < len && src[pos + end_rel + 1] == '\n') {
+            *consumed = pos + end_rel + 2;   /* CRLF */
         } else {
-            *consumed = pos + end_idx + 1;
+            *consumed = pos + end_rel + 1;   /* LF or lone CR */
         }
         return HP_OK;
     }
 
-    /* Pop all delimiters in chunk 0 */
-    uint64_t delims = d0;
-    while (delims) {
-        uint32_t d_idx = (uint32_t)__builtin_ctzll(delims);
-        out_row->fields[fc].ptr = (const char *)(p + field_start);
-        out_row->fields[fc].len = d_idx - field_start;
-        out_row->fields[fc].has_escapes = false;
-        fc++;
-        field_start = d_idx + 1;
-        delims &= delims - 1;
+    /* ---- Phase 2: byte-wise tail (< 64 bytes) ----
+     * Same rules as phase 1; a quote here also defers to the scalar parser. */
+    while (pos < len) {
+        uint8_t c = src[pos];
+        if (__builtin_expect(c == '"', 0)) {
+            out_row->field_count = 0;
+            return hp_csv_parse_row_scalar(parser, src, len, consumed, out_row, is_eof);
+        }
+        if (c == delim) {
+            if (!avx512_emit_field(out_row, &fc, src, field_start, pos)) {
+                return HP_ERR_BUFFER_OVERFLOW;
+            }
+            field_start = pos + 1;
+        } else if (c == '\n' || c == '\r') {
+            if (!avx512_emit_field(out_row, &fc, src, field_start, pos)) {
+                return HP_ERR_BUFFER_OVERFLOW;
+            }
+            out_row->field_count = fc;
+            if (c == '\r' && pos + 1 < len && src[pos + 1] == '\n') {
+                *consumed = pos + 2;
+            } else {
+                *consumed = pos + 1;
+            }
+            return HP_OK;
+        }
+        pos++;
     }
 
-    /* Process chunk 1 (bytes 64..127) */
-    if (rem >= 128) {
-        __m512i chunk1 = _mm512_loadu_si512((const void *)(p + 64));
-        uint64_t q1 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk1, v_quote);
-        if (q1 == 0) {
-            uint64_t d1 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk1, v_delim);
-            uint64_t lf1 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk1, v_lf);
-            uint64_t cr1 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk1, v_cr);
-            uint64_t end1 = lf1 | cr1;
+    /* ---- Phase 3: no row terminator before end of buffer ---- */
+    if (!is_eof) {
+        /* The record may continue in the next chunk: wait for more data.
+         * Partial fields are discarded; the caller re-parses from scratch. */
+        out_row->field_count = 0;
+        *consumed = 0;
+        return HP_OK;
+    }
 
-            if (end1 != 0) {
-                uint32_t rel_end = (uint32_t)__builtin_ctzll(end1);
-                uint32_t end_idx = 64 + rel_end;
-                uint64_t delims1 = d1 & ((rel_end < 64) ? ((1ULL << rel_end) - 1) : ~0ULL);
-
-                while (delims1) {
-                    uint32_t d_idx = 64 + (uint32_t)__builtin_ctzll(delims1);
-                    out_row->fields[fc].ptr = (const char *)(p + field_start);
-                    out_row->fields[fc].len = d_idx - field_start;
-                    out_row->fields[fc].has_escapes = false;
-                    fc++;
-                    field_start = d_idx + 1;
-                    delims1 &= delims1 - 1;
-                }
-
-                out_row->fields[fc].ptr = (const char *)(p + field_start);
-                out_row->fields[fc].len = end_idx - field_start;
-                out_row->fields[fc].has_escapes = false;
-                fc++;
-                out_row->field_count = fc;
-
-                if (p[end_idx] == '\r' && end_idx + 1 < rem && p[end_idx + 1] == '\n') {
-                    *consumed = pos + end_idx + 2;
-                } else {
-                    *consumed = pos + end_idx + 1;
-                }
-                return HP_OK;
-            }
-
-            /* Pop all delimiters in chunk 1 and try chunk 2 (128..191) */
-            uint64_t delims1 = d1;
-            while (delims1) {
-                uint32_t d_idx = 64 + (uint32_t)__builtin_ctzll(delims1);
-                out_row->fields[fc].ptr = (const char *)(p + field_start);
-                out_row->fields[fc].len = d_idx - field_start;
-                out_row->fields[fc].has_escapes = false;
-                fc++;
-                field_start = d_idx + 1;
-                delims1 &= delims1 - 1;
-            }
-
-            if (rem >= 192) {
-                __m512i chunk2 = _mm512_loadu_si512((const void *)(p + 128));
-                uint64_t q2 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk2, v_quote);
-                if (q2 == 0) {
-                    uint64_t d2 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk2, v_delim);
-                    uint64_t lf2 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk2, v_lf);
-                    uint64_t cr2 = (uint64_t)_mm512_cmpeq_epi8_mask(chunk2, v_cr);
-                    uint64_t end2 = lf2 | cr2;
-
-                    if (end2 != 0) {
-                        uint32_t rel_end2 = (uint32_t)__builtin_ctzll(end2);
-                        uint32_t end_idx2 = 128 + rel_end2;
-                        uint64_t delims2 = d2 & ((rel_end2 < 64) ? ((1ULL << rel_end2) - 1) : ~0ULL);
-
-                        while (delims2) {
-                            uint32_t d_idx = 128 + (uint32_t)__builtin_ctzll(delims2);
-                            out_row->fields[fc].ptr = (const char *)(p + field_start);
-                            out_row->fields[fc].len = d_idx - field_start;
-                            out_row->fields[fc].has_escapes = false;
-                            fc++;
-                            field_start = d_idx + 1;
-                            delims2 &= delims2 - 1;
-                        }
-
-                        out_row->fields[fc].ptr = (const char *)(p + field_start);
-                        out_row->fields[fc].len = end_idx2 - field_start;
-                        out_row->fields[fc].has_escapes = false;
-                        fc++;
-                        out_row->field_count = fc;
-
-                        if (p[end_idx2] == '\r' && end_idx2 + 1 < rem && p[end_idx2 + 1] == '\n') {
-                            *consumed = pos + end_idx2 + 2;
-                        } else {
-                            *consumed = pos + end_idx2 + 1;
-                        }
-                        return HP_OK;
-                    }
-                }
-            }
+    /* EOF: the trailing (possibly empty, when the file ends on a delimiter)
+     * field closes the row, mirroring the scalar parser's semantics. */
+    if (field_start < len || fc > 0) {
+        if (!avx512_emit_field(out_row, &fc, src, field_start, len)) {
+            return HP_ERR_BUFFER_OVERFLOW;
         }
     }
-
     out_row->field_count = fc;
-    hp_error_t err = hp_csv_parse_row_scalar(parser, p, rem, consumed, out_row, is_eof);
-    *consumed += pos;
-    return err;
+    *consumed = len;
+    return HP_OK;
+}
+
+/* ---- Chunk planner bitmaps ------------------------------------------------
+ *
+ * AVX-512 twin of hp_csv_plan_masks_scalar: newline and quote bitmaps for
+ * one chunk of up to 64 bytes, one compare per bitmap. The masked load
+ * touches only enabled lanes, so a short tail chunk is read without any
+ * padding guarantee from the caller. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
+#endif
+void hp_csv_plan_masks_avx512(const uint8_t *p, size_t chunk_len,
+                              uint64_t *nl, uint64_t *qm) {
+    __mmask64 len_mask = (chunk_len >= 64) ? ~0ull : ((1ull << chunk_len) - 1);
+    __m512i chunk = _mm512_maskz_loadu_epi8(len_mask, (const void *)p);
+    *nl = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8('\n')) & len_mask;
+    *qm = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8('"')) & len_mask;
 }

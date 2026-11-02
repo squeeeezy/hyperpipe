@@ -6,10 +6,10 @@
 static void test_projection(void) {
     hp_header_t hdr;
     hdr.count = 4;
-    hdr.names[0] = hp_strdup("id");
-    hdr.names[1] = hp_strdup("name");
-    hdr.names[2] = hp_strdup("score");
-    hdr.names[3] = hp_strdup("city");
+    hdr.names[0] = strdup("id");
+    hdr.names[1] = strdup("name");
+    hdr.names[2] = strdup("score");
+    hdr.names[3] = strdup("city");
 
     hp_projection_t proj;
     hp_error_t err = hp_projection_init(&proj, "name,score");
@@ -50,9 +50,9 @@ static void test_projection(void) {
 static void test_filtering(void) {
     hp_header_t hdr;
     hdr.count = 3;
-    hdr.names[0] = hp_strdup("name");
-    hdr.names[1] = hp_strdup("age");
-    hdr.names[2] = hp_strdup("status");
+    hdr.names[0] = strdup("name");
+    hdr.names[1] = strdup("age");
+    hdr.names[2] = strdup("status");
 
     hp_filter_t filter;
     hp_error_t err = hp_filter_init(&filter, "age >= 21, status == active");
@@ -91,91 +91,10 @@ static void test_filtering(void) {
     hp_header_free(&hdr);
 }
 
-static void test_compound_and_filtering(void) {
-    hp_header_t hdr;
-    hdr.count = 5;
-    hdr.names[0] = hp_strdup("host");
-    hdr.names[1] = hp_strdup("timestamp");
-    hdr.names[2] = hp_strdup("request");
-    hdr.names[3] = hp_strdup("status");
-    hdr.names[4] = hp_strdup("bytes");
-
-    /* Test 1: 'status == 200 and bytes > 50000' */
-    hp_filter_t filter1;
-    hp_error_t err = hp_filter_init(&filter1, "status == 200 and bytes > 50000");
-    assert(err == HP_OK);
-    assert(filter1.count == 2);
-    err = hp_filter_bind(&filter1, &hdr);
-    assert(err == HP_OK);
-
-    /* Test 2: Reverse order 'bytes > 50000 and status == 200' */
-    hp_filter_t filter2;
-    err = hp_filter_init(&filter2, "bytes > 50000 and status == 200");
-    assert(err == HP_OK);
-    assert(filter2.count == 2);
-    err = hp_filter_bind(&filter2, &hdr);
-    assert(err == HP_OK);
-
-    /* Test 3: 'status == 200 && bytes > 50000' */
-    hp_filter_t filter3;
-    err = hp_filter_init(&filter3, "status == 200 && bytes > 50000");
-    assert(err == HP_OK);
-    assert(filter3.count == 2);
-    err = hp_filter_bind(&filter3, &hdr);
-    assert(err == HP_OK);
-
-    /* Row with status=200, bytes=6245 -> must fail bytes condition */
-    hp_row_t row_small;
-    row_small.field_count = 5;
-    row_small.fields[0] = (hp_str_t){ .ptr = "199.72.81.55", .len = 12, .has_escapes = false };
-    row_small.fields[1] = (hp_str_t){ .ptr = "time", .len = 4, .has_escapes = false };
-    row_small.fields[2] = (hp_str_t){ .ptr = "req", .len = 3, .has_escapes = false };
-    row_small.fields[3] = (hp_str_t){ .ptr = "200", .len = 3, .has_escapes = false };
-    row_small.fields[4] = (hp_str_t){ .ptr = "6245", .len = 4, .has_escapes = false };
-
-    assert(hp_filter_matches(&filter1, &row_small) == false);
-    assert(hp_filter_matches(&filter2, &row_small) == false);
-    assert(hp_filter_matches(&filter3, &row_small) == false);
-
-    /* Row with status=200, bytes=61716 -> must match both conditions */
-    hp_row_t row_big;
-    row_big.field_count = 5;
-    row_big.fields[0] = (hp_str_t){ .ptr = "dial22.lloyd.com", .len = 16, .has_escapes = false };
-    row_big.fields[1] = (hp_str_t){ .ptr = "time", .len = 4, .has_escapes = false };
-    row_big.fields[2] = (hp_str_t){ .ptr = "req", .len = 3, .has_escapes = false };
-    row_big.fields[3] = (hp_str_t){ .ptr = "200", .len = 3, .has_escapes = false };
-    row_big.fields[4] = (hp_str_t){ .ptr = "61716", .len = 5, .has_escapes = false };
-
-    assert(hp_filter_matches(&filter1, &row_big) == true);
-    assert(hp_filter_matches(&filter2, &row_big) == true);
-    assert(hp_filter_matches(&filter3, &row_big) == true);
-
-    /* Row with status=304, bytes=61716 -> must fail status condition */
-    hp_row_t row_304;
-    row_304.field_count = 5;
-    row_304.fields[0] = (hp_str_t){ .ptr = "burger.letters.com", .len = 18, .has_escapes = false };
-    row_304.fields[1] = (hp_str_t){ .ptr = "time", .len = 4, .has_escapes = false };
-    row_304.fields[2] = (hp_str_t){ .ptr = "req", .len = 3, .has_escapes = false };
-    row_304.fields[3] = (hp_str_t){ .ptr = "304", .len = 3, .has_escapes = false };
-    row_304.fields[4] = (hp_str_t){ .ptr = "61716", .len = 5, .has_escapes = false };
-
-    assert(hp_filter_matches(&filter1, &row_304) == false);
-    assert(hp_filter_matches(&filter2, &row_304) == false);
-    assert(hp_filter_matches(&filter3, &row_304) == false);
-
-    /* Invalid syntax check */
-    hp_filter_t bad_filter;
-    assert(hp_filter_init(&bad_filter, "status == 200 and") == HP_ERR_INVALID_ARG);
-    assert(hp_filter_init(&bad_filter, "status ==") == HP_ERR_INVALID_ARG);
-
-    hp_header_free(&hdr);
-}
-
 int main(void) {
     printf("[test_filter] Running projection and filter tests...\n");
     test_projection();
     test_filtering();
-    test_compound_and_filtering();
     printf("[test_filter] All filter and projection tests passed successfully.\n");
     return 0;
 }

@@ -1,20 +1,12 @@
 #ifndef HYPERPIPE_HP_COMMON_H
 #define HYPERPIPE_HP_COMMON_H
 
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#endif
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE
-#endif
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <ctype.h>
 
 #if defined(_MSC_VER)
     #define HP_ALIGNED(n) __declspec(align(n))
@@ -39,7 +31,9 @@ typedef enum hp_error_e {
     HP_ERR_BUFFER_OVERFLOW = -6,
     HP_ERR_INVALID_ARG = -7,
     HP_ERR_UNSUPPORTED_SIMD = -8,
-    HP_ERR_COLUMN_NOT_FOUND = -9
+    HP_ERR_COLUMN_NOT_FOUND = -9,
+    HP_ERR_GZIP_UNAVAILABLE = -10,
+    HP_ERR_UNSUPPORTED = -11
 } hp_error_t;
 
 typedef enum hp_format_e {
@@ -65,7 +59,16 @@ typedef enum hp_simd_mode_e {
 typedef struct hp_str_s {
     const char *ptr;
     size_t len;
+    /* true when the value originated in quoted/string form ("x,y", "123",
+     * JSON strings). Such values MUST travel through the re-serializing write
+     * path (write_csv_field_pb / hp_json_ser_write_string) so embedded
+     * delimiters, newlines and quotes are re-escaped on output. Clean
+     * zero-copy fields keep this flag false and are emitted with raw memcpy. */
     bool has_escapes;
+    /* false when the field is absent from this record (sparse NDJSON rows).
+     * Absent fields are omitted from NDJSON objects and serialized as empty
+     * strings in CSV/TSV output. */
+    bool present;
 } hp_str_t;
 
 #define HP_MAX_COLUMNS 1024
@@ -80,16 +83,6 @@ typedef struct hp_header_s {
     char *names[HP_MAX_COLUMNS];
     size_t count;
 } hp_header_t;
-
-HP_INLINE char *hp_strdup(const char *s) {
-    if (!s) return NULL;
-    size_t len = strlen(s);
-    char *copy = (char *)malloc(len + 1);
-    if (copy) {
-        memcpy(copy, s, len + 1);
-    }
-    return copy;
-}
 
 HP_INLINE void hp_header_free(hp_header_t *h) {
     if (!h) return;

@@ -1,5 +1,53 @@
 #include "hyperpipe/hp_ring_buffer.h"
 
+/* Reads through the reader, engaging transparent gzip decompression when
+ * the stream starts with the gzip magic. Plain streams take a single fread
+ * with zero overhead beyond the two-byte sniff on the first call. */
+hp_error_t hp_reader_read(hp_reader_t *r, uint8_t *dst, size_t cap, size_t *n_out) {
+    *n_out = 0;
+    if (!r || !dst || cap == 0) return HP_ERR_INVALID_ARG;
+    if (r->eof) return HP_OK;
+
+    if (!r->gz_active) {
+        size_t n = fread(dst, 1, cap, r->stream);
+        if (n == 0) {
+            if (ferror(r->stream)) return HP_ERR_IO;
+            r->eof = true;
+            return HP_OK;
+        }
+
+        if (!r->sniffed) {
+            r->sniffed = true;
+            if (n >= 2 && dst[0] == 0x1F && dst[1] == 0x8B) {
+                hp_error_t err = hp_gzip_inflate_start(&r->gz);
+                if (err != HP_OK) return err; /* includes GZIP_UNAVAILABLE */
+                /* The sniffed bytes are compressed input; stage them so the
+                 * output can be inflated straight into dst. */
+                err = hp_gzip_inflate_stage(&r->gz, dst, n);
+                if (err != HP_OK) return err;
+                r->gz_active = true;
+                return hp_gzip_inflate_read(&r->gz, r->stream, dst, cap, n_out, &r->eof);
+            }
+        }
+
+        if (n < cap && feof(r->stream)) {
+            r->eof = true;
+        }
+        *n_out = n;
+        return HP_OK;
+    }
+
+    return hp_gzip_inflate_read(&r->gz, r->stream, dst, cap, n_out, &r->eof);
+}
+
+void hp_reader_free(hp_reader_t *r) {
+    if (!r) return;
+    if (r->gz_active) {
+        hp_gzip_inflate_free(&r->gz);
+        r->gz_active = false;
+    }
+}
+
 hp_error_t hp_sliding_buffer_init(hp_sliding_buffer_t *buf, size_t capacity) {
     if (!buf) return HP_ERR_INVALID_ARG;
     if (capacity < 1024) capacity = 1024;
@@ -29,9 +77,9 @@ void hp_sliding_buffer_free(hp_sliding_buffer_t *buf) {
     buf->eof_reached = false;
 }
 
-hp_error_t hp_sliding_buffer_refill(hp_sliding_buffer_t *buf, FILE *stream, size_t *bytes_read) {
+hp_error_t hp_sliding_buffer_refill(hp_sliding_buffer_t *buf, hp_reader_t *reader, size_t *bytes_read) {
     if (bytes_read) *bytes_read = 0;
-    if (!buf || !stream) return HP_ERR_INVALID_ARG;
+    if (!buf || !reader) return HP_ERR_INVALID_ARG;
     if (buf->eof_reached) return HP_OK;
 
     /* Slide unconsumed active data back to offset 0 */
@@ -51,19 +99,17 @@ hp_error_t hp_sliding_buffer_refill(hp_sliding_buffer_t *buf, FILE *stream, size
         return HP_ERR_BUFFER_OVERFLOW;
     }
 
-    size_t n = fread(buf->data + buf->tail, 1, available, stream);
+    size_t n = 0;
+    hp_error_t err = hp_reader_read(reader, buf->data + buf->tail, available, &n);
+    if (err != HP_OK) return err;
     buf->tail += n;
     /* Clear SIMD padding zone */
     memset(buf->data + buf->tail, 0, HP_SIMD_PADDING);
 
     if (bytes_read) *bytes_read = n;
 
-    if (n < available) {
-        if (feof(stream)) {
-            buf->eof_reached = true;
-        } else if (ferror(stream)) {
-            return HP_ERR_IO;
-        }
+    if (reader->eof) {
+        buf->eof_reached = true;
     }
 
     return HP_OK;

@@ -16,6 +16,7 @@ include_directories(include)
 # Static library for core engine
 set(HYPERPIPE_SOURCES
     src/hp_ring_buffer.c
+    src/hp_gzip.c
     src/hp_cpuid.c
     src/hp_csv_scalar.c
     src/hp_csv_avx2.c
@@ -39,7 +40,7 @@ endif()
 
 # CLI Executable
 add_executable(hyperpipe src/hp_main.c)
-target_link_libraries(hyperpipe PRIVATE hyperpipe_core)
+target_link_libraries(hyperpipe PRIVATE hyperpipe_core ${CMAKE_DL_LIBS})
 
 # Tests
 enable_testing()

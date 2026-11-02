@@ -1,5 +1,20 @@
 #include "hyperpipe/hp_cpuid.h"
 
+/* Dispatch-table writes are serialized: parallel workers initialize their
+ * transcoders concurrently, and every writer must exclude every reader.
+ * Reads always follow the caller's own locked init, so the mutex also
+ * provides the happens-before edge for the pointer reads. */
+#if !defined(_WIN32)
+    #include <pthread.h>
+    static pthread_mutex_t g_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
+    #define HP_DISPATCH_LOCK()   pthread_mutex_lock(&g_dispatch_mutex)
+    #define HP_DISPATCH_UNLOCK() pthread_mutex_unlock(&g_dispatch_mutex)
+#else
+    /* --jobs is unsupported on Windows; the table is single-threaded there */
+    #define HP_DISPATCH_LOCK()   (void)0
+    #define HP_DISPATCH_UNLOCK() (void)0
+#endif
+
 #if defined(_MSC_VER)
     #include <intrin.h>
     static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
@@ -37,6 +52,12 @@ hp_dispatch_table_t g_hp_dispatch = {
     .csv_scan_special = hp_csv_scan_special_scalar,
     .csv_scan_quote = hp_csv_scan_quote_scalar,
     .json_scan_escapes = hp_json_scan_escapes_scalar,
+    .json_emit_string = hp_json_emit_body_scalar,
+    .json_scan_str = hp_json_scan_str_scalar,
+    .json_scan_lit = hp_json_scan_lit_scalar,
+    .json_scan_ws = hp_json_scan_ws_scalar,
+    .json_struct_masks = hp_json_struct_masks_scalar,
+    .plan_masks = hp_csv_plan_masks_scalar,
     .csv_parse_row = hp_csv_parse_row_scalar
 };
 
@@ -86,6 +107,8 @@ const char *hp_simd_mode_to_string(hp_simd_mode_t mode) {
 }
 
 void hp_dispatch_init(hp_simd_mode_t requested_mode) {
+    HP_DISPATCH_LOCK();
+
     hp_cpu_caps_t caps = hp_detect_cpu_caps();
 
     hp_simd_mode_t selected = HP_SIMD_SCALAR;
@@ -118,22 +141,40 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_avx512;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_avx512;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_avx512;
+            g_hp_dispatch.json_emit_string = hp_json_emit_body_avx512;
+            g_hp_dispatch.json_scan_str = hp_json_scan_str_avx512;
+            g_hp_dispatch.json_scan_lit = hp_json_scan_lit_avx512;
+            g_hp_dispatch.json_scan_ws = hp_json_scan_ws_avx512;
+            g_hp_dispatch.json_struct_masks = hp_json_struct_masks_avx512;
+            g_hp_dispatch.plan_masks = hp_csv_plan_masks_avx512;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx512;
             break;
         case HP_SIMD_AVX2:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_avx2;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_avx2;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_avx2;
-            g_hp_dispatch.csv_parse_row = hp_csv_parse_row_scalar;
+            g_hp_dispatch.json_emit_string = hp_json_emit_body_avx2;
+            g_hp_dispatch.json_scan_str = hp_json_scan_str_avx2;
+            g_hp_dispatch.json_scan_lit = hp_json_scan_lit_avx2;
+            g_hp_dispatch.json_scan_ws = hp_json_scan_ws_avx2;
+            g_hp_dispatch.json_struct_masks = hp_json_struct_masks_avx2;
+            g_hp_dispatch.plan_masks = hp_csv_plan_masks_avx2;
+            g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx2;
             break;
         case HP_SIMD_SCALAR:
         default:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_scalar;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_scalar;
             g_hp_dispatch.json_scan_escapes = hp_json_scan_escapes_scalar;
+            g_hp_dispatch.json_emit_string = hp_json_emit_body_scalar;
+            g_hp_dispatch.json_scan_str = hp_json_scan_str_scalar;
+            g_hp_dispatch.json_scan_lit = hp_json_scan_lit_scalar;
+            g_hp_dispatch.json_scan_ws = hp_json_scan_ws_scalar;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_scalar;
             break;
     }
+
+    HP_DISPATCH_UNLOCK();
 }
 
 hp_error_t hp_csv_parser_init(hp_csv_parser_t *parser, hp_format_t fmt, hp_simd_mode_t simd) {

@@ -55,8 +55,9 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
     }
 
     size_t field_start = pos;
+    size_t field_arena_start = 0;
     bool field_is_quoted = false;
-    bool field_has_escapes = false;
+    bool field_has_escapes = false;   /* needs '""' unescape arena */
 
     while (pos < len) {
         if (!field_is_quoted) {
@@ -84,6 +85,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                 out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                 out_row->fields[out_row->field_count].len = pos - field_start;
                 out_row->fields[out_row->field_count].has_escapes = false;
+                out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
 
                 pos++;
@@ -95,6 +97,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                 out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                 out_row->fields[out_row->field_count].len = pos - field_start;
                 out_row->fields[out_row->field_count].has_escapes = false;
+                out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
 
                 if (c == '\r' && (pos + 1 < len) && src[pos + 1] == '\n') {
@@ -128,6 +131,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                 if (!field_has_escapes) {
                     field_has_escapes = true;
                     size_t raw_len = pos - field_start;
+                    field_arena_start = parser->arena_pos;
                     if (parser->arena_pos + raw_len + 1 >= HP_MAX_ROW_BYTES) return HP_ERR_BUFFER_OVERFLOW;
                     memcpy(parser->unescape_arena + parser->arena_pos, src + field_start, raw_len);
                     parser->arena_pos += raw_len;
@@ -138,15 +142,21 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
             } else {
                 if (out_row->field_count >= HP_MAX_COLUMNS) return HP_ERR_BUFFER_OVERFLOW;
                 if (field_has_escapes) {
-                    size_t flen = parser->arena_pos;
-                    out_row->fields[out_row->field_count].ptr = parser->unescape_arena;
+                    size_t flen = parser->arena_pos - field_arena_start;
+                    out_row->fields[out_row->field_count].ptr = parser->unescape_arena + field_arena_start;
                     out_row->fields[out_row->field_count].len = flen;
                     out_row->fields[out_row->field_count].has_escapes = true;
                 } else {
+                    /* Zero-copy quoted field (e.g. "x,y" or "multi
+line").
+                     * has_escapes = true forces the write path to re-quote it,
+                     * otherwise embedded delimiters/newlines would silently
+                     * corrupt the output CSV. */
                     out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                     out_row->fields[out_row->field_count].len = pos - field_start;
-                    out_row->fields[out_row->field_count].has_escapes = false;
+                    out_row->fields[out_row->field_count].has_escapes = true;
                 }
+                out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
 
                 pos++;
@@ -186,10 +196,43 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
             *consumed = 0;
             return HP_OK;
         }
+        if (field_start >= len && !is_eof) {
+            /* Buffer ended exactly on a field boundary (right after a
+             * delimiter). Another field may still arrive in the next chunk:
+             * do NOT emit a phantom trailing empty field, wait for data. */
+            *consumed = 0;
+            return HP_OK;
+        }
+        if (field_is_quoted) {
+            /* Unterminated quoted field at EOF: the lenient fault-tolerance
+             * policy emits what arrived. The field still originated inside
+             * quotes, so it must travel the re-quoting write path (a raw
+             * emit would leak the CR/LF/quote bytes as record structure),
+             * and '""' pairs already unescaped into the arena are the
+             * canonical bytes. */
+            if (out_row->field_count < HP_MAX_COLUMNS) {
+                if (field_has_escapes) {
+                    out_row->fields[out_row->field_count].ptr =
+                        parser->unescape_arena + field_arena_start;
+                    out_row->fields[out_row->field_count].len =
+                        parser->arena_pos - field_arena_start;
+                } else {
+                    out_row->fields[out_row->field_count].ptr =
+                        (const char *)(src + field_start);
+                    out_row->fields[out_row->field_count].len = len - field_start;
+                }
+                out_row->fields[out_row->field_count].has_escapes = true;
+                out_row->fields[out_row->field_count].present = true;
+                out_row->field_count++;
+            }
+            *consumed = pos;
+            return HP_OK;
+        }
         if (out_row->field_count < HP_MAX_COLUMNS) {
             out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
             out_row->fields[out_row->field_count].len = len - field_start;
             out_row->fields[out_row->field_count].has_escapes = false;
+            out_row->fields[out_row->field_count].present = true;
             out_row->field_count++;
         }
     }
@@ -208,4 +251,27 @@ hp_error_t hp_csv_parse_row(hp_csv_parser_t *parser,
         return g_hp_dispatch.csv_parse_row(parser, src, len, consumed, out_row, is_eof);
     }
     return hp_csv_parse_row_scalar(parser, src, len, consumed, out_row, is_eof);
+}
+
+/* ---- Chunk planner bitmaps ------------------------------------------------
+ *
+ * Portable reference for the --jobs boundary scan: newline and quote
+ * positions of one chunk as two 64-bit bitmaps. The parallel planner walks
+ * these bitmaps instead of testing every byte, which moves the planning
+ * pass (a full sequential read that gates when the last worker can start)
+ * from a byte-at-a-time loop to memchr-class speed. The SIMD twins in
+ * hp_csv_avx2.c / hp_csv_avx512.c return identical bitmaps. */
+void hp_csv_plan_masks_scalar(const uint8_t *p, size_t chunk_len,
+                              uint64_t *nl, uint64_t *qm) {
+    uint64_t n = 0, q = 0;
+    for (size_t i = 0; i < chunk_len; i++) {
+        uint64_t bit = 1ull << i;
+        if (p[i] == '\n') {
+            n |= bit;
+        } else if (p[i] == '"') {
+            q |= bit;
+        }
+    }
+    *nl = n;
+    *qm = q;
 }

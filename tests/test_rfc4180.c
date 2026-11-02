@@ -5,6 +5,7 @@
 
 static void test_simple_csv(void) {
     hp_csv_parser_t parser;
+    memset(&parser, 0, sizeof(parser)); /* zero state machine + arena cursor */
     parser.delim = ',';
     parser.quote = '"';
     parser.scan_special = hp_csv_scan_special_scalar;
@@ -47,6 +48,7 @@ static void test_simple_csv(void) {
 
 static void test_rfc4180_quotes_and_escapes(void) {
     hp_csv_parser_t parser;
+    memset(&parser, 0, sizeof(parser)); /* zero state machine + arena cursor */
     parser.delim = ',';
     parser.quote = '"';
     parser.scan_special = hp_csv_scan_special_scalar;
@@ -79,6 +81,7 @@ static void test_rfc4180_quotes_and_escapes(void) {
 
 static void test_empty_fields_and_no_trailing_newline(void) {
     hp_csv_parser_t parser;
+    memset(&parser, 0, sizeof(parser)); /* zero state machine + arena cursor */
     parser.delim = ',';
     parser.quote = '"';
     parser.scan_special = hp_csv_scan_special_scalar;
@@ -139,6 +142,7 @@ static void test_tsv_parsing(void) {
 
 static void test_malformed_quote_errors(void) {
     hp_csv_parser_t parser;
+    memset(&parser, 0, sizeof(parser)); /* zero state machine + arena cursor */
     parser.delim = ',';
     parser.quote = '"';
     parser.scan_special = hp_csv_scan_special_scalar;
