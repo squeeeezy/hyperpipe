@@ -191,11 +191,9 @@ bool hp_json_is_number(const char *s, size_t len) {
     return json_number_span(s, len) == len;
 }
 
-/* Converts a numeric span to double. The span is copied into a bounded stack
- * buffer and handed to strtod, so rounding and locale behavior stay with the
- * C library; use hp_json_is_number first when the strict JSON grammar is
- * required (hp_json_number_as_double also accepts what strtod accepts, e.g.
- * "inf" - matching the filter engine's historical numeric semantics). */
+/* Converts a number that hp_json_is_number() accepted to double. The span
+ * is copied into a bounded buffer and handed to strtod, so rounding stays
+ * with the C library. */
 bool hp_json_number_as_double(const char *s, size_t len, double *out) {
     if (len == 0 || len > 63) return false;
     char buf[64];
@@ -479,7 +477,7 @@ HP_INLINE size_t j_scan_ws(size_t (*simd)(const uint8_t *, size_t),
  * The walker never mutates shared state before the whole line is known to
  * fit its shape: unknown keys, a backslash anywhere, or unexpected
  * structure abort the walk and the byte-span scanner below re-parses the
- * line from scratch with the exact historical semantics. Escape-free lines
+ * line from scratch. Escape-free lines
  * skip per-byte branching entirely; escaped lines pay one wasted scan. */
 
 typedef struct hp_struct_scan_s {
@@ -544,7 +542,6 @@ static bool struct_walk(hp_struct_scan_t *s,
         long q1 = struct_next_quote(s, pos + 1);
         if (q1 < 0) return false;
         size_t key_len = (size_t)q1 - (pos + 1);
-        if (key_len > 255) return false; /* truncation is general-path work */
 
         /* colon region: ws ':' ws */
         size_t p = (size_t)q1 + 1;
@@ -608,20 +605,34 @@ static bool struct_walk(hp_struct_scan_t *s,
     }
 }
 
+/* Adds a key first seen on this line as a new column; absent from earlier
+ * rows, so its slot starts empty. */
+static hp_error_t append_key(hp_header_t *header, hp_keymap_t *keymap, hp_row_t *row,
+                             const char *key, size_t len, size_t *idx) {
+    if (header->count >= HP_MAX_COLUMNS) return HP_ERR_BUFFER_OVERFLOW;
+    char *name = (char *)malloc(len + 1);
+    if (!name) return HP_ERR_NOMEM;
+    memcpy(name, key, len);
+    name[len] = '\0';
+    *idx = header->count;
+    header->names[header->count++] = name;
+    row->fields[*idx] = (hp_str_t){ .ptr = "", .len = 0, .has_escapes = false, .present = false };
+    return keymap ? hp_keymap_insert(keymap, header, *idx) : HP_OK;
+}
+
 /* Reverse conversion: parses an NDJSON line into an hp_row_t and extends the
  * running header.
  *
- * Architecture (v1.5):
  *  - Key and string spans are located with the dispatchable span scanners
  *    above, not byte-at-a-time branching.
- *  - Values are ZERO-COPY whenever they need no unescaping: a field points
+ *  - Values are zero-copy whenever they need no unescaping: a field points
  *    straight into the caller's line buffer, which must stay valid until the
  *    row has been consumed (the transcoder serializes or filters each row
  *    before advancing the ring buffer). Only strings containing backslash
  *    escapes are decoded into value_arena.
- *  - Field slots are resolved BY KEY against the running header. With a
+ *  - Field slots are resolved by key against the running header. With a
  *    keymap bound, lookup is a hashed probe with one confirming memcmp;
- *    without one it is the historical linear strcmp walk. Reordered keys
+ *    without one it is a linear walk over the names. Reordered keys
  *    land on the correct column, unknown keys extend the header (and the
  *    keymap), and keys absent from this line keep present = false. */
 hp_error_t hp_json_parse_line_ex(const char *line,
@@ -710,12 +721,6 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         size_t key_len = pos - key_start;
         pos++; /* closing quote */
 
-        /* Keys longer than the lookup buffer are truncated exactly as in
-         * previous versions, so long-key behavior stays bit-identical. */
-        size_t key_cmp_len = key_len;
-        char key_buf[256];
-        if (key_cmp_len >= sizeof(key_buf)) key_cmp_len = sizeof(key_buf) - 1;
-
         pos += j_scan_ws(scan_ws, line + pos, len - pos);
         if (pos >= len || line[pos] != ':') return HP_ERR_PARSE_JSON;
         pos++; /* skip ':' */
@@ -724,45 +729,24 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         /* ---- resolve slot: existing column by key, else extend header ---- */
         size_t idx;
         if (header) {
+            int64_t hit = -1;
             if (keymap) {
-                /* padded_key = true: the ring buffer guarantees 64 readable
-                 * bytes past the line, so the 8-byte fast-path load is safe */
-                int64_t hit = hp_keymap_find(keymap, header, line + key_start,
-                                             key_cmp_len, true);
-                if (hit >= 0) {
-                    idx = (size_t)hit;
-                } else {
-                    if (header->count >= HP_MAX_COLUMNS) return HP_ERR_BUFFER_OVERFLOW;
-                    memcpy(key_buf, line + key_start, key_cmp_len);
-                    key_buf[key_cmp_len] = '\0';
-                    header->names[header->count] = strdup(key_buf);
-                    if (!header->names[header->count]) return HP_ERR_NOMEM;
-                    idx = header->count++;
-                    out_row->fields[idx].ptr = "";
-                    out_row->fields[idx].len = 0;
-                    out_row->fields[idx].has_escapes = false;
-                    out_row->fields[idx].present = false;
-                    hp_error_t ierr = hp_keymap_insert(keymap, header, idx);
-                    if (ierr != HP_OK) return ierr;
-                }
+                /* The line lives in the SIMD-padded ring buffer, so the
+                 * 8-byte key load is safe */
+                hit = hp_keymap_find(keymap, header, line + key_start, key_len, true);
             } else {
-                memcpy(key_buf, line + key_start, key_cmp_len);
-                key_buf[key_cmp_len] = '\0';
-                size_t h = 0;
-                for (; h < header->count; h++) {
-                    if (strcmp(header->names[h], key_buf) == 0) break;
+                for (size_t h = 0; h < header->count && hit < 0; h++) {
+                    if (strlen(header->names[h]) == key_len &&
+                        memcmp(header->names[h], line + key_start, key_len) == 0) {
+                        hit = (int64_t)h;
+                    }
                 }
-                if (h == header->count) {
-                    if (h >= HP_MAX_COLUMNS) return HP_ERR_BUFFER_OVERFLOW;
-                    header->names[h] = strdup(key_buf);
-                    if (!header->names[h]) return HP_ERR_NOMEM;
-                    header->count++;
-                    out_row->fields[h].ptr = "";
-                    out_row->fields[h].len = 0;
-                    out_row->fields[h].has_escapes = false;
-                    out_row->fields[h].present = false;
-                }
-                idx = h;
+            }
+            if (hit >= 0) {
+                idx = (size_t)hit;
+            } else {
+                hp_error_t err = append_key(header, keymap, out_row, line + key_start, key_len, &idx);
+                if (err != HP_OK) return err;
             }
         } else {
             if (out_row->field_count >= HP_MAX_COLUMNS) return HP_ERR_BUFFER_OVERFLOW;
@@ -873,7 +857,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
     return HP_OK;
 }
 
-/* Compatibility wrapper: the historical entry point without a keymap. */
+/* hp_json_parse_line_ex() without a keymap */
 hp_error_t hp_json_parse_line(const char *line,
                               size_t len,
                               hp_header_t *header,

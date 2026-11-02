@@ -299,6 +299,26 @@ static void test_valid_ndjson_edge_cases(void) {
     CHECK(strcmp(r.out, "a,b\n1,x\n-0.5e10,y\n,\ntrue,null\nfalse,\"\xc3\xa9\n/\"\n0,\"\"\n") == 0);
 }
 
+/* Keys and header names were cut to 255 bytes, so two long keys sharing
+ * that prefix collapsed into one column */
+static void test_long_names_are_kept_whole(void) {
+    char prefix[301], doc[1024];
+    memset(prefix, 'k', 300);
+    prefix[300] = '\0';
+    snprintf(doc, sizeof(doc), "{\"%sA\":1,\"%sB\":2}\n", prefix, prefix);
+
+    run_result_t r = run_pipeline(doc, NULL, NULL, HP_FORMAT_CSV);
+    CHECK(r.err == HP_OK);
+    char expect[1024];
+    snprintf(expect, sizeof(expect), "%sA,%sB\n1,2\n", prefix, prefix);
+    CHECK(strcmp(r.out, expect) == 0);
+
+    snprintf(doc, sizeof(doc), "%sA,%sB\n1,2\n", prefix, prefix);
+    r = run_pipeline(doc, NULL, NULL, HP_FORMAT_CSV);
+    CHECK(r.err == HP_OK);
+    CHECK(strcmp(r.out, doc) == 0);
+}
+
 int main(void) {
     TAP_RUN(test_single_equality_is_numeric);
     TAP_RUN(test_numeric_compare_needs_whole_field);
@@ -314,5 +334,6 @@ int main(void) {
     TAP_RUN(test_gzip_output_covers_oversized_records);
     TAP_RUN(test_valid_ndjson_edge_cases);
     TAP_RUN(test_malformed_ndjson_is_rejected);
+    TAP_RUN(test_long_names_are_kept_whole);
     return tap_done();
 }
