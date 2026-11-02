@@ -78,6 +78,9 @@ void hp_transcoder_free(hp_transcoder_t *tc);
 /* Sniff format from sample bytes */
 hp_format_t hp_sniff_format(const uint8_t *sample, size_t len);
 
+/* Human-readable description of an error code */
+const char *hp_strerror(hp_error_t err);
+
 /* Run streaming transcoding from in_stream to out_stream */
 hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream);
 

@@ -327,20 +327,13 @@ int main(int argc, char **argv) {
         hp_transcoder_t transcoder;
         err = hp_transcoder_init(&transcoder, &config);
         if (err != HP_OK) {
-            fprintf(stderr, "Error: failed to initialize transcoder (code %d)\n", err);
+            fprintf(stderr, "hyperpipe: %s\n", hp_strerror(err));
             if (in_f != stdin) fclose(in_f);
             if (out_f != stdout) fclose(out_f);
             return 1;
         }
 
         err = hp_transcoder_run(&transcoder, in_f, out_f);
-        if (err != HP_OK) {
-            if (err == HP_ERR_GZIP_UNAVAILABLE) {
-                fprintf(stderr, "Error: gzip support requires libz, which was not found on this system\n");
-            } else {
-                fprintf(stderr, "Error: transcoding execution failed (code %d)\n", err);
-            }
-        }
 
         if (count_only) {
             printf("%llu\n", (unsigned long long)transcoder.stats.rows_emitted);
@@ -360,6 +353,8 @@ int main(int argc, char **argv) {
             print_perf_stats(&parallel_stats);
         }
     }
+
+    if (err != HP_OK) fprintf(stderr, "hyperpipe: %s\n", hp_strerror(err));
 
     if (in_f != stdin) fclose(in_f);
     if (out_f != stdout) fclose(out_f);

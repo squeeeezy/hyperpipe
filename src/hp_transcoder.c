@@ -310,6 +310,26 @@ static void quarantine_write(hp_transcoder_t *tc, const uint8_t *data, size_t le
     }
 }
 
+const char *hp_strerror(hp_error_t err) {
+    switch (err) {
+        case HP_OK:                   return "success";
+        case HP_ERR_NOMEM:            return "out of memory";
+        case HP_ERR_IO:               return "read or write error";
+        case HP_ERR_PARSE_QUOTE:      return "malformed CSV quoting";
+        case HP_ERR_PARSE_DELIM:      return "malformed CSV record";
+        case HP_ERR_BUFFER_OVERFLOW:  return "record larger than the input buffer (see --buffer-size) "
+                                             "or more than 1024 columns";
+        case HP_ERR_INVALID_ARG:      return "invalid argument";
+        case HP_ERR_UNSUPPORTED_SIMD: return "SIMD engine not supported by this CPU";
+        case HP_ERR_COLUMN_NOT_FOUND: return "column not found in the input header";
+        case HP_ERR_GZIP_UNAVAILABLE: return "gzip support needs zlib, which was not found";
+        case HP_ERR_UNSUPPORTED:      return "not supported for this input";
+        case HP_ERR_PARSE_JSON:       return "malformed JSON";
+        case HP_ERR_GENERIC:          break;
+    }
+    return "internal error";
+}
+
 hp_format_t hp_sniff_format(const uint8_t *sample, size_t len) {
     if (!sample || len == 0) return HP_FORMAT_CSV;
 
