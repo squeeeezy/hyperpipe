@@ -11,6 +11,7 @@
 #if defined(_MSC_VER)
     #define HP_ALIGNED(n) __declspec(align(n))
     #define HP_INLINE static __forceinline
+    #define HP_HOT
 #elif defined(__GNUC__) || defined(__clang__)
     #define HP_ALIGNED(n) __attribute__((aligned(n)))
     #define HP_INLINE static inline __attribute__((always_inline))
