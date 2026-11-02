@@ -276,7 +276,7 @@ static void ser_row_emit(const hp_json_ser_t *ser,
 
         /* ---- value ---- */
         const hp_str_t *f = &row->fields[i];
-        if (!f->has_escapes && hp_json_is_number(f->ptr, f->len)) {
+        if (f->is_json || (!f->has_escapes && hp_json_is_number(f->ptr, f->len))) {
             memcpy(dst + w, f->ptr, f->len);
             w += f->len;
         } else if (!f->has_escapes && f->len == 4 && memcmp(f->ptr, "true", 4) == 0) {
@@ -425,6 +425,90 @@ static inline char json_unescape(char esc) {
         case 'b': return '\b';
         case 'f': return '\f';
         default:  return esc;
+    }
+}
+
+/* Length of the JSON string starting at the quote p[0], closing quote
+ * included; 0 when it is unterminated or holds an invalid escape */
+static size_t json_string_span(const char *p, size_t len) {
+    size_t i = 1;
+    while (i < len) {
+        if (p[i] == '"') return i + 1;
+        if (p[i] == '\\') {
+            size_t esc = json_escape_len(p + i, len - i);
+            if (esc == 0) return 0;
+            i += esc;
+        } else {
+            i++;
+        }
+    }
+    return 0;
+}
+
+#define HP_JSON_MAX_DEPTH 512
+
+/* Length of the JSON value (RFC 8259) at the start of p, or 0 when p does
+ * not start with one. Used for object and array values, which pass through
+ * as JSON text. Nesting is tracked on an explicit stack, so hostile depth
+ * cannot exhaust the C stack; deeper than HP_JSON_MAX_DEPTH is an error. */
+static size_t json_value_span(const char *p, size_t len) {
+    char open[HP_JSON_MAX_DEPTH];
+    size_t depth = 0, i = 0;
+    enum { VALUE, KEY, AFTER } want = VALUE;
+
+    for (;;) {
+        while (i < len && json_is_space(p[i])) i++;
+        if (i >= len) return 0;
+        char c = p[i];
+
+        if (want == KEY) {
+            size_t n = (c == '"') ? json_string_span(p + i, len - i) : 0;
+            if (n == 0) return 0;
+            i += n;
+            while (i < len && json_is_space(p[i])) i++;
+            if (i >= len || p[i] != ':') return 0;
+            i++;
+            want = VALUE;
+        } else if (want == VALUE) {
+            if (c == '{' || c == '[') {
+                if (depth == HP_JSON_MAX_DEPTH) return 0;
+                open[depth++] = c;
+                i++;
+                while (i < len && json_is_space(p[i])) i++;
+                if (i < len && p[i] == (c == '{' ? '}' : ']')) {
+                    depth--;
+                    i++;
+                    want = AFTER;
+                } else {
+                    want = (c == '{') ? KEY : VALUE;
+                }
+                continue;
+            }
+            size_t n;
+            if (c == '"') {
+                n = json_string_span(p + i, len - i);
+            } else if (c == 't' || c == 'f' || c == 'n') {
+                size_t word = (c == 'f') ? 5 : 4;
+                n = (len - i >= word && json_literal_ok(p + i, word)) ? word : 0;
+            } else {
+                n = json_number_span(p + i, len - i);
+            }
+            if (n == 0) return 0;
+            i += n;
+            want = AFTER;
+        } else {
+            if (depth == 0) return i;
+            char close = (open[depth - 1] == '{') ? '}' : ']';
+            if (c == ',') {
+                i++;
+                want = (open[depth - 1] == '{') ? KEY : VALUE;
+            } else if (c == close) {
+                depth--;
+                i++;
+            } else {
+                return 0;
+            }
+        }
     }
 }
 
@@ -594,6 +678,7 @@ static bool struct_walk(hp_struct_scan_t *s,
         out_row->fields[idx].ptr = val_ptr;
         out_row->fields[idx].len = val_len;
         out_row->fields[idx].has_escapes = val_is_string;
+        out_row->fields[idx].is_json = false;
         out_row->fields[idx].present = true;
         if (idx + 1 > out_row->field_count) out_row->field_count = idx + 1;
 
@@ -616,7 +701,7 @@ static hp_error_t append_key(hp_header_t *header, hp_keymap_t *keymap, hp_row_t 
     name[len] = '\0';
     *idx = header->count;
     header->names[header->count++] = name;
-    row->fields[*idx] = (hp_str_t){ .ptr = "", .len = 0, .has_escapes = false, .present = false };
+    row->fields[*idx] = (hp_str_t){ .ptr = "", .len = 0 };
     return keymap ? hp_keymap_insert(keymap, header, *idx) : HP_OK;
 }
 
@@ -664,6 +749,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
             out_row->fields[i].ptr = "";
             out_row->fields[i].len = 0;
             out_row->fields[i].has_escapes = false;
+            out_row->fields[i].is_json = false;
             out_row->fields[i].present = false;
         }
         out_row->field_count = header->count;
@@ -693,6 +779,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
             out_row->fields[i].ptr = "";
             out_row->fields[i].len = 0;
             out_row->fields[i].has_escapes = false;
+            out_row->fields[i].is_json = false;
             out_row->fields[i].present = false;
         }
         out_row->field_count = header->count;
@@ -757,6 +844,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         const char *val_ptr;
         size_t val_len;
         bool val_is_string = false;
+        bool val_is_json = false;
         size_t val_start_arena = arena_pos;
 
         if (pos < len && line[pos] == '"') {
@@ -826,6 +914,13 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                 val_ptr = value_arena + val_start_arena;
                 val_len = arena_pos - val_start_arena;
             }
+        } else if (pos < len && (line[pos] == '{' || line[pos] == '[')) {
+            /* Object or array: checked by the grammar, kept as JSON text */
+            val_len = json_value_span(line + pos, len - pos);
+            if (val_len == 0) return HP_ERR_PARSE_JSON;
+            val_ptr = line + pos;
+            val_is_json = true;
+            pos += val_len;
         } else {
             /* Literal/number value: scan the span, keep it zero-copy */
             size_t lit_start = pos;
@@ -839,6 +934,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
             out_row->fields[idx].ptr = val_ptr;
             out_row->fields[idx].len = val_len;
             out_row->fields[idx].has_escapes = val_is_string;
+            out_row->fields[idx].is_json = val_is_json;
             out_row->fields[idx].present = true;
             if (idx >= out_row->field_count) out_row->field_count = idx + 1;
         }

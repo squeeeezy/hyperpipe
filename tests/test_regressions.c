@@ -261,6 +261,14 @@ static void test_malformed_ndjson_is_rejected(void) {
         "{\"id\":\"x\\",
         "{\"id\":\"a\\qb\"}",        /* invalid escapes */
         "{\"id\":\"\\u12\"}",
+        "{\"id\":[1,2}",             /* malformed nested values */
+        "{\"id\":[1,]}",
+        "{\"id\":[1 2]}",
+        "{\"id\":{\"b\":}}",
+        "{\"id\":{1:2}}",
+        "{\"id\":{\"a\" 1}}",
+        "{\"id\":[\"x]}",
+        "{\"id\":[[[]]}",
     };
     const char *pad = "\"p\":\"pppppppppppppppppppppppppppppppppppppppp\",";
     const char *first = "{\"p\":\"pppppppppppppppppppppppppppppppppppppppp\",\"id\":0,\"v\":\"a\"}\n";
@@ -331,6 +339,52 @@ static void test_scalar_engine_replaces_every_kernel(void) {
     hp_dispatch_init(HP_SIMD_AUTO);
 }
 
+/* Objects and arrays used to fail the whole line. They pass through as JSON
+ * text: verbatim, inner spacing included, to NDJSON; as quoted text to CSV. */
+static void test_nested_values_pass_through(void) {
+    const char *doc =
+        "{\"id\":1,\"tags\":[\"a\",\"b,c\"],\"meta\":{\"x\":{\"y\":[1,{\"z\":null}]},\"s\":\"q\\\"x\"}}\n"
+        "{\"id\":2,\"tags\":[],\"meta\":{}}\n"
+        "{\"id\":3,\"tags\":[ 1 , 2 ]}\n";
+
+    run_result_t r = run_pipeline(doc, NULL, NULL, HP_FORMAT_NDJSON);
+    CHECK(r.err == HP_OK && r.rows_emitted == 3);
+    CHECK(strcmp(r.out, doc) == 0);
+
+    r = run_pipeline(doc, NULL, "id,tags", HP_FORMAT_CSV);
+    CHECK(r.err == HP_OK);
+    CHECK(strcmp(r.out,
+                 "id,tags\n"
+                 "1,\"[\"\"a\"\",\"\"b,c\"\"]\"\n"
+                 "2,[]\n"
+                 "3,\"[ 1 , 2 ]\"\n") == 0);
+
+    r = run_pipeline(doc, "id == 2", "meta", HP_FORMAT_CSV);
+    CHECK(r.err == HP_OK && strcmp(r.out, "meta\n{}\n") == 0);
+}
+
+/* Nesting is checked with an explicit stack: hostile depth is an error,
+ * not a stack overflow */
+static void test_deep_nesting_is_bounded(void) {
+    static char doc[300 * 1024];
+    size_t depth = 100 * 1000, w = 0;
+    w += (size_t)snprintf(doc, sizeof(doc), "{\"a\":");
+    memset(doc + w, '[', depth);
+    w += depth;
+    memset(doc + w, ']', depth);
+    w += depth;
+    strcpy(doc + w, "}\n");
+    run_result_t r = run_pipeline(doc, NULL, NULL, HP_FORMAT_NDJSON);
+    CHECK(r.err == HP_ERR_PARSE_JSON);
+
+    w = (size_t)snprintf(doc, sizeof(doc), "{\"a\":");
+    memset(doc + w, '[', 100);
+    memset(doc + w + 100, ']', 100);
+    strcpy(doc + w + 200, "}\n");
+    r = run_pipeline(doc, NULL, NULL, HP_FORMAT_NDJSON);
+    CHECK(r.err == HP_OK && strcmp(r.out, doc) == 0);
+}
+
 int main(void) {
     TAP_RUN(test_single_equality_is_numeric);
     TAP_RUN(test_numeric_compare_needs_whole_field);
@@ -348,5 +402,7 @@ int main(void) {
     TAP_RUN(test_malformed_ndjson_is_rejected);
     TAP_RUN(test_long_names_are_kept_whole);
     TAP_RUN(test_scalar_engine_replaces_every_kernel);
+    TAP_RUN(test_nested_values_pass_through);
+    TAP_RUN(test_deep_nesting_is_bounded);
     return tap_done();
 }

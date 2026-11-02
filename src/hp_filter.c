@@ -143,6 +143,7 @@ hp_error_t hp_project_row(const hp_projection_t *proj, const hp_row_t *src, hp_r
             dst->fields[dst->field_count].ptr = "";
             dst->fields[dst->field_count].len = 0;
             dst->fields[dst->field_count].has_escapes = false;
+            dst->fields[dst->field_count].is_json = false;
             dst->fields[dst->field_count].present = false;
             dst->field_count++;
         }

@@ -67,6 +67,9 @@ typedef struct hp_str_s {
      * delimiters, newlines and quotes are re-escaped on output. Clean
      * zero-copy fields keep this flag false and are emitted with raw memcpy. */
     bool has_escapes;
+    /* true for a JSON object or array value from NDJSON input: JSON text
+     * that NDJSON output writes verbatim and CSV output writes as text */
+    bool is_json;
     /* false when the field is absent from this record (sparse NDJSON rows).
      * Absent fields are omitted from NDJSON objects and serialized as empty
      * strings in CSV/TSV output. */

@@ -13,10 +13,9 @@ default for large files; and every workload is at least as fast as in 1.5.
 - `--jobs` defaults to `auto`: one thread per processor, at most 16, for
   regular files of 16 MiB or more. `--jobs 1` restores sequential runs;
   `--jobs 0` is rejected.
-- NDJSON input must be valid JSON: a complete object per line whose values
-  are strings, numbers, `true`, `false` or `null`. Truncated lines, missing
-  commas, trailing text and invalid escapes are malformed records
-  (`HP_ERR_PARSE_JSON`) handled by `--on-error`.
+- NDJSON input must be valid JSON: a complete object per line. Truncated
+  lines, missing commas, trailing text and invalid escapes are malformed
+  records (`HP_ERR_PARSE_JSON`) handled by `--on-error`.
 - CSV text after a closing quote (`"abc"xyz`) is a malformed record.
 - Numeric predicates compare values: `a == 5000` matches `5000.0` and `5e3`;
   fields such as `200abc`, `0x10` and `inf` are not numbers.
@@ -30,6 +29,12 @@ default for large files; and every workload is at least as fast as in 1.5.
   `lock_schema` in `hp_transcoder_config_t`, `hp_strerror()`,
   `hp_parallel_auto_jobs()`; `hp_filter_matches()` is inline and calls
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
+
+### Added
+- Nested NDJSON values. Objects and arrays are checked against the JSON
+  grammar and pass through as JSON text: verbatim to NDJSON, as a text
+  field to CSV and TSV. Nesting deeper than 512 levels is a malformed
+  record. Library: `is_json` in `hp_str_t`.
 
 ### Fixed
 - Heap overflow when a CSV record over 256 KiB was written as CSV.

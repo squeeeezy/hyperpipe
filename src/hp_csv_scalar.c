@@ -105,6 +105,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                 out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                 out_row->fields[out_row->field_count].len = pos - field_start;
                 out_row->fields[out_row->field_count].has_escapes = false;
+                out_row->fields[out_row->field_count].is_json = false;
                 out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
 
@@ -117,6 +118,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                 out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                 out_row->fields[out_row->field_count].len = pos - field_start;
                 out_row->fields[out_row->field_count].has_escapes = false;
+                out_row->fields[out_row->field_count].is_json = false;
                 out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
 
@@ -165,6 +167,7 @@ hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                     out_row->fields[out_row->field_count].ptr = parser->unescape_arena + field_arena_start;
                     out_row->fields[out_row->field_count].len = flen;
                     out_row->fields[out_row->field_count].has_escapes = true;
+                    out_row->fields[out_row->field_count].is_json = false;
                 } else {
                     /* Zero-copy quoted field (e.g. "x,y" or "multi
 line").
@@ -174,6 +177,7 @@ line").
                     out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
                     out_row->fields[out_row->field_count].len = pos - field_start;
                     out_row->fields[out_row->field_count].has_escapes = true;
+                    out_row->fields[out_row->field_count].is_json = false;
                 }
                 out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
@@ -243,6 +247,7 @@ line").
                     out_row->fields[out_row->field_count].len = len - field_start;
                 }
                 out_row->fields[out_row->field_count].has_escapes = true;
+                out_row->fields[out_row->field_count].is_json = false;
                 out_row->fields[out_row->field_count].present = true;
                 out_row->field_count++;
             }
@@ -253,6 +258,7 @@ line").
             out_row->fields[out_row->field_count].ptr = (const char *)(src + field_start);
             out_row->fields[out_row->field_count].len = len - field_start;
             out_row->fields[out_row->field_count].has_escapes = false;
+            out_row->fields[out_row->field_count].is_json = false;
             out_row->fields[out_row->field_count].present = true;
             out_row->field_count++;
         }

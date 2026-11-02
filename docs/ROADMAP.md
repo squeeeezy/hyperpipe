@@ -6,8 +6,6 @@ showing no workload slower.
 
 ## Next
 
-- Nested NDJSON values: pass objects and arrays through as JSON text instead
-  of rejecting the line.
 - MSVC: replace the GCC builtins and target attributes in the SIMD units.
 - ARM: NEON versions of the CSV and NDJSON kernels.
 - Positional parallel output on Windows: preallocate the file so chunks can

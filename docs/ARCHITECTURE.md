@@ -49,7 +49,7 @@ and `test_chaos` check that.
 
 `hp_json_parse_line_ex()` (`src/hp_json_scalar.c`) parses one line into a row
 whose columns are the keys seen so far. It accepts exactly an RFC 8259
-object of scalar members; anything else is `HP_ERR_PARSE_JSON`.
+object; anything else is `HP_ERR_PARSE_JSON`.
 
 - Values that need no unescaping point into the buffer. Escaped strings are
   decoded into an arena the transcoder sizes to the line, which always
@@ -57,6 +57,10 @@ object of scalar members; anything else is `HP_ERR_PARSE_JSON`.
 - Keys resolve through `hp_keymap` (`src/hp_keymap.c`), an open-addressing
   hash over the header. Keys up to 8 bytes compare as one packed word.
   Unknown keys extend the header and the map.
+- An object or array value is validated by `json_value_span()`, which keeps
+  the nesting on a fixed 512-entry stack instead of recursing, and becomes
+  a field with `is_json` set that points at its source text. The NDJSON
+  writer copies such a field as is; everything else sees a string.
 - A structural fast path handles escape-free lines: one vector pass per
   64-byte chunk gives the quote and backslash bitmaps, keys and string
   values become spans between quotes, and numbers are checked against the

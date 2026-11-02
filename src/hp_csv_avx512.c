@@ -80,6 +80,7 @@ HP_INLINE bool avx512_emit_field(hp_row_t *out_row, size_t *fc,
     out_row->fields[*fc].ptr = (const char *)(base + start);
     out_row->fields[*fc].len = end - start;
     out_row->fields[*fc].has_escapes = false;
+    out_row->fields[*fc].is_json = false;
     out_row->fields[*fc].present = true;
     (*fc)++;
     return true;

@@ -86,10 +86,12 @@ position.
   stays an empty string rather than an absent value.
 - Text after a closing quote, or a quote inside an unquoted field, is a
   malformed record.
-- NDJSON lines must be complete JSON objects whose values are strings,
-  numbers, `true`, `false` or `null`. Truncated lines, missing commas,
-  trailing text and invalid escapes are malformed records. Raw control
-  characters inside strings are accepted.
+- NDJSON lines must be complete JSON objects. Truncated lines, missing
+  commas, trailing text and invalid escapes are malformed records. Raw
+  control characters inside strings are accepted.
+- Object and array values pass through as JSON text: verbatim to NDJSON,
+  as a text field to CSV and TSV. Filters and `--summary` treat them as
+  strings.
 - NDJSON rows may omit, reorder or add keys. NDJSON output follows keys that
   appear later; CSV output keeps the columns of the first line. Parallel
   runs keep the first line's keys for every format, so their output does not
