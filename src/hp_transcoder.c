@@ -546,11 +546,267 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
     return HP_OK;
 }
 
+/* ---- streaming ------------------------------------------------------------ */
+
+/* State of one hp_transcoder_run() */
+typedef struct hp_run_s {
+    hp_transcoder_t *tc;
+    hp_page_buffer_t pb;
+    hp_row_t row;                  /* the record being processed */
+    hp_row_t projected;            /* NDJSON output with a projection */
+    hp_error_t (*parse_csv)(hp_csv_parser_t *, const uint8_t *, size_t, size_t *, hp_row_t *, bool);
+    bool ndjson_in;
+    bool header_done;
+    bool csv_out;                  /* CSV or TSV output */
+    uint8_t out_delim;
+    bool quote_clean;              /* clean input fields may hold out_delim */
+    bool resyncing;                /* drop input up to the next newline */
+    uint64_t rows_read;
+    uint64_t rows_emitted;
+    uint64_t rows_dropped;
+} hp_run_t;
+
+/* Parses the next CSV record. *consumed == 0 asks for more input; *raw_len
+ * is the record's size in the input, which bounds its output. */
+HP_INLINE hp_error_t next_csv_record(hp_run_t *run, const uint8_t *src, size_t available,
+                                     bool is_eof, size_t *consumed, size_t *raw_len) {
+    hp_error_t err = run->parse_csv(&run->tc->csv_parser, src, available, consumed, &run->row, is_eof);
+    *raw_len = *consumed;
+    return err;
+}
+
+/* Parses the next NDJSON line. Fields point into the ring buffer and stay
+ * valid until the caller advances past the line. */
+HP_INLINE hp_error_t next_ndjson_record(hp_run_t *run, const uint8_t *src, size_t available,
+                                        bool is_eof, size_t *consumed, size_t *raw_len) {
+    hp_transcoder_t *tc = run->tc;
+    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
+    *consumed = 0;
+    if (!nl && !is_eof) return HP_OK;
+    *consumed = nl ? (size_t)(nl - src + 1) : available;
+
+    size_t len = *consumed;
+    while (len > 0 && (src[len - 1] == '\r' || src[len - 1] == '\n' || src[len - 1] == ' ' ||
+                       src[len - 1] == '\t' || src[len - 1] == '\v' || src[len - 1] == '\f')) {
+        len--;
+    }
+    *raw_len = len;
+    run->row.field_count = 0;
+    if (len == 0) return HP_OK;
+
+    /* Decoded strings are never longer than their escaped source, so an
+     * arena as large as the line always suffices */
+    if (len > tc->value_arena_cap) {
+        char *arena = (char *)realloc(tc->value_arena, len);
+        if (!arena) return HP_ERR_NOMEM;
+        tc->value_arena = arena;
+        tc->value_arena_cap = len;
+    }
+    return hp_json_parse_line_ex((const char *)src, len, &tc->in_header,
+                                 tc->keymap_active ? &tc->keymap : NULL,
+                                 &run->row, tc->value_arena, tc->value_arena_cap);
+}
+
+/* An empty header name is written as "" so it stays distinguishable from
+ * an absent cell after a round trip. --count and --summary write no rows,
+ * so they write no header either. */
+static void write_csv_header(hp_run_t *run) {
+    hp_transcoder_t *tc = run->tc;
+    if (!run->csv_out || tc->config.count_only || tc->config.summary) return;
+    for (size_t i = 0; i < tc->out_header.count; i++) {
+        size_t len = strlen(tc->out_header.names[i]);
+        if (i > 0) hp_page_buffer_putc(&run->pb, run->out_delim);
+        write_csv_field_pb(&run->pb, tc->out_header.names[i], len, run->out_delim, len == 0);
+    }
+    hp_page_buffer_putc(&run->pb, '\n');
+}
+
+/* Binds the stream to its header: the first CSV record, or the keys of the
+ * first NDJSON line. */
+static hp_error_t start_stream(hp_run_t *run) {
+    hp_transcoder_t *tc = run->tc;
+    if (!run->ndjson_in) {
+        for (size_t i = 0; i < run->row.field_count && i < HP_MAX_COLUMNS; i++) {
+            const hp_str_t *f = &run->row.fields[i];
+            char *name = (char *)malloc(f->len + 1);
+            if (!name) return HP_ERR_NOMEM;
+            memcpy(name, f->ptr, f->len);
+            name[f->len] = '\0';
+            tc->in_header.names[tc->in_header.count++] = name;
+        }
+    }
+
+    hp_error_t err = hp_bind_stream_header(tc);
+    if (err != HP_OK) return err;
+
+    /* A hashed index over the first line's keys; the parser keeps it in
+     * step as keys appear. Without one, lookups fall back to a linear walk. */
+    if (run->ndjson_in && hp_keymap_build(&tc->keymap, &tc->in_header) == HP_OK) {
+        tc->keymap_active = true;
+    }
+    run->header_done = true;
+    write_csv_header(run);
+    return HP_OK;
+}
+
+/* NDJSON output can follow keys that appear mid-stream, since no header
+ * line was written. Parallel runs lock the schema instead: growth order
+ * would depend on the rows each chunk happens to see first. */
+HP_INLINE void follow_schema_growth(hp_run_t *run) {
+    hp_transcoder_t *tc = run->tc;
+    if (tc->config.lock_schema || tc->projection.active ||
+        tc->config.out_format != HP_FORMAT_NDJSON ||
+        tc->in_header.count <= tc->out_header.count) {
+        return;
+    }
+    for (size_t i = tc->out_header.count; i < tc->in_header.count; i++) {
+        tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
+    }
+    hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
+}
+
+/* Handles one record that passed the filter: folds it into --summary,
+ * counts it for --count, or writes it. Sets *done once --head is reached. */
+HP_INLINE hp_error_t deliver_record(hp_run_t *run, size_t raw_len, bool *done) {
+    hp_transcoder_t *tc = run->tc;
+    if (tc->config.summary) {
+        hp_summary_observe(tc->summary, &tc->in_header, &run->row);
+    } else if (tc->config.count_only) {
+        /* counted below, nothing is written */
+    } else if (run->csv_out) {
+        emit_csv_row_pb(&run->pb, &run->row,
+                        tc->projection.active ? tc->projection.col_indices : NULL,
+                        tc->projection.count, run->out_delim, raw_len, run->quote_clean);
+    } else {
+        const hp_row_t *row = &run->row;
+        if (tc->projection.active) {
+            hp_project_row(&tc->projection, &run->row, &run->projected);
+            row = &run->projected;
+        }
+        size_t line_len = 0;
+        hp_error_t err = emit_ndjson_row_pb(&run->pb, &tc->json_ser, &tc->out_header, row, &line_len);
+        if (err != HP_OK) return err;
+        tc->stats.bytes_out += line_len;
+    }
+    run->rows_emitted++;
+    *done = tc->config.limit_rows && run->rows_emitted >= tc->config.limit_rows;
+    return HP_OK;
+}
+
+/* Bytes up to and including the next newline: the unit that fault
+ * tolerance drops after a malformed or oversized record */
+HP_INLINE size_t line_span(const uint8_t *src, size_t available) {
+    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
+    return nl ? (size_t)(nl - src + 1) : available;
+}
+
+static hp_error_t finish_run(hp_run_t *run, hp_error_t err) {
+    hp_transcoder_t *tc = run->tc;
+    if (err == HP_OK) {
+        err = hp_page_buffer_finish(&run->pb);
+    } else {
+        hp_page_buffer_flush(&run->pb);
+    }
+    tc->stats.rows_read += run->rows_read;
+    tc->stats.rows_emitted += run->rows_emitted;
+    tc->stats.rows_dropped += run->rows_dropped;
+    return err;
+}
+
+typedef hp_error_t (*hp_next_record_fn)(hp_run_t *, const uint8_t *, size_t, bool, size_t *, size_t *);
+
+/* The streaming loop shared by both input formats. Inlined with a constant
+ * next_record, so each format gets its own copy without an indirect call
+ * per record. Parse errors go to the fault-tolerance mode; anything else
+ * stops the run. */
+HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
+    hp_transcoder_t *tc = run->tc;
+    hp_sliding_buffer_t *ring = &tc->ring_buf;
+    const bool skip_errors = tc->config.on_error != HP_ON_ERROR_FAIL;
+    size_t available = 0, bytes_read = 0;
+    const uint8_t *src;
+    hp_error_t err;
+
+    for (;;) {
+        src = hp_sliding_buffer_read_ptr(ring, &available);
+        if (available == 0) {
+            if (ring->eof_reached) return HP_OK;
+            if ((err = hp_sliding_buffer_refill(ring, &tc->in_reader, &bytes_read)) != HP_OK) return err;
+            tc->stats.bytes_in += bytes_read;
+            src = hp_sliding_buffer_read_ptr(ring, &available);
+            if (available == 0 && ring->eof_reached) return HP_OK;
+        }
+
+        const bool is_eof = ring->eof_reached;
+        bool progress = false, done = false;
+
+        while (available > 0 && !done) {
+            size_t consumed = 0, raw_len = 0;
+            if (run->resyncing) {
+                consumed = line_span(src, available);
+                run->resyncing = src[consumed - 1] != '\n';
+                quarantine_write(tc, src, consumed);
+            } else if ((err = next_record(run, src, available, is_eof, &consumed, &raw_len)) != HP_OK) {
+                if (!skip_errors) {
+                    ring->head = (size_t)(src - ring->data);
+                    return err;
+                }
+                consumed = line_span(src, available);
+                quarantine_write(tc, src, consumed);
+                run->rows_dropped++;
+            } else if (consumed == 0) {
+                break;
+            } else if (run->row.field_count > 0 || (run->ndjson_in && raw_len > 0)) {
+                bool is_data = true;
+                if (!run->header_done && (!run->ndjson_in || tc->in_header.count > 0)) {
+                    if ((err = start_stream(run)) != HP_OK) {
+                        ring->head = (size_t)(src - ring->data);
+                        return err;
+                    }
+                    is_data = run->ndjson_in;   /* a CSV header row is not data */
+                }
+                if (is_data) {
+                    if (run->ndjson_in) follow_schema_growth(run);
+                    run->rows_read++;
+                    if (hp_filter_matches(&tc->filter, &run->row) &&
+                        (err = deliver_record(run, raw_len, &done)) != HP_OK) {
+                        ring->head = (size_t)(src - ring->data);
+                        return err;
+                    }
+                }
+            }
+            progress = true;
+            src += consumed;
+            available -= consumed;
+        }
+
+        /* Fields point into the ring buffer, so it advances only here, once
+         * every record parsed from this window has been consumed */
+        ring->head = (size_t)(src - ring->data);
+        if (done) return HP_OK;
+        if (progress) continue;
+        if (is_eof) return HP_OK;
+
+        err = hp_sliding_buffer_refill(ring, &tc->in_reader, &bytes_read);
+        if (err == HP_ERR_BUFFER_OVERFLOW && skip_errors) {
+            /* A record larger than the buffer: drop what is buffered and
+             * resynchronize at the next newline */
+            quarantine_write(tc, src, available);
+            run->rows_dropped++;
+            ring->head = ring->tail;
+            run->resyncing = true;
+            continue;
+        }
+        if (err != HP_OK) return err;
+        tc->stats.bytes_in += bytes_read;
+    }
+}
+
 hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream) {
     if (!tc || !in_stream || (!out_stream && !tc->config.sink)) return HP_ERR_INVALID_ARG;
 
-    /* Input reader: plain stdio passthrough, or transparent inflate when the
-     * stream turns out to be gzip. hp_reader_init is re-entry safe. */
+    /* Plain stdio, or transparent inflate when the stream turns out to be
+     * gzip. Parallel workers read exactly their span of the file. */
     hp_reader_init(&tc->in_reader, in_stream);
     if (tc->config.span_end) {
         tc->in_reader.limited = true;
@@ -558,527 +814,67 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     }
 
     double t0 = get_time_sec();
-    bool header_processed = false;
-
-    hp_page_buffer_t pb;
-    pb.data = tc->page_buf_data;
-    pb.cap = tc->page_buf_cap;
-    pb.len = 0;
-    pb.stream = out_stream;
-    pb.sink = tc->config.sink;
-    pb.sink_ctx = tc->config.sink_ctx;
-    pb.gz = tc->gz_out;
-    pb.error = HP_OK;
-
-    uint64_t rows_read_local = 0;
-    uint64_t rows_emitted_local = 0;
-    uint64_t rows_dropped_local = 0;
-
     size_t bytes_read = 0;
     hp_error_t err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
     if (err != HP_OK) return err;
     tc->stats.bytes_in += bytes_read;
 
-    /* One row buffer reused by every parse call in this run. Keeping it here
-     * (instead of inside the row loop) documents that its lifetime spans the
-     * whole stream and avoids re-entering its ~24 KB scope per iteration. */
-    hp_row_t raw_row;
-
     size_t available = 0;
     const uint8_t *src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-
     if (tc->config.in_format == HP_FORMAT_AUTO) {
         tc->config.in_format = hp_sniff_format(src, available);
-        if (tc->config.in_format == HP_FORMAT_TSV) {
-            tc->csv_parser.delim = '\t';
-        }
+        if (tc->config.in_format == HP_FORMAT_TSV) tc->csv_parser.delim = '\t';
     }
-
     if (tc->config.out_format == HP_FORMAT_AUTO) {
-        if (tc->config.in_format == HP_FORMAT_NDJSON) {
-            tc->config.out_format = HP_FORMAT_CSV;
-        } else {
-            tc->config.out_format = HP_FORMAT_NDJSON;
-        }
+        tc->config.out_format = (tc->config.in_format == HP_FORMAT_NDJSON) ? HP_FORMAT_CSV
+                                                                            : HP_FORMAT_NDJSON;
     }
 
-    /* Parallel workers receive the resolved header from the coordinator:
-     * their chunks begin exactly at a data-row boundary, so no header row is
-     * parsed and the state the single-stream path reaches after its first
-     * row is reproduced directly. */
+    /* About 50 KiB of rows: on the heap rather than the stack of a worker */
+    hp_run_t *run = (hp_run_t *)calloc(1, sizeof(*run));
+    if (!run) return HP_ERR_NOMEM;
+    run->tc = tc;
+    run->pb = (hp_page_buffer_t){
+        .data = tc->page_buf_data,
+        .cap = tc->page_buf_cap,
+        .stream = out_stream,
+        .sink = tc->config.sink,
+        .sink_ctx = tc->config.sink_ctx,
+        .gz = tc->gz_out,
+        .error = HP_OK,
+    };
+    run->parse_csv = g_hp_dispatch.csv_parse_row ? g_hp_dispatch.csv_parse_row
+                                                 : hp_csv_parse_row_scalar;
+    run->ndjson_in = (tc->config.in_format == HP_FORMAT_NDJSON);
+    run->csv_out = (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV);
+    run->out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
+    run->quote_clean = run->ndjson_in || tc->csv_parser.delim != run->out_delim;
+
+    /* Parallel workers start mid-file with the header the coordinator read */
+    tc->keymap_active = false;
     if (tc->config.preset_header) {
         const hp_header_t *pre = tc->config.preset_header;
         for (size_t i = 0; i < pre->count && i < HP_MAX_COLUMNS; i++) {
             tc->in_header.names[tc->in_header.count++] = strdup(pre->names[i] ? pre->names[i] : "");
         }
-        hp_error_t berr = hp_bind_stream_header(tc);
-        if (berr != HP_OK) return berr;
-        header_processed = true;
-    }
-
-    if (tc->config.in_format == HP_FORMAT_CSV || tc->config.in_format == HP_FORMAT_TSV) {
-        hp_error_t (*parse_row_fn)(hp_csv_parser_t *, const uint8_t *, size_t, size_t *, hp_row_t *, bool) = 
-            g_hp_dispatch.csv_parse_row ? g_hp_dispatch.csv_parse_row : hp_csv_parse_row_scalar;
-
-        const bool is_csv_out = (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV);
-        const uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-
-        const int64_t *out_cols = tc->projection.active ? tc->projection.col_indices : NULL;
-        const bool quote_clean = tc->csv_parser.delim != out_delim;
-        bool limit_reached = false;
-        bool resyncing = false;   /* set after an oversized-record drop:
-                                     discard bytes until the next '\n' */
-
-        while (1) {
-            src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-            if (available == 0) {
-                if (tc->ring_buf.eof_reached) break;
-                err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
-                if (err != HP_OK) {
-                    hp_page_buffer_flush(&pb);
-                    return err;
-                }
-                tc->stats.bytes_in += bytes_read;
-                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-                if (available == 0 && tc->ring_buf.eof_reached) break;
-            }
-
-            bool is_eof = tc->ring_buf.eof_reached;
-            bool made_progress = false;
-
-            while (available > 0) {
-
-                size_t consumed = 0;
-
-                if (resyncing) {
-                    /* Oversized record was dropped: skip to the next line
-                     * boundary so its tail is never parsed as fake rows */
-                    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
-                    size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    quarantine_write(tc, src, skip);
-                    src += skip;
-                    available -= skip;
-                    made_progress = true;
-                    if (nl) resyncing = false;
-                    continue;
-                }
-
-                err = parse_row_fn(&tc->csv_parser, src, available, &consumed, &raw_row, is_eof);
-                if (err != HP_OK) {
-                    if (tc->config.on_error == HP_ON_ERROR_FAIL) {
-                        tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-                        hp_page_buffer_flush(&pb);
-                        return err;
-                    }
-                    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
-                    size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    quarantine_write(tc, src, skip);
-                    rows_dropped_local++;
-                    made_progress = true;
-                    src += skip;
-                    available -= skip;
-                    continue;
-                }
-
-                if (consumed == 0) {
-                    break;
-                }
-
-                made_progress = true;
-
-                if (raw_row.field_count == 0) {
-                    src += consumed;
-                    available -= consumed;
-                    continue;
-                }
-
-                if (!header_processed) {
-                    tc->in_header.count = 0;
-                    for (size_t i = 0; i < raw_row.field_count && i < HP_MAX_COLUMNS; i++) {
-                        char buf[256];
-                        size_t flen = raw_row.fields[i].len < sizeof(buf) - 1 ? raw_row.fields[i].len : sizeof(buf) - 1;
-                        memcpy(buf, raw_row.fields[i].ptr, flen);
-                        buf[flen] = '\0';
-                        tc->in_header.names[tc->in_header.count++] = strdup(buf);
-                    }
-
-                    hp_error_t berr = hp_bind_stream_header(tc);
-                    if (berr != HP_OK) {
-                        tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-                        hp_page_buffer_flush(&pb);
-                        return berr;
-                    }
-
-                    header_processed = true;
-
-                    if (is_csv_out && !tc->config.count_only && !tc->config.summary) {
-                        /* An empty header name is written as "" so it stays
-                         * distinguishable from an absent cell after a
-                         * roundtrip; non-empty names stay content-driven.
-                         * --count/--summary produce no rows, so they emit no
-                         * header line either. */
-                        for (size_t i = 0; i < tc->out_header.count; i++) {
-                            size_t name_len = strlen(tc->out_header.names[i]);
-                            if (i > 0) hp_page_buffer_putc(&pb, out_delim);
-                            write_csv_field_pb(&pb, tc->out_header.names[i], name_len, out_delim, name_len == 0);
-                        }
-                        hp_page_buffer_putc(&pb, '\n');
-                    }
-
-                    src += consumed;
-                    available -= consumed;
-                    continue;
-                }
-
-                rows_read_local++;
-
-                if (!hp_filter_matches(&tc->filter, &raw_row)) {
-                    src += consumed;
-                    available -= consumed;
-                    continue;
-                }
-
-                if (tc->config.summary) {
-                    /* --summary: fold the row into the column statistics;
-                     * no row output is produced */
-                    hp_summary_observe(tc->summary, &tc->in_header, &raw_row);
-                    rows_emitted_local++;
-                    if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                        limit_reached = true;
-                        break;
-                    }
-                    src += consumed;
-                    available -= consumed;
-                    continue;
-                }
-
-                if (tc->config.count_only) {
-                    /* --count: count matching rows without materializing any
-                     * output; --head/--limit still applies to the count */
-                    rows_emitted_local++;
-                    if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                        limit_reached = true;
-                        break;
-                    }
-                    src += consumed;
-                    available -= consumed;
-                    continue;
-                }
-
-                if (is_csv_out) {
-                    emit_csv_row_pb(&pb, &raw_row, out_cols, tc->projection.count, out_delim, consumed,
-                                    quote_clean);
-                } else {
-                    /* NDJSON output never mutates the parsed row, so it is
-                     * serialized in place. With a projection, hp_project_row
-                     * copies only the selected columns instead of the whole
-                     * row struct. */
-                    hp_row_t proj_row;
-                    const hp_row_t *out_row_ptr;
-                    if (tc->projection.active) {
-                        hp_project_row(&tc->projection, &raw_row, &proj_row);
-                        out_row_ptr = &proj_row;
-                    } else {
-                        out_row_ptr = &raw_row;
-                    }
-
-                    size_t line_len = 0;
-                    err = emit_ndjson_row_pb(&pb, &tc->json_ser, &tc->out_header, out_row_ptr, &line_len);
-                    if (err != HP_OK) {
-                        tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-                        hp_page_buffer_flush(&pb);
-                        return err;
-                    }
-
-                    tc->stats.bytes_out += line_len;
-                }
-
-                rows_emitted_local++;
-                if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                    limit_reached = true;
-                    break;
-                }
-                src += consumed;
-                available -= consumed;
-            }
-
-            tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-            if (limit_reached) break;
-
-            if (!made_progress) {
-                if (is_eof) break;
-                err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
-                if (err != HP_OK) {
-                    if (err == HP_ERR_BUFFER_OVERFLOW && tc->config.on_error != HP_ON_ERROR_FAIL) {
-                        /* Row larger than the ring buffer: drop the buffered
-                         * span and resynchronize at the next line boundary */
-                        quarantine_write(tc, src, available);
-                        rows_dropped_local++;
-                        tc->ring_buf.head = tc->ring_buf.tail;
-                        resyncing = true;
-                        continue;
-                    }
-                    hp_page_buffer_flush(&pb);
-                    return err;
-                }
-                tc->stats.bytes_in += bytes_read;
-            }
-        }
-    } else if (tc->config.in_format == HP_FORMAT_NDJSON) {
-        bool limit_reached = false;
-        bool resyncing = false;   /* skip to the next '\n' after an oversized line */
-        hp_row_t raw_row;
-
-        /* Parallel workers with a preset header (see hp_parallel.h) bind
-         * their keymap here; single-stream runs build it when the first
-         * parsed row binds the schema below. */
-        tc->keymap_active = false;
-        if (tc->config.preset_header &&
-            hp_keymap_build(&tc->keymap, &tc->in_header) == HP_OK) {
+        err = hp_bind_stream_header(tc);
+        if (err == HP_OK && run->ndjson_in && hp_keymap_build(&tc->keymap, &tc->in_header) == HP_OK) {
             tc->keymap_active = true;
         }
-
-        while (1) {
-            src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-            if (available == 0) {
-                if (tc->ring_buf.eof_reached) break;
-                err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
-                if (err != HP_OK) {
-                    hp_page_buffer_flush(&pb);
-                    return err;
-                }
-                tc->stats.bytes_in += bytes_read;
-                src = hp_sliding_buffer_read_ptr(&tc->ring_buf, &available);
-                if (available == 0 && tc->ring_buf.eof_reached) break;
-            }
-
-            bool is_eof = tc->ring_buf.eof_reached;
-            bool made_progress = false;
-
-            while (available > 0) {
-
-                if (resyncing) {
-                    /* Oversized line was dropped: skip to the next line
-                     * boundary so its tail is never parsed as fake rows */
-                    const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
-                    size_t skip = nl ? (size_t)(nl - src + 1) : available;
-                    quarantine_write(tc, src, skip);
-                    src += skip;
-                    available -= skip;
-                    made_progress = true;
-                    if (nl) resyncing = false;
-                    continue;
-                }
-
-                const uint8_t *nl = (const uint8_t *)memchr(src, '\n', available);
-                if (!nl && !is_eof) {
-                    break;
-                }
-
-                size_t line_len = nl ? (size_t)(nl - src + 1) : available;
-
-                /* Trailing whitespace is stripped in place: the parser gets
-                 * a bounded span into the ring buffer and no line copy is
-                 * made. Fields of the parsed row point into that span and
-                 * stay valid until the row has been consumed below - the
-                 * ring buffer head only advances after the row is emitted
-                 * (or rejected). */
-                size_t strip_len = line_len;
-                while (strip_len > 0 && (src[strip_len - 1] == '\r' || src[strip_len - 1] == '\n' ||
-                                         src[strip_len - 1] == ' ' || src[strip_len - 1] == '\t' ||
-                                         src[strip_len - 1] == '\v' || src[strip_len - 1] == '\f')) {
-                    strip_len--;
-                }
-
-                made_progress = true;
-
-                if (strip_len == 0) {
-                    src += line_len;
-                    available -= line_len;
-                    continue;
-                }
-
-                /* Decoded string values are never longer than their escaped
-                 * source, so an arena as large as the line always suffices. */
-                if (strip_len > tc->value_arena_cap) {
-                    char *arena = (char *)realloc(tc->value_arena, strip_len);
-                    if (!arena) {
-                        hp_page_buffer_flush(&pb);
-                        return HP_ERR_NOMEM;
-                    }
-                    tc->value_arena = arena;
-                    tc->value_arena_cap = strip_len;
-                }
-                err = hp_json_parse_line_ex((const char *)src, strip_len, &tc->in_header,
-                                            tc->keymap_active ? &tc->keymap : NULL,
-                                            &raw_row, tc->value_arena, tc->value_arena_cap);
-                if (err != HP_OK) {
-                    if (tc->config.on_error == HP_ON_ERROR_FAIL) {
-                        tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-                        hp_page_buffer_flush(&pb);
-                        return err;
-                    }
-                    quarantine_write(tc, src, line_len);
-                    rows_dropped_local++;
-                    src += line_len;
-                    available -= line_len;
-                    continue;
-                }
-
-                if (!header_processed && tc->in_header.count > 0) {
-                    hp_error_t berr = hp_bind_stream_header(tc);
-                    if (berr != HP_OK) {
-                        tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-                        hp_page_buffer_flush(&pb);
-                        return berr;
-                    }
-
-                    /* Hash index over the first row's schema for O(1) key
-                     * resolution; the parser keeps it in sync when keys
-                     * appear mid-stream. A failed allocation merely falls
-                     * back to the linear walk. */
-                    if (hp_keymap_build(&tc->keymap, &tc->in_header) == HP_OK) {
-                        tc->keymap_active = true;
-                    }
-
-                    header_processed = true;
-
-                    if ((tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV) &&
-                        !tc->config.count_only && !tc->config.summary) {
-                        uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                        /* Empty header name canonicalizes to "" (see above);
-                         * --count/--summary emit no header line */
-                        for (size_t i = 0; i < tc->out_header.count; i++) {
-                            size_t name_len = strlen(tc->out_header.names[i]);
-                            if (i > 0) hp_page_buffer_putc(&pb, out_delim);
-                            write_csv_field_pb(&pb, tc->out_header.names[i], name_len, out_delim, name_len == 0);
-                        }
-                        hp_page_buffer_putc(&pb, '\n');
-                    }
-                }
-
-                /* Schema growth mid-stream: single-stream NDJSON output
-                 * can follow it (the header line is not yet written).
-                 * Parallel runs lock the schema instead: growth order would
-                 * depend on which rows each chunk happens to see first, so
-                 * keys beyond the first line serialize under their column
-                 * index - the same lock rule CSV output documents. */
-                if (!tc->config.lock_schema &&
-                    !tc->projection.active && tc->config.out_format == HP_FORMAT_NDJSON &&
-                    tc->in_header.count > tc->out_header.count) {
-                    for (size_t i = tc->out_header.count; i < tc->in_header.count; i++) {
-                        tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
-                    }
-                    hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
-                }
-
-                rows_read_local++;
-
-                if (!hp_filter_matches(&tc->filter, &raw_row)) {
-                    src += line_len;
-                    available -= line_len;
-                    continue;
-                }
-
-                if (tc->config.summary) {
-                    /* --summary: fold the row into the column statistics;
-                     * no row output is produced */
-                    hp_summary_observe(tc->summary, &tc->in_header, &raw_row);
-                    rows_emitted_local++;
-                    if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                        limit_reached = true;
-                        break;
-                    }
-                    src += line_len;
-                    available -= line_len;
-                    continue;
-                }
-
-                if (tc->config.count_only) {
-                    /* --count: count matching rows without materializing any
-                     * output; --head/--limit still applies to the count */
-                    rows_emitted_local++;
-                    if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                        limit_reached = true;
-                        break;
-                    }
-                    src += line_len;
-                    available -= line_len;
-                    continue;
-                }
-
-                if (tc->config.out_format == HP_FORMAT_NDJSON) {
-                    hp_row_t proj_row;
-                    const hp_row_t *out_row_ptr = &raw_row;
-                    if (tc->projection.active) {
-                        hp_project_row(&tc->projection, &raw_row, &proj_row);
-                        out_row_ptr = &proj_row;
-                    }
-                    size_t out_line_len = 0;
-                    err = emit_ndjson_row_pb(&pb, &tc->json_ser, &tc->out_header, out_row_ptr, &out_line_len);
-                    if (err != HP_OK) {
-                        hp_page_buffer_flush(&pb);
-                        return err;
-                    }
-                    tc->stats.bytes_out += out_line_len;
-                } else {
-                    /* Every value is a slice of the line or a decoded copy no
-                     * longer than its source, so the line length bounds the
-                     * record just as it does for CSV input. */
-                    const uint8_t out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
-                    emit_csv_row_pb(&pb, &raw_row,
-                                    tc->projection.active ? tc->projection.col_indices : NULL,
-                                    tc->projection.count, out_delim, strip_len, true);
-                }
-                rows_emitted_local++;
-                if (tc->config.limit_rows && rows_emitted_local >= tc->config.limit_rows) {
-                    limit_reached = true;
-                    break;
-                }
-                src += line_len;
-                available -= line_len;
-            }
-
-            /* Publish the local cursor: with zero-copy parsing the ring
-             * buffer head advances here, once per outer iteration, exactly
-             * when the last parsed row has been consumed. */
-            tc->ring_buf.head = (size_t)(src - tc->ring_buf.data);
-            if (limit_reached) break;
-
-            if (!made_progress) {
-                if (is_eof) break;
-                err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
-                if (err != HP_OK) {
-                    if (err == HP_ERR_BUFFER_OVERFLOW && tc->config.on_error != HP_ON_ERROR_FAIL) {
-                        /* Line larger than the ring buffer: quarantine the
-                         * buffered span and resynchronize at the next line
-                         * boundary so its tail is never parsed as fake rows */
-                        quarantine_write(tc, src, available);
-                        rows_dropped_local++;
-                        tc->ring_buf.head = tc->ring_buf.tail;
-                        resyncing = true;
-                        continue;
-                    }
-                    hp_page_buffer_flush(&pb);
-                    return err;
-                }
-                tc->stats.bytes_in += bytes_read;
-            }
-        }
+        run->header_done = true;
     }
 
-    hp_error_t finish_err = hp_page_buffer_finish(&pb);
-    double t1 = get_time_sec();
+    if (err == HP_OK) {
+        err = run->ndjson_in ? run_records(run, next_ndjson_record)
+                             : run_records(run, next_csv_record);
+    }
+    err = finish_run(run, err);
 
-    /* --summary prints its table after the (empty) row stream, directly to
-     * the output stream: it is the run's only output. */
-    if (tc->config.summary && tc->summary && out_stream) {
+    /* --summary prints its table as the run's only output */
+    if (err == HP_OK && tc->config.summary && tc->summary && out_stream) {
         hp_summary_print(tc->summary, out_stream);
     }
-
-    tc->stats.rows_read += rows_read_local;
-    tc->stats.rows_emitted += rows_emitted_local;
-    tc->stats.rows_dropped += rows_dropped_local;
-    tc->stats.elapsed_seconds = t1 - t0;
-    return finish_err;
+    tc->stats.elapsed_seconds = get_time_sec() - t0;
+    free(run);
+    return err;
 }
