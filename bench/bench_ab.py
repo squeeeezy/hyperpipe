@@ -62,6 +62,8 @@ def main():
     ap.add_argument("-n", type=int, default=5)
     ap.add_argument("-k", "--filter", default="", help="substring of workload names to run")
     ap.add_argument("--args", default="", help="extra arguments for every run, e.g. '--jobs 1'")
+    ap.add_argument("--out-dir", default=None,
+                    help="where outputs go; a RAM disk such as /dev/shm keeps disk writeback out of the timings")
     ap.add_argument("bins", nargs="+")
     a = ap.parse_args()
     extra = a.args.split()
@@ -69,7 +71,7 @@ def main():
     sizes = {a.csv: os.path.getsize(a.csv), a.ndjson: os.path.getsize(a.ndjson)}
     names = [os.path.basename(b) for b in a.bins]
     print(f"{'workload':32}" + "".join(f"{n:>22}" for n in names) + "   speedup  same")
-    tmp = tempfile.mkdtemp(prefix="hpab_")
+    tmp = tempfile.mkdtemp(prefix="hpab_", dir=a.out_dir)
     for label, args in workloads(a.csv, a.ndjson):
         if a.filter and a.filter not in label:
             continue
