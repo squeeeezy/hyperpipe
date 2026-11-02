@@ -14,11 +14,11 @@
  * the exact byte stream of the single-threaded run.
  *
  * Scope (deliberate, see docs/ARCHITECTURE.md 7):
- *   - CSV/TSV input only. NDJSON input and gzip-compressed input fall back
- *     to the single-threaded path (HP_ERR_UNSUPPORTED); NDJSON streams can
- *     grow their schema mid-file, which ordered workers cannot express
- *     without a header rewrite.
+ *   - CSV, TSV and NDJSON input. NDJSON runs lock the schema to the first
+ *     line, the same rule CSV output follows. gzip-compressed input reports
+ *     HP_ERR_UNSUPPORTED so the caller falls back to the single-threaded path.
  *   - The input must be a regular seekable file.
+ *   - Runs on Windows and POSIX (see src/hp_thread.h).
  *   - Memory stays bounded: each worker holds one ring buffer plus at most
  *     a few pages of queued output.
  *   - gzip output with --jobs produces concatenated gzip members, which

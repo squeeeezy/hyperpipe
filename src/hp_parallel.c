@@ -1,21 +1,16 @@
-/* Parallel chunked pipeline (--jobs N). POSIX implementation; on Windows
- * the entry point reports HP_ERR_UNSUPPORTED and callers fall back to the
- * single-threaded transcoder. */
+/* Parallel chunked pipeline (--jobs N). */
 
-/* fopencookie (worker output queues) is a GNU extension: it must be visible
- * before the first standard header is included. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "hyperpipe/hp_parallel.h"
+#include "hp_thread.h"
 
-#if !defined(_WIN32)
-
-#include <pthread.h>
-#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+    #include <io.h>
+#endif
 
 #define HP_JOB_MAX 64
 #define HP_QUEUE_PAGE_SIZE (256 * 1024)
@@ -40,9 +35,9 @@ typedef struct hp_page_node_s {
 } hp_page_node_t;
 
 typedef struct hp_out_queue_s {
-    pthread_mutex_t mu;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
+    hp_mutex_t mu;
+    hp_cond_t not_empty;
+    hp_cond_t not_full;
     hp_page_node_t *head;
     hp_page_node_t *tail;
     size_t bytes;
@@ -52,9 +47,9 @@ typedef struct hp_out_queue_s {
 } hp_out_queue_t;
 
 static void queue_init(hp_out_queue_t *q, size_t max_bytes) {
-    pthread_mutex_init(&q->mu, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-    pthread_cond_init(&q->not_full, NULL);
+    hp_mutex_init(&q->mu);
+    hp_cond_init(&q->not_empty);
+    hp_cond_init(&q->not_full);
     q->head = q->tail = NULL;
     q->bytes = 0;
     q->max_bytes = max_bytes;
@@ -73,93 +68,119 @@ static void queue_destroy(hp_out_queue_t *q) {
         n = next;
     }
     q->head = q->tail = NULL;
-    pthread_mutex_destroy(&q->mu);
-    pthread_cond_destroy(&q->not_empty);
-    pthread_cond_destroy(&q->not_full);
+    hp_mutex_destroy(&q->mu);
+    hp_cond_destroy(&q->not_empty);
+    hp_cond_destroy(&q->not_full);
 }
 
-/* stdio cookie write: splits the producer's page-buffer flushes into queue
- * nodes. A stop request turns into a short write, so stdio flags an error
- * and the worker's run unwinds; bytes delivered before the stop stay valid. */
-static ssize_t queue_write(void *cookie, const char *buf, size_t size) {
-    hp_out_queue_t *q = (hp_out_queue_t *)cookie;
+/* Transcoder output sink: splits the worker's page flushes into queue
+ * nodes. A stop request turns into a short write, which the transcoder
+ * reports as an I/O error so the worker's run unwinds; bytes delivered
+ * before the stop stay valid. */
+static size_t queue_write(void *ctx, const void *data, size_t size) {
+    hp_out_queue_t *q = (hp_out_queue_t *)ctx;
+    const uint8_t *buf = (const uint8_t *)data;
     size_t off = 0;
 
     while (off < size) {
-        pthread_mutex_lock(&q->mu);
+        hp_mutex_lock(&q->mu);
         while (q->bytes >= q->max_bytes && !q->stop) {
-            pthread_cond_wait(&q->not_full, &q->mu);
+            hp_cond_wait(&q->not_full, &q->mu);
         }
         bool stop = q->stop;
-        pthread_mutex_unlock(&q->mu);
+        hp_mutex_unlock(&q->mu);
         if (stop) {
-            return (ssize_t)off;
+            return off;
         }
 
         size_t take = size - off;
         if (take > HP_QUEUE_PAGE_SIZE) take = HP_QUEUE_PAGE_SIZE;
 
         hp_page_node_t *node = (hp_page_node_t *)malloc(sizeof(*node));
-        if (!node) return (ssize_t)off;
+        if (!node) return off;
         node->data = (uint8_t *)malloc(take);
         if (!node->data) {
             free(node);
-            return (ssize_t)off;
+            return off;
         }
         memcpy(node->data, buf + off, take);
         node->len = take;
         node->next = NULL;
 
-        pthread_mutex_lock(&q->mu);
+        hp_mutex_lock(&q->mu);
         if (q->tail) q->tail->next = node;
         else q->head = node;
         q->tail = node;
         q->bytes += take;
-        pthread_mutex_unlock(&q->mu);
-        pthread_cond_signal(&q->not_empty);
+        hp_mutex_unlock(&q->mu);
+        hp_cond_signal(&q->not_empty);
 
         off += take;
     }
-    return (ssize_t)size;
+    return size;
 }
 
 static void queue_producer_done(hp_out_queue_t *q) {
-    pthread_mutex_lock(&q->mu);
+    hp_mutex_lock(&q->mu);
     q->producer_done = true;
-    pthread_mutex_unlock(&q->mu);
-    pthread_cond_signal(&q->not_empty);
+    hp_mutex_unlock(&q->mu);
+    hp_cond_signal(&q->not_empty);
 }
 
 static void queue_request_stop(hp_out_queue_t *q) {
-    pthread_mutex_lock(&q->mu);
+    hp_mutex_lock(&q->mu);
     q->stop = true;
-    pthread_mutex_unlock(&q->mu);
-    pthread_cond_signal(&q->not_full);
-    pthread_cond_signal(&q->not_empty);
+    hp_mutex_unlock(&q->mu);
+    hp_cond_signal(&q->not_full);
+    hp_cond_signal(&q->not_empty);
 }
 
 /* Pops one page, blocking until a page arrives, the producer finishes, or a
  * stop is requested. Returns NULL in the latter two cases. */
 static hp_page_node_t *queue_pop(hp_out_queue_t *q) {
-    pthread_mutex_lock(&q->mu);
+    hp_mutex_lock(&q->mu);
     while (q->head == NULL && !q->producer_done && !q->stop) {
-        pthread_cond_wait(&q->not_empty, &q->mu);
+        hp_cond_wait(&q->not_empty, &q->mu);
     }
     hp_page_node_t *node = q->head;
     if (node) {
         q->head = node->next;
         if (!q->head) q->tail = NULL;
         q->bytes -= node->len;
-        pthread_cond_signal(&q->not_full);
+        hp_cond_signal(&q->not_full);
     }
-    pthread_mutex_unlock(&q->mu);
+    hp_mutex_unlock(&q->mu);
     return node;
+}
+
+/* ---- file access ------------------------------------------------------------ */
+
+/* Size of a regular file; false for pipes, devices and errors. Windows needs
+ * the explicit 64-bit calls: its off_t and long stay 32 bits wide. */
+static bool regular_file_size(FILE *f, uint64_t *size) {
+#if defined(_WIN32)
+    struct _stat64 st;
+    if (_fstat64(_fileno(f), &st) != 0 || (st.st_mode & _S_IFMT) != _S_IFREG) return false;
+#else
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+#endif
+    *size = (uint64_t)st.st_size;
+    return true;
+}
+
+static bool seek_to(FILE *f, uint64_t offset) {
+#if defined(_WIN32)
+    return _fseeki64(f, (__int64)offset, SEEK_SET) == 0;
+#else
+    return fseeko(f, (off_t)offset, SEEK_SET) == 0;
+#endif
 }
 
 /* ---- worker --------------------------------------------------------------- */
 
 typedef struct hp_worker_s {
-    pthread_t thread;
+    hp_thread_t thread;
     const char *input_path;
     uint64_t chunk_start;
     uint64_t chunk_end;
@@ -180,36 +201,24 @@ static void *hp_worker_main(void *arg) {
         queue_producer_done(&w->queue);
         return NULL;
     }
-    if (fseeko(in, (off_t)w->chunk_start, SEEK_SET) != 0) {
+    if (!seek_to(in, w->chunk_start)) {
         fclose(in);
         w->err = HP_ERR_IO;
         queue_producer_done(&w->queue);
         return NULL;
     }
 
-    cookie_io_functions_t io_funcs;
-    memset(&io_funcs, 0, sizeof(io_funcs));
-    io_funcs.write = queue_write;
-    FILE *out = fopencookie(&w->queue, "w", io_funcs);
-    if (!out) {
-        fclose(in);
-        w->err = HP_ERR_NOMEM;
-        queue_producer_done(&w->queue);
-        return NULL;
-    }
-    /* Unbuffered: the transcoder's 256 KiB page buffer already batches the
-     * writes, so stdio buffering would only add a copy. */
-    setvbuf(out, NULL, _IONBF, 0);
+    w->cfg.sink = queue_write;
+    w->cfg.sink_ctx = &w->queue;
 
     hp_transcoder_t tc;
     w->err = hp_transcoder_init(&tc, &w->cfg);
     if (w->err == HP_OK) {
-        w->err = hp_transcoder_run(&tc, in, out);
+        w->err = hp_transcoder_run(&tc, in, NULL);
         w->stats = tc.stats;
         hp_transcoder_free(&tc);
     }
 
-    fclose(out);
     fclose(in);
     queue_producer_done(&w->queue);
     return NULL;
@@ -307,7 +316,7 @@ static hp_error_t hp_plan_chunks(FILE *f, uint64_t file_size, int jobs,
                 bool parity = in_quotes;
                 uint64_t bits = nl_mask | qm_mask;
                 while (bits) {
-                    size_t rel = (size_t)__builtin_ctzll(bits);
+                    size_t rel = (size_t)hp_ctz64(bits);
                     bits &= bits - 1;
                     if (qm_mask & (1ull << rel)) {
                         parity = !parity;
@@ -325,7 +334,7 @@ static hp_error_t hp_plan_chunks(FILE *f, uint64_t file_size, int jobs,
                 /* Common case: no quotes in this chunk and even parity -
                  * every newline ends a record. */
                 while (nl_mask) {
-                    size_t rel = (size_t)__builtin_ctzll(nl_mask);
+                    size_t rel = (size_t)hp_ctz64(nl_mask);
                     nl_mask &= nl_mask - 1;
                     uint64_t line_end = offset + base + rel + 1;
                     if (line_end - last_boundary >= target && n < jobs &&
@@ -353,11 +362,12 @@ static hp_error_t hp_plan_chunks(FILE *f, uint64_t file_size, int jobs,
 static hp_error_t hp_parse_header_span(hp_format_t fmt, const char *span,
                                        size_t len, hp_header_t *out) {
     if (fmt == HP_FORMAT_NDJSON) {
-        hp_row_t probe;              /* scratch: only the key names matter */
-        char arena[4096];
+        static hp_row_t probe;       /* scratch: only the key names matter */
+        char *arena = (char *)malloc(len ? len : 1);
+        if (!arena) return HP_ERR_NOMEM;
         memset(out, 0, sizeof(*out));
-        hp_error_t err = hp_json_parse_line(span, len, out, &probe,
-                                            arena, sizeof(arena));
+        hp_error_t err = hp_json_parse_line(span, len, out, &probe, arena, len);
+        free(arena);
         return (err == HP_OK) ? HP_OK : HP_ERR_UNSUPPORTED;
     }
 
@@ -433,8 +443,8 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
 
     /* Regular file only: chunk planning and worker positioning both need
      * seekable byte offsets. */
-    struct stat st;
-    if (fstat(fileno(probe), &st) != 0 || !S_ISREG(st.st_mode)) {
+    uint64_t file_size = 0;
+    if (!regular_file_size(probe, &file_size)) {
         fclose(probe);
         return HP_ERR_INVALID_ARG;
     }
@@ -456,8 +466,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
         return HP_ERR_UNSUPPORTED;
     }
 
-    uint64_t file_size = (uint64_t)st.st_size;
-    if (fseeko(probe, 0, SEEK_SET) != 0) {
+    if (!seek_to(probe, 0)) {
         fclose(probe);
         return HP_ERR_IO;
     }
@@ -559,8 +568,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
 
     int started = 0;
     for (; setup_err == HP_OK && started < n_chunks; started++) {
-        if (pthread_create(&workers[started].thread, NULL,
-                           hp_worker_main, &workers[started]) != 0) {
+        if (!hp_thread_create(&workers[started].thread, hp_worker_main, &workers[started])) {
             setup_err = HP_ERR_NOMEM;
             break;
         }
@@ -575,7 +583,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
                 queue_request_stop(&workers[i].queue);
             }
             for (int i = 0; i < started; i++) {
-                pthread_join(workers[i].thread, NULL);
+                hp_thread_join(workers[i].thread);
             }
             for (int i = 0; i < n_chunks; i++) {
                 queue_destroy(&workers[i].queue);
@@ -617,7 +625,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
     }
 
     for (int i = 0; i < n_chunks; i++) {
-        pthread_join(workers[i].thread, NULL);
+        hp_thread_join(workers[i].thread);
     }
 
     if (base_cfg->on_error == HP_ON_ERROR_QUARANTINE) {
@@ -648,20 +656,3 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
 
     return run_err;
 }
-
-#else /* _WIN32 */
-
-hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
-                           const char *input_path,
-                           FILE *out_stream,
-                           int jobs,
-                           hp_transcoder_stats_t *stats_out) {
-    (void)base_cfg;
-    (void)input_path;
-    (void)out_stream;
-    (void)jobs;
-    (void)stats_out;
-    return HP_ERR_UNSUPPORTED;
-}
-
-#endif /* !_WIN32 */
