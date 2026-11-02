@@ -18,6 +18,16 @@ static int span_cmp(const char *a, size_t a_len, const char *b, size_t b_len) {
     return 0;
 }
 
+/* Converts an already validated JSON integer of at most 18 characters, so
+ * it always fits int64. Converting the result to double rounds exactly as
+ * strtod would, without the copy and the locale-aware parse. */
+static int64_t span_to_int64(const char *s, size_t len) {
+    size_t i = (s[0] == '-') ? 1 : 0;
+    int64_t v = 0;
+    for (; i < len; i++) v = v * 10 + (s[i] - '0');
+    return s[0] == '-' ? -v : v;
+}
+
 void hp_summary_observe(hp_summary_t *s, const hp_header_t *header,
                         const hp_row_t *row) {
     if (!s || !row) return;
@@ -54,8 +64,21 @@ void hp_summary_observe(hp_summary_t *s, const hp_header_t *header,
         /* String-typed values (quoted sources) never count as numbers:
          * type fidelity outranks convenience, matching the filter engine. */
         if (!f->has_escapes && hp_json_is_number(f->ptr, f->len)) {
+            bool is_int = true;
+            for (size_t k = 0; k < f->len; k++) {
+                char c = f->ptr[k];
+                if (c == '.' || c == 'e' || c == 'E') {
+                    is_int = false;
+                    break;
+                }
+            }
+
             double v = 0.0;
-            hp_json_number_as_double(f->ptr, f->len, &v);
+            if (is_int && f->len <= 18) {
+                v = (double)span_to_int64(f->ptr, f->len);
+            } else {
+                hp_json_number_as_double(f->ptr, f->len, &v);
+            }
             col->num_count++;
             if (!col->has_numeric) {
                 col->min_num = v;
@@ -66,15 +89,6 @@ void hp_summary_observe(hp_summary_t *s, const hp_header_t *header,
                 if (v > col->max_num) col->max_num = v;
             }
             col->sum += v;
-
-            bool is_int = true;
-            for (size_t k = 0; k < f->len; k++) {
-                char c = f->ptr[k];
-                if (c == '.' || c == 'e' || c == 'E') {
-                    is_int = false;
-                    break;
-                }
-            }
             if (is_int) col->int_count++;
         } else {
             size_t copy_len = f->len < sizeof(col->min_str) - 1
