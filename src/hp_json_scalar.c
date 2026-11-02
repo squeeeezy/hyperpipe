@@ -157,49 +157,38 @@ hp_error_t hp_json_ser_write_string(hp_json_ser_t *ser, const char *str, size_t 
     return HP_OK;
 }
 
-bool hp_json_is_number(const char *s, size_t len) {
-    if (len == 0) return false;
-    /* Cheap pre-filter: a JSON number can only start with a digit or '-'
-     * (a leading '.' is invalid JSON). One byte-sized test rejects the vast
-     * majority of string fields before the full grammar check below. */
-    uint8_t c0 = (uint8_t)s[0];
-    if ((c0 < '0' || c0 > '9') && c0 != '-') return false;
+/* Length of the JSON number (RFC 8259 section 6) that starts at s, or 0
+ * when s does not start with one. Stops at the first byte that cannot
+ * continue the number, so callers check what follows. */
+HP_INLINE size_t json_number_span(const char *s, size_t len) {
     size_t i = 0;
-    if (s[0] == '-') i++;
-    if (i >= len) return false;
-
-    /* Fast path for unsigned and signed integers */
-    size_t digits_start = i;
-    while (i < len && (uint8_t)(s[i] - '0') <= 9) i++;
-    if (i == len && i > digits_start) {
-        if (s[digits_start] == '0' && (len - digits_start) > 1) return false;
-        return true;
-    }
-
-    /* Reset and check full floating-point specification */
-    i = (s[0] == '-') ? 1 : 0;
+    if (i < len && s[i] == '-') i++;
+    if (i >= len) return 0;
     if (s[i] == '0') {
         i++;
-    } else if (s[i] >= '1' && s[i] <= '9') {
-        while (i < len && (s[i] >= '0' && s[i] <= '9')) i++;
+    } else if ((uint8_t)(s[i] - '1') <= 8) {
+        while (i < len && (uint8_t)(s[i] - '0') <= 9) i++;
     } else {
-        return false;
+        return 0;
     }
-
     if (i < len && s[i] == '.') {
         i++;
-        if (i >= len || !(s[i] >= '0' && s[i] <= '9')) return false;
-        while (i < len && (s[i] >= '0' && s[i] <= '9')) i++;
+        if (i >= len || (uint8_t)(s[i] - '0') > 9) return 0;
+        while (i < len && (uint8_t)(s[i] - '0') <= 9) i++;
     }
-
     if (i < len && (s[i] == 'e' || s[i] == 'E')) {
         i++;
         if (i < len && (s[i] == '+' || s[i] == '-')) i++;
-        if (i >= len || !(s[i] >= '0' && s[i] <= '9')) return false;
-        while (i < len && (s[i] >= '0' && s[i] <= '9')) i++;
+        if (i >= len || (uint8_t)(s[i] - '0') > 9) return 0;
+        while (i < len && (uint8_t)(s[i] - '0') <= 9) i++;
     }
+    return i;
+}
 
-    return i == len;
+bool hp_json_is_number(const char *s, size_t len) {
+    /* Most cells are not numbers: the first byte rejects them cheaply */
+    if (len == 0 || ((uint8_t)(s[0] - '0') > 9 && s[0] != '-')) return false;
+    return json_number_span(s, len) == len;
 }
 
 /* Converts a numeric span to double. The span is copied into a bounded stack
@@ -404,6 +393,49 @@ static inline bool json_is_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
+/* A scalar value that is not a string: a number or true, false, null.
+ * Objects and arrays are not supported as values. */
+static inline bool json_literal_ok(const char *p, size_t len) {
+    switch (len ? p[0] : 0) {
+        case 't': return len == 4 && memcmp(p, "true", 4) == 0;
+        case 'f': return len == 5 && memcmp(p, "false", 5) == 0;
+        case 'n': return len == 4 && memcmp(p, "null", 4) == 0;
+        default:  return hp_json_is_number(p, len);
+    }
+}
+
+/* Length of the escape sequence starting at the backslash p[0]: 2, or 6
+ * for \uXXXX; 0 when it is not one of the escapes RFC 8259 defines. */
+static size_t json_escape_len(const char *p, size_t avail) {
+    if (avail < 2) return 0;
+    switch (p[1]) {
+        case '"': case '\\': case '/': case 'b': case 'f': case 'n': case 'r': case 't':
+            return 2;
+        case 'u':
+            return (avail >= 6 && json_hex4(p + 2) >= 0) ? 6 : 0;
+        default:
+            return 0;
+    }
+}
+
+/* The character a two-byte escape stands for (\" \\ \/ map to themselves) */
+static inline char json_unescape(char esc) {
+    switch (esc) {
+        case 'n': return '\n';
+        case 'r': return '\r';
+        case 't': return '\t';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        default:  return esc;
+    }
+}
+
+/* Whether only whitespace follows position pos */
+static inline bool json_rest_is_space(const char *line, size_t pos, size_t len) {
+    while (pos < len && json_is_space(line[pos])) pos++;
+    return pos == len;
+}
+
 /* Hybrid span scanners: SIMD for spans of 32+ bytes, an inline scalar walk
  * for the short keys and values that dominate real NDJSON. Both paths return
  * identical results; the threshold only avoids call overhead on short spans. */
@@ -488,21 +520,24 @@ static long struct_next_quote(hp_struct_scan_t *s, size_t from) {
     }
 }
 
-/* Walks one escape-free line. Returns true when the line matched the
- * structural shape and all fields are assigned; false means "fall back". */
+/* Walks one escape-free line from just past its opening brace. Returns
+ * true when the whole line is a well-formed object of known keys and all
+ * fields are assigned; false means "fall back", and the general path then
+ * either parses the line or reports the error. */
 static bool struct_walk(hp_struct_scan_t *s,
+                        size_t pos,
                         hp_header_t *header,
                         hp_keymap_t *keymap,
                         hp_row_t *out_row) {
     const char *line = s->line;
     const size_t len = s->len;
-    size_t pos = 1; /* the caller verified line[0] == '{' */
+
+    while (pos < len && json_is_space(line[pos])) pos++;
+    if (pos < len && line[pos] == '}') return json_rest_is_space(line, pos + 1, len);
 
     for (;;) {
         while (pos < len && json_is_space(line[pos])) pos++;
-        if (pos >= len) return false;
-        if (line[pos] == '}') return true;
-        if (line[pos] != '"') return false;
+        if (pos >= len || line[pos] != '"') return false;
 
         long q0 = struct_next_quote(s, pos);
         if (q0 < 0 || (size_t)q0 != pos) return false;
@@ -531,21 +566,31 @@ static bool struct_walk(hp_struct_scan_t *s,
             val_is_string = true;
             p = (size_t)qv + 1;
         } else {
-            /* literal: numbers and true/false/null are short; the scalar
-             * terminator scan costs less than a vector round trip */
+            /* Literal: a number is parsed by its grammar in one pass, the
+             * words by a compare; either must end at a structural byte. */
             size_t vstart = p;
-            while (p < len && line[p] != ',' && line[p] != '}' &&
-                   !json_is_space(line[p])) {
-                p++;
+            char c = line[p];
+            if (c == 't' && len - p >= 4 && memcmp(line + p, "true", 4) == 0) {
+                p += 4;
+            } else if (c == 'f' && len - p >= 5 && memcmp(line + p, "false", 5) == 0) {
+                p += 5;
+            } else if (c == 'n' && len - p >= 4 && memcmp(line + p, "null", 4) == 0) {
+                p += 4;
+            } else {
+                size_t n = json_number_span(line + p, len - p);
+                if (n == 0) return false;
+                p += n;
             }
+            if (p < len && line[p] != ',' && line[p] != '}' && !json_is_space(line[p])) return false;
             val_ptr = line + vstart;
             val_len = p - vstart;
         }
 
         /* Resolve by key. Unknown keys grow the header, which is
-         * general-path work, so they fall back. */
+         * general-path work, so they fall back. The line lives in the
+         * SIMD-padded ring buffer, so the 8-byte key load is safe. */
         int64_t hit = hp_keymap_find(keymap, header, line + q0 + 1,
-                                     key_len, false);
+                                     key_len, true);
         if (hit < 0) return false;
         size_t idx = (size_t)hit;
 
@@ -557,7 +602,7 @@ static bool struct_walk(hp_struct_scan_t *s,
 
         while (p < len && json_is_space(line[p])) p++;
         if (p >= len) return false;
-        if (line[p] == '}') return true;
+        if (line[p] == '}') return json_rest_is_space(line, p + 1, len);
         if (line[p] != ',') return false;
         pos = p + 1;
     }
@@ -597,7 +642,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
     const uint8_t *u = (const uint8_t *)line;
 
     size_t pos = j_scan_ws(scan_ws, line, len);
-    if (pos >= len || line[pos] != '{') return HP_ERR_PARSE_QUOTE;
+    if (pos >= len || line[pos] != '{') return HP_ERR_PARSE_JSON;
     pos++;
 
     size_t arena_pos = 0;
@@ -628,7 +673,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         ss.c_len = 0;
         ss.qm = 0;
         ss.bm = 0;
-        if (struct_walk(&ss, header, keymap, out_row)) {
+        if (struct_walk(&ss, pos, header, keymap, out_row)) {
             return HP_OK;
         }
         /* Re-run the slot reset: the walker may have assigned fields before
@@ -642,23 +687,26 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         out_row->field_count = header->count;
     }
 
-    while (pos < len) {
-        pos += j_scan_ws(scan_ws, line + pos, len - pos);
-        if (pos < len && line[pos] == '}') break;
+    /* RFC 8259 object: '{' [member *(',' member)] '}', then only whitespace */
+    pos += j_scan_ws(scan_ws, line + pos, len - pos);
+    bool empty = (pos < len && line[pos] == '}');
+    if (empty) pos++;
 
-        /* ---- key: raw span scan; escapes are skipped, never decoded ---- */
-        if (pos >= len || line[pos] != '"') return HP_ERR_PARSE_QUOTE;
+    while (!empty) {
+        pos += j_scan_ws(scan_ws, line + pos, len - pos);
+
+        /* ---- key: raw span scan; escapes are validated, never decoded ---- */
+        if (pos >= len || line[pos] != '"') return HP_ERR_PARSE_JSON;
         pos++;
         size_t key_start = pos;
-        while (pos < len) {
+        for (;;) {
             pos += j_scan_str(scan_str, line + pos, len - pos);
-            if (pos >= len) return HP_ERR_PARSE_QUOTE; /* unterminated key */
+            if (pos >= len) return HP_ERR_PARSE_JSON; /* unterminated key */
             if (line[pos] == '"') break;
-            /* backslash: the escape pair (and its quote) stays inside the
-             * key; a trailing lone backslash terminates the line */
-            pos += (pos + 1 < len) ? 2 : 1;
+            size_t esc = json_escape_len(line + pos, len - pos);
+            if (esc == 0) return HP_ERR_PARSE_JSON;
+            pos += esc;
         }
-        if (pos >= len) return HP_ERR_PARSE_QUOTE;
         size_t key_len = pos - key_start;
         pos++; /* closing quote */
 
@@ -669,7 +717,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         if (key_cmp_len >= sizeof(key_buf)) key_cmp_len = sizeof(key_buf) - 1;
 
         pos += j_scan_ws(scan_ws, line + pos, len - pos);
-        if (pos >= len || line[pos] != ':') return HP_ERR_PARSE_QUOTE;
+        if (pos >= len || line[pos] != ':') return HP_ERR_PARSE_JSON;
         pos++; /* skip ':' */
         pos += j_scan_ws(scan_ws, line + pos, len - pos);
 
@@ -738,19 +786,14 @@ hp_error_t hp_json_parse_line_ex(const char *line,
              * string is zero-copy; anything containing a backslash decodes
              * into the arena below. */
             size_t stop = vbegin + j_scan_str(scan_str, line + vbegin, len - vbegin);
-            if (stop < len && u[stop] == '"') {
+            if (stop >= len) return HP_ERR_PARSE_JSON; /* unterminated string */
+            if (u[stop] == '"') {
                 val_ptr = line + vbegin;
                 val_len = stop - vbegin;
                 pos = stop + 1;
-            } else if (stop >= len) {
-                /* Unterminated, escape-free tail: the raw rest is the value
-                 * (bit-identical to the previous byte-wise decoder). */
-                val_ptr = line + vbegin;
-                val_len = len - vbegin;
-                pos = len;
             } else {
                 /* Escaped string: copy the clean prefix, then decode the
-                 * remainder through the exact same rules as before. */
+                 * rest into the arena. */
                 size_t prefix = stop - vbegin;
                 if (prefix > arena_size - arena_pos) return HP_ERR_BUFFER_OVERFLOW;
                 memcpy(value_arena + arena_pos, line + vbegin, prefix);
@@ -758,51 +801,43 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                 pos = stop;
 
                 while (pos < len && line[pos] != '"') {
-                    if (line[pos] == '\\' && pos + 1 < len) {
-                        char esc = line[pos + 1];
-                        if (esc == 'u') {
-                            int hi = (pos + 5 < len) ? json_hex4(line + pos + 2) : -1;
-                            if (hi >= 0) {
-                                unsigned cp = (unsigned)hi;
-                                pos += 6;
-                                if (cp >= 0xD800 && cp <= 0xDBFF &&
-                                    pos + 1 < len && line[pos] == '\\' && line[pos + 1] == 'u') {
-                                    int lo = (pos + 5 < len) ? json_hex4(line + pos + 2) : -1;
-                                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                                        cp = 0x10000u + ((cp - 0xD800u) << 10) + (unsigned)(lo - 0xDC00);
-                                        pos += 6;
-                                    } else {
-                                        cp = 0xFFFDu; /* lone high surrogate */
-                                    }
-                                } else if (cp >= 0xD800 && cp <= 0xDFFF) {
-                                    cp = 0xFFFDu; /* lone surrogate */
-                                }
-                                size_t n = json_utf8_encode(value_arena + arena_pos,
-                                                            arena_size - arena_pos, cp);
-                                if (n == 0) return HP_ERR_BUFFER_OVERFLOW;
-                                arena_pos += n;
-                                continue;
-                            }
-                            /* invalid \u sequence -> fall through, lenient */
-                        }
-                        char unescaped = esc;
-                        if (esc == 'n') unescaped = '\n';
-                        else if (esc == 'r') unescaped = '\r';
-                        else if (esc == 't') unescaped = '\t';
-                        else if (esc == 'b') unescaped = '\b';
-                        else if (esc == 'f') unescaped = '\f';
-                        else if (esc == '"') unescaped = '"';
-                        else if (esc == '\\') unescaped = '\\';
+                    if (line[pos] != '\\') {
                         if (arena_pos == arena_size) return HP_ERR_BUFFER_OVERFLOW;
-                        value_arena[arena_pos++] = unescaped;
-                        pos += 2;
-                    } else {
-                        if (arena_pos == arena_size) return HP_ERR_BUFFER_OVERFLOW;
-                        value_arena[arena_pos++] = line[pos];
-                        pos++;
+                        value_arena[arena_pos++] = line[pos++];
+                        continue;
                     }
+                    size_t esc_len = json_escape_len(line + pos, len - pos);
+                    if (esc_len == 0) return HP_ERR_PARSE_JSON;
+                    if (esc_len == 2) {
+                        if (arena_pos == arena_size) return HP_ERR_BUFFER_OVERFLOW;
+                        value_arena[arena_pos++] = json_unescape(line[pos + 1]);
+                        pos += 2;
+                        continue;
+                    }
+
+                    /* \uXXXX: a surrogate pair combines into one code point,
+                     * a lone surrogate becomes U+FFFD */
+                    unsigned cp = (unsigned)json_hex4(line + pos + 2);
+                    pos += 6;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        int lo = (len - pos >= 6 && line[pos] == '\\' && line[pos + 1] == 'u')
+                                     ? json_hex4(line + pos + 2) : -1;
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000u + ((cp - 0xD800u) << 10) + (unsigned)(lo - 0xDC00);
+                            pos += 6;
+                        } else {
+                            cp = 0xFFFDu;
+                        }
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        cp = 0xFFFDu;
+                    }
+                    size_t n = json_utf8_encode(value_arena + arena_pos,
+                                                arena_size - arena_pos, cp);
+                    if (n == 0) return HP_ERR_BUFFER_OVERFLOW;
+                    arena_pos += n;
                 }
-                if (pos < len && line[pos] == '"') pos++;
+                if (pos >= len) return HP_ERR_PARSE_JSON; /* unterminated string */
+                pos++;
 
                 val_ptr = value_arena + val_start_arena;
                 val_len = arena_pos - val_start_arena;
@@ -813,6 +848,7 @@ hp_error_t hp_json_parse_line_ex(const char *line,
             pos += j_scan_lit(scan_lit, line + pos, len - pos);
             val_ptr = line + lit_start;
             val_len = pos - lit_start;
+            if (!json_literal_ok(val_ptr, val_len)) return HP_ERR_PARSE_JSON;
         }
 
         if (idx < HP_MAX_COLUMNS) {
@@ -824,11 +860,16 @@ hp_error_t hp_json_parse_line_ex(const char *line,
         }
 
         pos += j_scan_ws(scan_ws, line + pos, len - pos);
-        if (pos < len && line[pos] == ',') {
+        if (pos >= len) return HP_ERR_PARSE_JSON;
+        if (line[pos] == '}') {
             pos++;
+            break;
         }
+        if (line[pos] != ',') return HP_ERR_PARSE_JSON;
+        pos++;
     }
 
+    if (!json_rest_is_space(line, pos, len)) return HP_ERR_PARSE_JSON;
     return HP_OK;
 }
 

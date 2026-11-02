@@ -276,6 +276,66 @@ static void test_gzip_output_covers_oversized_records(void) {
     free(csv);
 }
 
+/* Each malformed NDJSON line must be rejected: as an error in the default
+ * fail mode, as one dropped row in skip mode. The long form puts a known
+ * key first so the line also takes the SIMD structural path. */
+static void test_malformed_ndjson_is_rejected(void) {
+    static const char *const bad[] = {
+        "{\"id\":5,\"v\":",          /* truncated inside the value */
+        "{\"id\":5",                 /* no closing brace */
+        "{\"id\":5,\"v\":\"x\"}}",   /* text after the object */
+        "{\"id\":5,\"v\":\"x\"} x",
+        "{\"id\":5 \"v\":1}",        /* missing comma */
+        "{\"id\":5,}",               /* trailing comma */
+        "{,\"id\":5}",
+        "{\"id\":}",                 /* missing value */
+        "{\"id\"5}",                 /* missing colon */
+        "{\"id\":abc}",              /* not a literal */
+        "{\"id\":tru}",
+        "{\"id\":01}",               /* leading zero */
+        "{\"id\":1.}",
+        "{\"id\":\"x}",              /* unterminated strings */
+        "{\"id\":\"x\\",
+        "{\"id\":\"a\\qb\"}",        /* invalid escapes */
+        "{\"id\":\"\\u12\"}",
+    };
+    const char *pad = "\"p\":\"pppppppppppppppppppppppppppppppppppppppp\",";
+    const char *first = "{\"p\":\"pppppppppppppppppppppppppppppppppppppppp\",\"id\":0,\"v\":\"a\"}\n";
+    const char *last = "{\"id\":9,\"v\":\"z\"}\n";
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (int longer = 0; longer < 2; longer++) {
+            char line[256], doc[512];
+            if (longer) snprintf(line, sizeof(line), "{%s%s", pad, bad[i] + 1);
+            else        snprintf(line, sizeof(line), "%s", bad[i]);
+            snprintf(doc, sizeof(doc), "%s%s\n%s", first, line, last);
+
+            run_result_t r = run_pipeline(doc, NULL, NULL, HP_FORMAT_CSV);
+            if (r.err == HP_OK) fprintf(stderr, "accepted: %s\n", line);
+            CHECK(r.err == HP_ERR_PARSE_JSON);
+
+            hp_transcoder_config_t cfg = { .out_format = HP_FORMAT_CSV,
+                                           .on_error = HP_ON_ERROR_SKIP };
+            r = run_config(doc, &cfg);
+            CHECK(r.err == HP_OK && r.rows_emitted == 2);
+        }
+    }
+}
+
+/* Valid JSON spellings that a strict parser must keep accepting */
+static void test_valid_ndjson_edge_cases(void) {
+    const char *doc =
+        "{\"a\":1,\"b\":\"x\"}\n"
+        "  { \"a\" : -0.5e10 , \"b\" : \"y\" }  \n"
+        "{}\n"
+        "{\"b\":null,\"a\":true}\n"
+        "{\"a\":false,\"b\":\"\\u00e9\\n\\/\"}\n"
+        "{\"a\":0,\"b\":\"\"}\r\n";
+    run_result_t r = run_pipeline(doc, NULL, NULL, HP_FORMAT_CSV);
+    CHECK(r.err == HP_OK && r.rows_emitted == 6);
+    CHECK(strcmp(r.out, "a,b\n1,x\n-0.5e10,y\n,\ntrue,null\nfalse,\"\xc3\xa9\n/\"\n0,\"\"\n") == 0);
+}
+
 int main(void) {
     TAP_RUN(test_single_equality_is_numeric);
     TAP_RUN(test_numeric_compare_needs_whole_field);
@@ -289,5 +349,7 @@ int main(void) {
     TAP_RUN(test_tsv_to_csv_quotes_commas);
     TAP_RUN(test_quoting_detects_special_at_any_offset);
     TAP_RUN(test_gzip_output_covers_oversized_records);
+    TAP_RUN(test_valid_ndjson_edge_cases);
+    TAP_RUN(test_malformed_ndjson_is_rejected);
     return tap_done();
 }
