@@ -231,6 +231,51 @@ static void test_quoting_detects_special_at_any_offset(void) {
     }
 }
 
+/* A record larger than the output page bypassed the compressor and went
+ * into a --gzip stream raw. Compress one such record, read it back through
+ * the transparent gunzip input and compare every byte. */
+static void test_gzip_output_covers_oversized_records(void) {
+    const size_t field_len = 300 * 1024;
+    char *csv = malloc(field_len + 16);
+    CHECK(csv);
+    memcpy(csv, "a,b\n", 4);
+    memset(csv + 4, 'x', field_len);
+    strcpy(csv + 4 + field_len, ",1\n");
+
+    FILE *in = tmpfile(), *packed = tmpfile(), *plain = tmpfile();
+    CHECK(in && packed && plain);
+    fputs(csv, in);
+    rewind(in);
+
+    hp_transcoder_config_t cfg = { .out_format = HP_FORMAT_CSV, .gzip_out = true };
+    hp_transcoder_t tc;
+    CHECK(hp_transcoder_init(&tc, &cfg) == HP_OK);
+    hp_error_t err = hp_transcoder_run(&tc, in, packed);
+    hp_transcoder_free(&tc);
+    if (err == HP_ERR_GZIP_UNAVAILABLE) {
+        printf("# zlib not available, gzip round trip not exercised\n");
+    } else {
+        CHECK(err == HP_OK);
+        rewind(packed);
+        hp_transcoder_config_t back = { .out_format = HP_FORMAT_CSV };
+        CHECK(hp_transcoder_init(&tc, &back) == HP_OK);
+        CHECK(hp_transcoder_run(&tc, packed, plain) == HP_OK);
+        hp_transcoder_free(&tc);
+
+        size_t total = strlen(csv);
+        char *got = malloc(total + 1);
+        CHECK(got);
+        rewind(plain);
+        CHECK(fread(got, 1, total + 1, plain) == total);
+        CHECK(memcmp(got, csv, total) == 0);
+        free(got);
+    }
+    fclose(in);
+    fclose(packed);
+    fclose(plain);
+    free(csv);
+}
+
 int main(void) {
     TAP_RUN(test_single_equality_is_numeric);
     TAP_RUN(test_numeric_compare_needs_whole_field);
@@ -243,5 +288,6 @@ int main(void) {
     TAP_RUN(test_long_escaped_values);
     TAP_RUN(test_tsv_to_csv_quotes_commas);
     TAP_RUN(test_quoting_detects_special_at_any_offset);
+    TAP_RUN(test_gzip_output_covers_oversized_records);
     return tap_done();
 }

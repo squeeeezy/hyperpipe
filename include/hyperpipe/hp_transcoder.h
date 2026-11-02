@@ -29,6 +29,11 @@ typedef struct hp_transcoder_config_s {
      * zero/NULL in ordinary single-stream runs. */
     uint64_t span_end;
     const hp_header_t *preset_header;
+    /* Optional output sink. When set, every output page goes to it instead
+     * of out_stream (hp_transcoder_run then accepts out_stream == NULL); it
+     * returns how many bytes it took, and a short count is an I/O error. */
+    size_t (*sink)(void *ctx, const void *data, size_t len);
+    void *sink_ctx;
 } hp_transcoder_config_t;
 
 typedef struct hp_transcoder_stats_s {

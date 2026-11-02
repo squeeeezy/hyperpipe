@@ -23,26 +23,43 @@ typedef struct hp_page_buffer_s {
     size_t cap;
     size_t len;
     FILE *stream;
-    hp_gzip_deflate_t *gz;   /* non-NULL: flush compresses through zlib */
+    size_t (*sink)(void *ctx, const void *data, size_t len); /* replaces stream */
+    void *sink_ctx;
+    hp_gzip_deflate_t *gz;   /* non-NULL: output is compressed through zlib */
     hp_error_t error;        /* first I/O or compression error, if any */
 } hp_page_buffer_t;
 
-HP_INLINE void hp_page_buffer_flush(hp_page_buffer_t *pb) {
-    if (pb && pb->len > 0) {
-        if (pb->gz) {
-            const unsigned char *out = NULL;
-            size_t out_len = 0;
-            hp_error_t err = hp_gzip_deflate_push(pb->gz, pb->data, pb->len, &out, &out_len);
-            if (err != HP_OK) {
-                if (pb->error == HP_OK) pb->error = err;
-            } else if (out_len > 0) {
-                fwrite(out, 1, out_len, pb->stream);
-            }
-        } else {
-            fwrite(pb->data, 1, pb->len, pb->stream);
+/* Delivers bytes that are already in their final (possibly compressed)
+ * form to the sink or the stream. */
+static void hp_page_buffer_send(hp_page_buffer_t *pb, const void *data, size_t len) {
+    if (len == 0) return;
+    size_t n = pb->sink ? pb->sink(pb->sink_ctx, data, len)
+                        : fwrite(data, 1, len, pb->stream);
+    if (n != len && pb->error == HP_OK) pb->error = HP_ERR_IO;
+}
+
+/* Every output byte passes through here, so gzip output also covers the
+ * records too large to be staged in the page. Output stops at the first
+ * error. */
+static void hp_page_buffer_emit(hp_page_buffer_t *pb, const void *data, size_t len) {
+    if (pb->error != HP_OK || len == 0) return;
+    if (pb->gz) {
+        const unsigned char *out = NULL;
+        size_t out_len = 0;
+        hp_error_t err = hp_gzip_deflate_push(pb->gz, data, len, &out, &out_len);
+        if (err != HP_OK) {
+            pb->error = err;
+            return;
         }
-        pb->len = 0;
+        data = out;
+        len = out_len;
     }
+    hp_page_buffer_send(pb, data, len);
+}
+
+HP_INLINE void hp_page_buffer_flush(hp_page_buffer_t *pb) {
+    hp_page_buffer_emit(pb, pb->data, pb->len);
+    pb->len = 0;
 }
 
 /* Flushes any pending bytes and, for gzip output, writes the stream trailer.
@@ -55,11 +72,11 @@ static hp_error_t hp_page_buffer_finish(hp_page_buffer_t *pb) {
         hp_error_t err = hp_gzip_deflate_finish(pb->gz, &out, &out_len);
         if (err != HP_OK) {
             pb->error = err;
-        } else if (out_len > 0) {
-            fwrite(out, 1, out_len, pb->stream);
+        } else {
+            hp_page_buffer_send(pb, out, out_len);
         }
     }
-    if (pb->error == HP_OK && ferror(pb->stream)) {
+    if (pb->error == HP_OK && pb->stream && ferror(pb->stream)) {
         pb->error = HP_ERR_IO;
     }
     return pb->error;
@@ -68,7 +85,7 @@ static hp_error_t hp_page_buffer_finish(hp_page_buffer_t *pb) {
 HP_INLINE void hp_page_buffer_write(hp_page_buffer_t *pb, const void *src, size_t size) {
     if (size >= pb->cap) {
         hp_page_buffer_flush(pb);
-        fwrite(src, 1, size, pb->stream);
+        hp_page_buffer_emit(pb, src, size);
         return;
     }
     if (pb->len + size > pb->cap) {
@@ -500,7 +517,7 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
 }
 
 hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream) {
-    if (!tc || !in_stream || !out_stream) return HP_ERR_INVALID_ARG;
+    if (!tc || !in_stream || (!out_stream && !tc->config.sink)) return HP_ERR_INVALID_ARG;
 
     /* Input reader: plain stdio passthrough, or transparent inflate when the
      * stream turns out to be gzip. hp_reader_init is re-entry safe. */
@@ -514,6 +531,8 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     pb.cap = tc->page_buf_cap;
     pb.len = 0;
     pb.stream = out_stream;
+    pb.sink = tc->config.sink;
+    pb.sink_ctx = tc->config.sink_ctx;
     pb.gz = tc->gz_out;
     pb.error = HP_OK;
 
@@ -1051,7 +1070,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
 
     /* --summary prints its table after the (empty) row stream, directly to
      * the output stream: it is the run's only output. */
-    if (tc->config.summary && tc->summary) {
+    if (tc->config.summary && tc->summary && out_stream) {
         hp_summary_print(tc->summary, out_stream);
     }
 
