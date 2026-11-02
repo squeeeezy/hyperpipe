@@ -4,7 +4,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+    #include <fcntl.h>
+    #include <io.h>
+#endif
+
 #define HP_VERSION "1.5.0"
+
+/* The Windows CRT opens stdin and stdout in text mode: output "\n" becomes
+ * "\r\n" and input stops at the first 0x1A byte, which breaks byte-exact
+ * output and gzip streams on pipes. */
+static void use_binary_stdio(void) {
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+}
+
+static bool file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -69,6 +91,8 @@ static void print_perf_stats(const hp_transcoder_stats_t *st) {
 }
 
 int main(int argc, char **argv) {
+    use_binary_stdio();
+
     const char *input_path = NULL;
     const char *output_path = NULL;
     const char *select_spec = NULL;
@@ -164,14 +188,20 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "Error: unknown SIMD mode: %s\n", argv[i]); return 1; }
         } else if (strcmp(argv[i], "--buffer-size") == 0) {
             if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            buf_cap = (size_t)strtoull(argv[i], NULL, 10);
+            char *end = NULL;
+            unsigned long long n = strtoull(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || n == 0) {
+                fprintf(stderr, "Error: invalid --buffer-size value: %s\n", argv[i]);
+                return 1;
+            }
+            buf_cap = (size_t)n;
         } else if (strcmp(argv[i], "--stats") == 0) {
             show_stats = true;
         } else if (argv[i][0] != '-') {
             /* Positional argument detection: either filename or filter query */
             if (input_path == NULL && (strstr(argv[i], ".csv") || strstr(argv[i], ".tsv") ||
                                        strstr(argv[i], ".json") || strstr(argv[i], ".log") ||
-                                       strstr(argv[i], ".txt") || fopen(argv[i], "r") != NULL)) {
+                                       strstr(argv[i], ".txt") || file_exists(argv[i]))) {
                 input_path = argv[i];
             } else if (where_spec == NULL) {
                 where_spec = argv[i];

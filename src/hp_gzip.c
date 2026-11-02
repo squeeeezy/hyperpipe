@@ -30,6 +30,10 @@ void hp_gzip_load(void) {
     g_zlib_probe_done = true;
 
 #if defined(_WIN32)
+    /* Drop the current directory from the DLL search order first, so a
+     * zlib1.dll planted next to the data being processed is never loaded.
+     * The application directory, system directories and PATH still apply. */
+    SetDllDirectoryA("");
     g_zlib_handle = HP_DLOPEN("zlib1.dll");
 #else
     /* Prefer the versioned soname, fall back to the bare linker name. */
