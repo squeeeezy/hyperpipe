@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, cc: gcc }
+          - { os: ubuntu-24.04, cc: clang }
+          - { os: ubuntu-24.04-arm, cc: gcc }
+          - { os: macos-latest, cc: clang }
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -j4 CC=${{ matrix.cc }}
+      - run: make test CC=${{ matrix.cc }}
+      - run: ./build/hyperpipe --version
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: make mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib
+      - run: make -j4 CC=gcc
+      - run: make test CC=gcc
+      - run: ./build/hyperpipe.exe --version
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: address and undefined
+        run: |
+          SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -g"
+          make -j4 test CFLAGS="-O1 $SAN" LDFLAGS="$SAN"
+      - name: thread
+        run: |
+          make clean
+          setarch $(uname -m) -R make -j4 test CFLAGS="-O1 -fsanitize=thread -g" LDFLAGS="-fsanitize=thread -g"
+      - name: fuzz
+        run: |
+          make clean
+          make fuzz FUZZ_K=200
+
+  cmake:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B out -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build out -j4
+      - run: ctest --test-dir out --output-on-failure

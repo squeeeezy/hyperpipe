@@ -1,5 +1,7 @@
 # HyperPipe
 
+[![ci](https://github.com/squeeeezy/hyperpipe/actions/workflows/ci.yml/badge.svg)](https://github.com/squeeeezy/hyperpipe/actions/workflows/ci.yml)
+
 A streaming filter and converter for CSV, TSV and NDJSON, written in C11.
 It detects the input format, parses with SIMD kernels chosen at run time
 (AVX-512, AVX2 or scalar), spreads large files over all cores, and keeps
