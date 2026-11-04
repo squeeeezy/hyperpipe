@@ -309,6 +309,7 @@ const char *hp_strerror(hp_error_t err) {
         case HP_ERR_GZIP_UNAVAILABLE: return "gzip support needs zlib, which was not found";
         case HP_ERR_UNSUPPORTED:      return "not supported for this input";
         case HP_ERR_PARSE_JSON:       return "malformed JSON";
+        case HP_ERR_FILTER:           return "invalid filter";
         case HP_ERR_GENERIC:          break;
     }
     return "internal error";
@@ -503,6 +504,11 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
     }
 }
 
+static hp_error_t column_not_found(hp_transcoder_t *tc, const char *name) {
+    snprintf(tc->stats.error_column, sizeof(tc->stats.error_column), "%s", name);
+    return HP_ERR_COLUMN_NOT_FOUND;
+}
+
 /* Shared post-header binding: projection, filter, JSON key fragments.
  * Called by the streaming path once the header is known (first row for CSV,
  * first record's schema for NDJSON) and by parallel workers with a preset
@@ -510,6 +516,11 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
 static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
     if (tc->projection.active) {
         hp_error_t err = hp_projection_bind(&tc->projection, &tc->in_header);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) {
+            size_t i = 0;
+            while (tc->projection.col_indices[i] >= 0) i++;
+            return column_not_found(tc, tc->projection.col_names[i]);
+        }
         if (err != HP_OK) return err;
         hp_project_header(&tc->projection, &tc->in_header, &tc->out_header);
     } else {
@@ -521,6 +532,11 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
 
     if (tc->filter.count > 0) {
         hp_error_t err = hp_filter_bind(&tc->filter, &tc->in_header);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) {
+            size_t i = 0;
+            while (tc->filter.preds[i].col_index >= 0) i++;
+            return column_not_found(tc, tc->filter.preds[i].col_name);
+        }
         if (err != HP_OK) return err;
     }
 
@@ -545,6 +561,7 @@ typedef struct hp_run_s {
     uint8_t out_delim;
     bool quote_clean;              /* clean input fields may hold out_delim */
     bool resyncing;                /* drop input up to the next newline */
+    uint64_t skipped;              /* the header row and blank lines */
     uint64_t rows_read;
     uint64_t rows_emitted;
     uint64_t rows_dropped;
@@ -694,7 +711,17 @@ static hp_error_t finish_run(hp_run_t *run, hp_error_t err) {
     tc->stats.rows_read += run->rows_read;
     tc->stats.rows_emitted += run->rows_emitted;
     tc->stats.rows_dropped += run->rows_dropped;
+    tc->stats.records_in += run->rows_read + run->rows_dropped + run->skipped;
     return err;
+}
+
+/* Notes the record at rec as the one the run stops on */
+static void mark_error_record(hp_run_t *run, const uint8_t *rec) {
+    hp_transcoder_t *tc = run->tc;
+    const hp_sliding_buffer_t *ring = &tc->ring_buf;
+    size_t buffered_from_rec = ring->tail - (size_t)(rec - ring->data);
+    tc->stats.error_record = run->rows_read + run->rows_dropped + run->skipped + 1;
+    tc->stats.error_offset = tc->stats.bytes_in - buffered_from_rec;
 }
 
 typedef hp_error_t (*hp_next_record_fn)(hp_run_t *, const uint8_t *, size_t, bool, size_t *, size_t *);
@@ -727,11 +754,13 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
         while (available > 0 && !done) {
             size_t consumed = 0, raw_len = 0;
             if (run->resyncing) {
+                /* The rest of a record already counted as dropped */
                 consumed = line_span(src, available);
                 run->resyncing = src[consumed - 1] != '\n';
                 quarantine_write(tc, src, consumed);
             } else if ((err = next_record(run, src, available, is_eof, &consumed, &raw_len)) != HP_OK) {
                 if (!skip_errors) {
+                    mark_error_record(run, src);
                     ring->head = (size_t)(src - ring->data);
                     return err;
                 }
@@ -748,6 +777,7 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
                         return err;
                     }
                     is_data = run->ndjson_in;   /* a CSV header row is not data */
+                    run->skipped += !is_data;
                 }
                 if (is_data) {
                     if (run->ndjson_in) follow_schema_growth(run);
@@ -758,6 +788,8 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
                         return err;
                     }
                 }
+            } else {
+                run->skipped++;
             }
             progress = true;
             src += consumed;
@@ -781,6 +813,7 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
             run->resyncing = true;
             continue;
         }
+        if (err == HP_ERR_BUFFER_OVERFLOW) mark_error_record(run, src);
         if (err != HP_OK) return err;
         tc->stats.bytes_in += bytes_read;
     }

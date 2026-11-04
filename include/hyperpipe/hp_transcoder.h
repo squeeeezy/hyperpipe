@@ -45,9 +45,16 @@ typedef struct hp_transcoder_stats_s {
     uint64_t rows_read;
     uint64_t rows_emitted;
     uint64_t rows_dropped;
+    uint64_t records_in;      /* input records, header and blank lines included */
     uint64_t bytes_in;
     uint64_t bytes_out;
     double elapsed_seconds;
+    /* Where a failed run stopped: the 1-based number of the bad record and
+     * the offset of its first byte in the decompressed input, or 0 when the
+     * error has no position; the column name of HP_ERR_COLUMN_NOT_FOUND. */
+    uint64_t error_record;
+    uint64_t error_offset;
+    char error_column[128];
 } hp_transcoder_stats_t;
 
 typedef struct hp_transcoder_s {

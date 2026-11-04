@@ -89,25 +89,38 @@ static int64_t hp_resolve_column(const hp_header_t *header, const char *ref) {
     return -1;
 }
 
+static const char *skip_space(const char *p) {
+    while (*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+/* Comma-separated column names; spaces around a name are dropped, spaces
+ * inside it are kept */
 hp_error_t hp_projection_init(hp_projection_t *proj, const char *spec) {
     if (!proj) return HP_ERR_INVALID_ARG;
     memset(proj, 0, sizeof(*proj));
-    if (!spec || *spec == '\0') return HP_OK;
+    if (!spec) return HP_OK;
 
     const char *p = spec;
-    while (*p && proj->count < HP_MAX_COLUMNS) {
-        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-        if (!*p) break;
-
+    for (;;) {
+        p = skip_space(p);
         const char *start = p;
-        while (*p && *p != ',' && !isspace((unsigned char)*p)) p++;
-        size_t len = p - start;
-        if (len >= sizeof(proj->col_names[0])) len = sizeof(proj->col_names[0]) - 1;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+        size_t len = (size_t)(end - start);
 
-        memcpy(proj->col_names[proj->count], start, len);
-        proj->col_names[proj->count][len] = '\0';
-        proj->col_indices[proj->count] = -1;
-        proj->count++;
+        if (len > 0) {
+            if (proj->count == HP_MAX_COLUMNS || len >= sizeof(proj->col_names[0])) {
+                return HP_ERR_INVALID_ARG;
+            }
+            memcpy(proj->col_names[proj->count], start, len);
+            proj->col_names[proj->count][len] = '\0';
+            proj->col_indices[proj->count] = -1;
+            proj->count++;
+        }
+        if (!*p) break;
+        p++;
     }
 
     proj->active = (proj->count > 0);
@@ -167,135 +180,146 @@ hp_error_t hp_project_header(const hp_projection_t *proj, const hp_header_t *src
     return HP_OK;
 }
 
-hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
-    if (!filter) return HP_ERR_INVALID_ARG;
-    memset(filter, 0, sizeof(*filter));
-    if (!where_clause || *where_clause == '\0') return HP_OK;
+/* A word such as "and" or "contains", followed by a space or the end */
+static bool at_word(const char *p, const char *word, bool any_case) {
+    size_t n = strlen(word);
+    for (size_t i = 0; i < n; i++) {
+        char c = any_case ? (char)tolower((unsigned char)p[i]) : p[i];
+        if (c != word[i]) return false;
+    }
+    return p[n] == '\0' || isspace((unsigned char)p[n]);
+}
 
-    const char *p = where_clause;
-    uint16_t cur_group = 0;
-    while (*p && filter->count < HP_MAX_PREDICATES) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
+static hp_error_t filter_error(hp_filter_t *filter, const char *clause, const char *at,
+                               const char *why) {
+    filter->error = why;
+    filter->error_at = (size_t)(at - clause);
+    return HP_ERR_FILTER;
+}
 
-        const char *col_start = p;
-        while (*p && !isspace((unsigned char)*p) && *p != '=' && *p != '!' && *p != '<' && *p != '>') p++;
-        size_t col_len = p - col_start;
-        if (col_len == 0) break;
+static const struct {
+    const char *text;
+    hp_pred_op_t op;
+    bool word;
+} filter_ops[] = {
+    { "==", HP_OP_EQ, false },   { "!=", HP_OP_NEQ, false },
+    { "<=", HP_OP_LTE, false },  { ">=", HP_OP_GTE, false },
+    { "<", HP_OP_LT, false },    { ">", HP_OP_GT, false },
+    { "=", HP_OP_EQ, false },
+    { "contains", HP_OP_CONTAINS, true },
+    { "startswith", HP_OP_STARTSWITH, true },
+    { "endswith", HP_OP_ENDSWITH, true },
+};
 
-        hp_predicate_t *pred = &filter->preds[filter->count];
-        if (col_len >= sizeof(pred->col_name)) col_len = sizeof(pred->col_name) - 1;
-        memcpy(pred->col_name, col_start, col_len);
-        pred->col_name[col_len] = '\0';
-        pred->col_index = -1;
-        pred->or_group = cur_group;
+/* One "column operator value" condition at *pp */
+static hp_error_t parse_predicate(hp_filter_t *filter, const char *clause, const char **pp,
+                                  hp_predicate_t *pred) {
+    const char *p = *pp;
 
-        while (*p && isspace((unsigned char)*p)) p++;
+    const char *name = p;
+    while (*p && !isspace((unsigned char)*p) && !strchr("=!<>", *p)) p++;
+    size_t name_len = (size_t)(p - name);
+    if (name_len == 0) return filter_error(filter, clause, name, "expected a column name");
+    if (name_len >= sizeof(pred->col_name)) {
+        return filter_error(filter, clause, name, "column name longer than 127 bytes");
+    }
+    memcpy(pred->col_name, name, name_len);
+    pred->col_name[name_len] = '\0';
 
-        if (strncmp(p, "==", 2) == 0) {
-            pred->op = HP_OP_EQ;
-            p += 2;
-        } else if (strncmp(p, "!=", 2) == 0) {
-            pred->op = HP_OP_NEQ;
-            p += 2;
-        } else if (strncmp(p, "<=", 2) == 0) {
-            pred->op = HP_OP_LTE;
-            p += 2;
-        } else if (strncmp(p, ">=", 2) == 0) {
-            pred->op = HP_OP_GTE;
-            p += 2;
-        } else if (strncmp(p, "contains", 8) == 0 && (p[8] == '\0' || isspace((unsigned char)p[8]))) {
-            pred->op = HP_OP_CONTAINS;
-            p += 8;
-        } else if (strncmp(p, "startswith", 10) == 0 && (p[10] == '\0' || isspace((unsigned char)p[10]))) {
-            pred->op = HP_OP_STARTSWITH;
-            p += 10;
-        } else if (strncmp(p, "endswith", 8) == 0 && (p[8] == '\0' || isspace((unsigned char)p[8]))) {
-            pred->op = HP_OP_ENDSWITH;
-            p += 8;
-        } else if (*p == '<') {
-            pred->op = HP_OP_LT;
-            p += 1;
-        } else if (*p == '>') {
-            pred->op = HP_OP_GT;
-            p += 1;
-        } else if (*p == '=') {
-            pred->op = HP_OP_EQ;
-            p += 1;
+    p = skip_space(p);
+    size_t k = 0, n_ops = sizeof(filter_ops) / sizeof(filter_ops[0]);
+    while (k < n_ops && !(filter_ops[k].word ? at_word(p, filter_ops[k].text, false)
+                                             : strncmp(p, filter_ops[k].text, strlen(filter_ops[k].text)) == 0)) {
+        k++;
+    }
+    if (k == n_ops) {
+        return filter_error(filter, clause, p, "expected an operator: ==, !=, <, <=, >, >=, "
+                                               "contains, startswith or endswith");
+    }
+    pred->op = filter_ops[k].op;
+    p = skip_space(p + strlen(filter_ops[k].text));
+
+    const char *value = p;
+    bool quoted = (*p == '"');
+    if (quoted) {
+        value = ++p;
+        while (*p && *p != '"') p++;
+        if (!*p) return filter_error(filter, clause, value - 1, "unterminated quote");
+    } else {
+        while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
+        if (p == value) return filter_error(filter, clause, value, "expected a value");
+    }
+    size_t value_len = (size_t)(p - value);
+    if (value_len >= sizeof(pred->str_val)) {
+        return filter_error(filter, clause, value, "value longer than 255 bytes");
+    }
+    memcpy(pred->str_val, value, value_len);
+    pred->str_val[value_len] = '\0';
+    pred->str_val_len = value_len;
+    if (quoted) p++;
+
+    /* An unquoted literal that reads as a number compares numerically;
+     * string operators always compare text */
+    bool text_op = pred->op == HP_OP_CONTAINS || pred->op == HP_OP_STARTSWITH ||
+                   pred->op == HP_OP_ENDSWITH;
+    if (!quoted && !text_op) {
+        pred->is_int = hp_parse_int_span(pred->str_val, value_len, &pred->int_val);
+        pred->is_positive_canonical_int =
+            pred->is_int && pred->str_val[0] >= '1' && pred->str_val[0] <= '9';
+        if (pred->is_int) {
+            pred->is_num = true;
+            pred->num_val = (double)pred->int_val;
         } else {
-            return HP_ERR_INVALID_ARG;
-        }
-
-        while (*p && isspace((unsigned char)*p)) p++;
-
-        const char *val_start = p;
-        if (*p == '"') {
-            p++;
-            val_start = p;
-            while (*p && *p != '"') p++;
-            size_t val_len = p - val_start;
-            if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
-            memcpy(pred->str_val, val_start, val_len);
-            pred->str_val[val_len] = '\0';
-            pred->str_val_len = val_len;
-            if (*p == '"') p++;
-            pred->is_num = false;
-            pred->is_int = false;
-        } else if (pred->op == HP_OP_CONTAINS || pred->op == HP_OP_STARTSWITH || pred->op == HP_OP_ENDSWITH) {
-            /* String operators always compare text, even against numeric-looking literals */
-            while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
-            size_t val_len = p - val_start;
-            if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
-            memcpy(pred->str_val, val_start, val_len);
-            pred->str_val[val_len] = '\0';
-            pred->str_val_len = val_len;
-            pred->is_num = false;
-            pred->is_int = false;
-        } else {
-            while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
-            size_t val_len = p - val_start;
-            if (val_len >= sizeof(pred->str_val)) val_len = sizeof(pred->str_val) - 1;
-            memcpy(pred->str_val, val_start, val_len);
-            pred->str_val[val_len] = '\0';
-            pred->str_val_len = val_len;
-
-            /* An unquoted literal that reads as a number compares numerically */
-            pred->is_int = hp_parse_int_span(pred->str_val, val_len, &pred->int_val);
-            pred->is_positive_canonical_int =
-                pred->is_int && pred->str_val[0] >= '1' && pred->str_val[0] <= '9';
-            if (pred->is_int) {
-                pred->is_num = true;
-                pred->num_val = (double)pred->int_val;
-            } else {
-                pred->is_num = hp_parse_decimal_span(pred->str_val, val_len, &pred->num_val);
-            }
-        }
-
-        filter->count++;
-        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-        /* Accept explicit conjunction keywords: 'and' / 'AND' / '&&' keep the
-         * current OR-group (AND-semantics inside a group); 'or' / '||' starts
-         * a new one. A row passes when AT LEAST ONE group fully matches. */
-        if (p[0] == '&' && p[1] == '&') {
-            p += 2;
-            while (*p && isspace((unsigned char)*p)) p++;
-        } else if ((p[0] | 32) == 'a' && (p[1] | 32) == 'n' && (p[2] | 32) == 'd' &&
-                   (p[3] == '\0' || isspace((unsigned char)p[3]))) {
-            p += 3;
-            while (*p && isspace((unsigned char)*p)) p++;
-        } else if (p[0] == '|' && p[1] == '|') {
-            p += 2;
-            while (*p && isspace((unsigned char)*p)) p++;
-            cur_group++;
-        } else if ((p[0] | 32) == 'o' && (p[1] | 32) == 'r' &&
-                   (p[2] == '\0' || isspace((unsigned char)p[2]))) {
-            p += 2;
-            while (*p && isspace((unsigned char)*p)) p++;
-            cur_group++;
+            pred->is_num = hp_parse_decimal_span(pred->str_val, value_len, &pred->num_val);
         }
     }
 
+    *pp = p;
     return HP_OK;
+}
+
+/* Conditions joined by "and" (also "&&" or ",") form a group; "or" (also
+ * "||") starts the next group, and a row passes when any group matches. */
+hp_error_t hp_filter_init(hp_filter_t *filter, const char *where_clause) {
+    if (!filter) return HP_ERR_INVALID_ARG;
+    memset(filter, 0, sizeof(*filter));
+    if (!where_clause) return HP_OK;
+
+    const char *p = skip_space(where_clause);
+    if (!*p) return HP_OK;
+
+    uint16_t group = 0;
+    for (;;) {
+        if (filter->count == HP_MAX_PREDICATES) {
+            return filter_error(filter, where_clause, p, "more than 16 conditions");
+        }
+        hp_predicate_t *pred = &filter->preds[filter->count];
+        pred->col_index = -1;
+        pred->or_group = group;
+        hp_error_t err = parse_predicate(filter, where_clause, &p, pred);
+        if (err != HP_OK) return err;
+        filter->count++;
+
+        p = skip_space(p);
+        if (!*p) return HP_OK;
+        if (*p == ',') {
+            p++;
+        } else if (p[0] == '&' && p[1] == '&') {
+            p += 2;
+        } else if (at_word(p, "and", true)) {
+            p += 3;
+        } else if (p[0] == '|' && p[1] == '|') {
+            p += 2;
+            group++;
+        } else if (at_word(p, "or", true)) {
+            p += 2;
+            group++;
+        } else {
+            return filter_error(filter, where_clause, p, "expected 'and', 'or' or the end "
+                                                         "of the filter; quote values with spaces");
+        }
+        p = skip_space(p);
+    }
 }
 
 hp_error_t hp_filter_bind(hp_filter_t *filter, const hp_header_t *header) {

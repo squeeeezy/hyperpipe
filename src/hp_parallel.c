@@ -180,6 +180,7 @@ static void buf_free(hp_buf_t *b) {
 
 typedef struct hp_chunk_s {
     uint64_t cut;              /* raw range start; records start at or after it */
+    uint64_t start;            /* where the chunk's first record starts */
     bool odd_quotes;           /* the range holds an odd number of quotes */
     bool cut_in_quotes;        /* quoting state just before `cut` */
     hp_buf_t out;
@@ -332,6 +333,7 @@ static void *transcode_main(void *arg) {
             }
 
             hp_transcoder_t tc;
+            c->start = start;
             if (!seek_to(f, start)) {
                 c->err = HP_ERR_IO;
             } else if ((c->err = hp_transcoder_init(&tc, &cfg)) == HP_OK) {
@@ -558,6 +560,11 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
 
         if (c->err != HP_OK) {
             err = c->err;
+            if (c->stats.error_record) {
+                stats_out->error_record = stats_out->records_in + c->stats.error_record;
+                stats_out->error_offset = c->start + c->stats.error_offset;
+            }
+            memcpy(stats_out->error_column, c->stats.error_column, sizeof(stats_out->error_column));
         } else if (pool.positional) {
             c->offset = out_end;
             out_end += c->out.len;
@@ -572,6 +579,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
         stats_out->rows_read += c->stats.rows_read;
         stats_out->rows_emitted += c->stats.rows_emitted;
         stats_out->rows_dropped += c->stats.rows_dropped;
+        stats_out->records_in += c->stats.records_in;
         stats_out->bytes_in += c->stats.bytes_in;
         stats_out->bytes_out += c->stats.bytes_out;
         buf_free(&c->quarantine);

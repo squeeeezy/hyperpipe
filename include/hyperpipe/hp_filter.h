@@ -49,6 +49,10 @@ typedef struct hp_schema_hint_s {
 typedef struct hp_filter_s {
     hp_predicate_t preds[HP_MAX_PREDICATES];
     size_t count;
+    /* Why hp_filter_init() returned HP_ERR_FILTER, and the byte offset in
+     * the filter text where parsing stopped */
+    const char *error;
+    size_t error_at;
     hp_schema_hint_t hints[HP_MAX_HINTS];
     size_t hint_count;
 } hp_filter_t;
