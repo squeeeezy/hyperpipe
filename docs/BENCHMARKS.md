@@ -205,6 +205,30 @@ is always `-`); SQL and HyperPipe leave it empty, so miller is not timed.
 | HyperPipe, one thread | 127 ms | 3.8x | 3 MiB |
 | miller | 3,922 ms | 118.8x | 140 MiB |
 
+**Distinct hosts per status** (`--agg "count_distinct(host)"`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 34 ms | 1.0x | 21 MiB |
+| HyperPipe, one thread | 58 ms | 1.7x | 3 MiB |
+| qsv sqlp | 130 ms | 3.9x | 199 MiB |
+| DuckDB | 139 ms | 4.1x | 194 MiB |
+| miller | 720 ms | 21.4x | 542 MiB |
+
+**p50, p95 and p99 of bytes per status** (`"bytes >= 0" --agg "p50(bytes), p95(bytes), p99(bytes)"`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 37 ms | 1.0x | 19 MiB |
+| HyperPipe, one thread | 99 ms | 2.7x | 3 MiB |
+| DuckDB | 144 ms | 3.9x | 242 MiB |
+| qsv sqlp | 144 ms | 3.9x | 256 MiB |
+
+The groups hold hundreds of thousands of values, so HyperPipe answers from
+its sketch; DuckDB and qsv compute `quantile_cont` exactly, and the results
+are compared within 2%. DuckDB 2.0 pushes the cast into its CSV reader, where
+`TRY_CAST` fails on `-`, so the SQL filters those rows out first.
+
 **Count per hour** (`--group-by "hour(timestamp)"`; the others parse the
 common log format with `strptime` and print the same bucket text)
 

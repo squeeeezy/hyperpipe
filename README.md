@@ -121,6 +121,8 @@ hyperpipe access.csv --group-by host --count            # the number of distinct
 | `count(col)` | rows where the column is not empty |
 | `sum(col)`, `avg(col)` | sum and mean of the numbers in the column |
 | `min(col)`, `max(col)` | smallest and largest number |
+| `count_distinct(col)` | distinct non-empty values, compared as text |
+| `median(col)`, `p95(col)`, `p99.9(col)` | quantiles of the numbers |
 
 - Keys are compared as text: `1` and `"1"` are one group; a missing NDJSON
   key is a group of its own.
@@ -131,8 +133,12 @@ hyperpipe access.csv --group-by host --count            # the number of distinct
   They stay exact while each value fits in 64 bits with at most 18 decimal
   places and the sum fits in 128 bits; past that they are doubles. `avg` is
   the double nearest to the exact sum divided by the count.
+- `count_distinct` is exact. Quantiles are exact, interpolated as numpy and
+  pandas do, for groups of up to 1,024 numbers; past that they come from a
+  sketch and are within 1% of the true value, in a few KiB per group.
 - The result is the same for every `--jobs`. `--head N` writes the first N
-  groups. Memory grows with the number of groups.
+  groups. Memory grows with the number of groups, and for `count_distinct`
+  with the number of distinct values.
 
 ## Time
 
@@ -252,6 +258,8 @@ equal (median time, peak RSS):
 | group by status: count, sum | 23 ms, 14 MiB | 97 ms, 190 MiB | 91 ms, 183 MiB | | |
 | group by host: count | 21 ms, 20 MiB | 91 ms, 194 MiB | 88 ms, 192 MiB | 511 ms, 534 MiB | |
 | NDJSON group by status: count, avg | 33 ms, 14 MiB | 108 ms, 231 MiB | | 3,922 ms, 140 MiB | |
+| distinct hosts per status | 34 ms, 21 MiB | 139 ms, 194 MiB | 130 ms, 199 MiB | 720 ms, 542 MiB | |
+| p50, p95, p99 per status | 37 ms, 19 MiB | 144 ms, 242 MiB | 144 ms, 256 MiB | | |
 | count per hour | 32 ms, 14 MiB | 154 ms, 185 MiB | 147 ms, 214 MiB | 5,592 ms, 542 MiB | |
 | count in a time range | 37 ms, 11 MiB | 171 ms, 184 MiB | 235 ms, 210 MiB | 3,093 ms, 572 MiB | |
 | sort by bytes, top 10 | 35 ms, 13 MiB | 111 ms, 156 MiB | 139 ms, 353 MiB | | |

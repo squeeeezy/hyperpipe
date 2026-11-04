@@ -100,8 +100,34 @@ def read_groups(path):
     return digest_rows(sorted([cell(x) for x in r] for r in rows))
 
 
+class Approx:
+    """Grouped results whose numbers may differ by 2%: quantiles that one
+    tool estimates and another computes exactly."""
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __getitem__(self, i):
+        return len(self.rows) if i == 0 else None
+
+    def __eq__(self, other):
+        def close(a, b):
+            try:
+                x, y = float(a), float(b)
+            except ValueError:
+                return a == b
+            return abs(x - y) <= 0.02 * max(abs(x), abs(y)) + 1e-9
+        return len(self.rows) == len(other.rows) and all(
+            len(r) == len(s) and all(close(a, b) for a, b in zip(r, s))
+            for r, s in zip(self.rows, other.rows))
+
+
+def read_approx(path):
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        return Approx(sorted([r for r in csv.reader(f) if r][1:]))
+
+
 READERS = {"csv": read_csv_rows, "ndjson": read_ndjson_rows, "count": read_count,
-           "groups": read_groups}
+           "groups": read_groups, "approx": read_approx}
 
 
 # DuckDB infers the mixed numbers-and-"-" bytes column as JSON and would
@@ -115,6 +141,11 @@ NASA_COLUMNS = ("{host: 'VARCHAR', timestamp: 'VARCHAR', request: 'VARCHAR', "
 SORT_HP = "-bytes,host,timestamp,request"
 SORT_SQL = "TRY_CAST(bytes AS BIGINT) DESC NULLS LAST, host, timestamp, request"
 
+
+# DuckDB 2.0 pushes the cast into its CSV reader, where TRY_CAST fails on
+# "-" like CAST does, so the "-" rows are filtered out first
+QUANTILES_SQL = ", ".join(f"quantile_cont(CAST(bytes AS BIGINT), {p}) AS p{int(p * 100)}"
+                          for p in (0.5, 0.95, 0.99))
 
 # The common log format timestamp as a time, in SQL
 CLF_SQL = "strptime(timestamp, '%d/%b/%Y:%H:%M:%S %z')"
@@ -180,6 +211,19 @@ def tasks(a, hp, out):
             "hyperpipe -j1": ([hp, nd, "--group-by", "status", "--agg", "count, avg(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
             "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(*), avg(TRY_CAST(bytes AS BIGINT)) FROM read_json('{q(nd)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
             "miller": (["mlr", "--ijsonl", "--ocsv", "stats1", "-a", "count,mean", "-f", "bytes", "-g", "status", nd], True),
+        }),
+        ("distinct hosts per status", "groups", {
+            "hyperpipe": ([hp, big, "--group-by", "status", "--agg", "count_distinct(host)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--group-by", "status", "--agg", "count_distinct(host)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT status, count(DISTINCT host) AS n FROM _t_1 GROUP BY status", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(DISTINCT host) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "count-distinct", "-f", "status,host", "then", "count", "-g", "status", big], True),
+        }),
+        ("p50, p95, p99 of bytes per status", "approx", {
+            "hyperpipe": ([hp, big, "bytes >= 0", "--group-by", "status", "--agg", "p50(bytes), p95(bytes), p99(bytes)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "bytes >= 0", "--group-by", "status", "--agg", "p50(bytes), p95(bytes), p99(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT status, {QUANTILES_SQL} FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) WHERE bytes <> '-' GROUP BY status) TO '{q(out)}' (HEADER)"], False),
+            "qsv sqlp": (["qsv", "sqlp", big, f"SELECT status, {QUANTILES_SQL} FROM _t_1 WHERE bytes <> '-' GROUP BY status", "-o", out], False),
         }),
         ("count per hour", "groups", {
             "hyperpipe": ([hp, big, "--group-by", "hour(timestamp)", "--to", "csv", "-o", out], False),

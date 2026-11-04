@@ -14,11 +14,13 @@ add_library(hyperpipe_core STATIC
     src/hp_agg.c
     src/hp_cpuid.c
     src/hp_csv_scalar.c
+    src/hp_distinct.c
     src/hp_filter.c
     src/hp_gzip.c
     src/hp_json_scalar.c
     src/hp_keymap.c
     src/hp_parallel.c
+    src/hp_quantile.c
     src/hp_ring_buffer.c
     src/hp_sort.c
     src/hp_summary.c
@@ -32,6 +34,9 @@ if(APPLE)
     target_compile_definitions(hyperpipe_core PUBLIC _DARWIN_C_SOURCE)
 endif()
 target_link_libraries(hyperpipe_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX)
+    target_link_libraries(hyperpipe_core PUBLIC m)
+endif()
 if(WIN32)
     target_link_libraries(hyperpipe_core PUBLIC psapi)
 endif()

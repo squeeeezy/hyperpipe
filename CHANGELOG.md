@@ -40,6 +40,10 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- `count_distinct(col)`, exact, and quantiles: `median(col)` and `pN(col)`
+  for any percentile (`p95`, `p99.9`). Quantiles are exact, as numpy and
+  pandas compute them, up to 1,024 values per group and within 1% past
+  that, from a mergeable sketch; parallel runs give the same results.
 - Time: ISO 8601, the common log format and Unix time are recognized in any
   field. `--group-by` takes `year`, `month`, `day`, `hour` and `minute` of a
   column, and unquoted ISO 8601 literals in filters compare as times

@@ -6,8 +6,7 @@ showing no workload slower.
 
 ## Next
 
-- `--distinct` and `count_distinct(col)`; quantiles (`p50`, `p95`) from a
-  mergeable sketch.
+- `--distinct`: unique rows, or unique values of some columns.
 - Join with a smaller file held in memory.
 - Paths into nested NDJSON values (`meta.x.y`) in filters, `--select` and
   `--group-by`.

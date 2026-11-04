@@ -121,7 +121,16 @@ Numbers follow `src/hp_number.h`, shared with the filter. A value with a
 64-bit mantissa and at most 18 decimal places is kept as mantissa and
 scale; sums are 128-bit integers at the largest scale seen, so they are
 exact and do not depend on the order of the rows. Anything wider falls back
-to double. Parallel workers build a table per chunk (`agg_partial`); the
+to double.
+
+`count_distinct` keeps one table of (group, value) pairs per function
+(`src/hp_distinct.c`), not a set per group; a slot holds the value's hash
+apart from the group, so a merge moves pairs to other groups without hashing
+again. Quantiles (`src/hp_quantile.c`) keep a group's values until there are
+1,024 and then move them into a DDSketch: logarithmic buckets 2% wide, at
+most 4,096 of them, the lowest folding into the next when the range grows.
+The fold point only rises, so the sketch, like the kept values, depends on
+the values alone and merges to the single-threaded result. Parallel workers build a table per chunk (`agg_partial`); the
 coordinator merges them in chunk order, which keeps arrival order, and
 writes the rows through `hp_transcoder_write_groups()`, the same writer a
 single-threaded run uses.

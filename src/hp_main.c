@@ -43,7 +43,9 @@ static void print_usage(void) {
         "  --group-by COLUMNS        one output row per distinct value of COLUMNS;\n"
         "                            hour(col), day(col) and the like group by time\n"
         "  --agg FUNCTIONS           per group: count, count(col), sum(col),\n"
-        "                            avg(col), min(col), max(col) (default count)\n"
+        "                            avg(col), min(col), max(col), count_distinct(col),\n"
+        "                            median(col), p95(col) and other percentiles\n"
+        "                            (default count)\n"
         "  --sort COLUMNS            sort rows, or groups, by COLUMNS; -col descends\n"
         "  --memory SIZE             memory for sorting before it uses temporary\n"
         "                            files, e.g. 2G (default 512M)\n"
@@ -340,6 +342,7 @@ static bool check_agg(const char *group_by, const char *fns) {
     static hp_agg_t agg;
     if (!group_by && !fns) return true;
     hp_error_t err = hp_agg_init(&agg, group_by, fns);
+    hp_agg_free(&agg);
     if (err == HP_ERR_AGG) {
         complain("invalid --agg: %s", agg.error);
         fprintf(stderr, "  %s\n  %*s^\n", fns, (int)agg.error_at, "");

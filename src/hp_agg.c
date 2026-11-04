@@ -1,6 +1,8 @@
 #include "hyperpipe/hp_agg.h"
 #include "hyperpipe/hp_filter.h"
+#include "hp_distinct.h"
 #include "hp_number.h"
+#include "hp_quantile.h"
 
 /* Exact sums are scaled integers. 128 bits hold any 18-digit value at any
  * of the 19 scales with room for 10^20 more additions; without a 128-bit
@@ -28,6 +30,7 @@ struct hp_agg_acc_s {
     bool inexact;          /* the sum left the exact range: fsum holds it */
     double fsum;
     hp_agg_num_t min, max;
+    hp_quantile_t *quant;  /* the values of a quantile */
 };
 
 struct hp_agg_group_s {
@@ -64,18 +67,45 @@ static hp_error_t agg_error(hp_agg_t *agg, const char *text, const char *at, con
 static const struct {
     const char *name;
     hp_agg_fn_t fn;
+    double q;
 } agg_names[] = {
-    { "count", HP_AGG_COUNT }, { "sum", HP_AGG_SUM }, { "avg", HP_AGG_AVG },
-    { "min", HP_AGG_MIN },     { "max", HP_AGG_MAX },
+    { "count", HP_AGG_COUNT, 0 }, { "sum", HP_AGG_SUM, 0 }, { "avg", HP_AGG_AVG, 0 },
+    { "min", HP_AGG_MIN, 0 },     { "max", HP_AGG_MAX, 0 },
+    { "count_distinct", HP_AGG_COUNT_DISTINCT, 0 }, { "median", HP_AGG_QUANTILE, 0.5 },
 };
 
+/* column may be spec->column itself, so the name is built apart first */
 static void set_name(hp_agg_spec_t *spec, const char *column) {
-    const char *fn_name = agg_names[spec->fn].name;
+    char name[sizeof(spec->name)];
     if (column[0]) {
-        snprintf(spec->name, sizeof(spec->name), "%s(%s)", fn_name, column);
+        snprintf(name, sizeof(name), "%s(%s)", spec->label, column);
     } else {
-        snprintf(spec->name, sizeof(spec->name), "%s", fn_name);
+        snprintf(name, sizeof(name), "%s", spec->label);
     }
+    memcpy(spec->name, name, sizeof(name));
+}
+
+/* A function name, or pN for the N-th percentile: p95, p99.9 */
+static bool name_fn(const char *word, size_t len, hp_agg_spec_t *spec) {
+    for (size_t k = 0; k < sizeof(agg_names) / sizeof(agg_names[0]); k++) {
+        if (strlen(agg_names[k].name) == len && strncmp(word, agg_names[k].name, len) == 0) {
+            spec->fn = agg_names[k].fn;
+            spec->q = agg_names[k].q;
+            return true;
+        }
+    }
+    /* p99.9 is 999 / 1000 in one division, the double nearest 0.999, where
+     * 99.9 / 100 would round twice */
+    int64_t mant;
+    int scale;
+    if (len >= 2 && len < sizeof(spec->label) && word[0] == 'p' && isdigit((unsigned char)word[1]) &&
+        hp_parse_decimal_exact(word + 1, len - 1, &mant, &scale) && scale <= 14 &&
+        mant >= 0 && mant <= 100 * pow10_i64[scale]) {
+        spec->fn = HP_AGG_QUANTILE;
+        spec->q = (double)mant / (double)pow10_i64[scale + 2];
+        return true;
+    }
+    return false;
 }
 
 /* "count", or "fn(column)": count(column) counts the non-empty values */
@@ -83,21 +113,18 @@ static hp_error_t parse_fns(hp_agg_t *agg, const char *text) {
     const char *p = skip_space(text);
     for (;;) {
         const char *word = p;
-        while (isalpha((unsigned char)*p)) p++;
+        while (isalnum((unsigned char)*p) || *p == '_' || *p == '.') p++;
         size_t word_len = (size_t)(p - word);
-        size_t k = 0, n_names = sizeof(agg_names) / sizeof(agg_names[0]);
-        while (k < n_names && !(strlen(agg_names[k].name) == word_len &&
-                                strncmp(word, agg_names[k].name, word_len) == 0)) {
-            k++;
-        }
-        if (k == n_names) {
-            return agg_error(agg, text, word, "expected count, sum, avg, min or max");
-        }
         if (agg->fn_count == HP_AGG_MAX_FNS) {
             return agg_error(agg, text, word, "more than 32 functions");
         }
         hp_agg_spec_t *spec = &agg->fns[agg->fn_count];
-        spec->fn = agg_names[k].fn;
+        if (!name_fn(word, word_len, spec)) {
+            return agg_error(agg, text, word, "expected count, count_distinct, sum, avg, min, max, "
+                                              "median or a percentile such as p95");
+        }
+        memcpy(spec->label, word, word_len);
+        spec->label[word_len] = '\0';
         spec->col_index = -1;
 
         p = skip_space(p);
@@ -174,14 +201,28 @@ hp_error_t hp_agg_init(hp_agg_t *agg, const char *group_by, const char *fns) {
     if (agg->fn_count == 0) {
         agg->fns[0].fn = HP_AGG_COUNT;
         agg->fns[0].col_index = -1;
+        snprintf(agg->fns[0].label, sizeof(agg->fns[0].label), "count");
         set_name(&agg->fns[0], "");
         agg->fn_count = 1;
+    }
+    for (size_t i = 0; i < agg->fn_count; i++) {
+        if (agg->fns[i].fn == HP_AGG_COUNT_DISTINCT && !agg->distinct) {
+            agg->distinct = (hp_distinct_t *)calloc(agg->fn_count, sizeof(hp_distinct_t));
+            if (!agg->distinct) return HP_ERR_NOMEM;
+        }
     }
     return HP_OK;
 }
 
 void hp_agg_free(hp_agg_t *agg) {
     if (!agg) return;
+    for (size_t i = 0; i < agg->fn_count; i++) {
+        if (agg->fns[i].fn != HP_AGG_QUANTILE) continue;
+        for (size_t g = 0; g < agg->group_count; g++) hp_quantile_free(agg->acc[g * agg->fn_count + i].quant);
+    }
+    for (size_t i = 0; agg->distinct && i < agg->fn_count; i++) hp_distinct_free(&agg->distinct[i]);
+    free(agg->distinct);
+    agg->distinct = NULL;
     free(agg->slots);
     free(agg->groups);
     free(agg->acc);
@@ -295,7 +336,10 @@ static void add_value(hp_agg_acc_t *acc, const hp_agg_num_t *v) {
     acc->fsum += num_double(v);
 }
 
-static void fold(hp_agg_acc_t *acc, const hp_agg_spec_t *spec, const hp_row_t *row) {
+static uint64_t hash_field(uint64_t h, const char *p, size_t n, bool present);
+
+static hp_error_t fold(hp_agg_t *agg, size_t fn, size_t group, hp_agg_acc_t *acc, const hp_row_t *row) {
+    const hp_agg_spec_t *spec = &agg->fns[fn];
     const hp_str_t *f = NULL;
     if (spec->col_index >= 0 && (size_t)spec->col_index < row->field_count &&
         row->fields[spec->col_index].present && row->fields[spec->col_index].len > 0) {
@@ -303,11 +347,31 @@ static void fold(hp_agg_acc_t *acc, const hp_agg_spec_t *spec, const hp_row_t *r
     }
     if (spec->fn == HP_AGG_COUNT) {
         acc->n += (!spec->column[0] || f);
-        return;
+        return HP_OK;
+    }
+    if (spec->fn == HP_AGG_COUNT_DISTINCT) {
+        if (!f) return HP_OK;
+        bool added = false;
+        hp_error_t err = hp_distinct_add(&agg->distinct[fn], hash_field(0, f->ptr, f->len, true),
+                                         (uint32_t)group, f->ptr, f->len, &added);
+        acc->n += added;
+        return err;
+    }
+    if (spec->fn == HP_AGG_QUANTILE) {
+        int64_t i;
+        double d;
+        if (!f || f->is_json) return HP_OK;
+        if (hp_parse_int_span(f->ptr, f->len, &i)) {
+            d = (double)i;
+        } else if (!hp_parse_decimal_span(f->ptr, f->len, &d)) {
+            return HP_OK;
+        }
+        acc->n++;
+        return hp_quantile_add(&acc->quant, d);
     }
 
     hp_agg_num_t v;
-    if (!f || f->is_json || !parse_num(f, &v)) return;
+    if (!f || f->is_json || !parse_num(f, &v)) return HP_OK;
     acc->n++;
     if (spec->fn == HP_AGG_SUM || spec->fn == HP_AGG_AVG) {
         add_value(acc, &v);
@@ -316,17 +380,23 @@ static void fold(hp_agg_acc_t *acc, const hp_agg_spec_t *spec, const hp_row_t *r
     } else {
         if (acc->n == 1 || num_cmp(&v, &acc->max) > 0) acc->max = v;
     }
+    return HP_OK;
 }
 
-static void merge_acc(hp_agg_acc_t *dst, const hp_agg_acc_t *src, hp_agg_fn_t fn) {
-    if (src->n == 0) return;
+/* Distinct values are merged by hp_agg_merge(), which knows the groups */
+static hp_error_t merge_acc(hp_agg_acc_t *dst, const hp_agg_acc_t *src, hp_agg_fn_t fn) {
+    if (src->n == 0 || fn == HP_AGG_COUNT_DISTINCT) return HP_OK;
+    if (fn == HP_AGG_QUANTILE) {
+        dst->n += src->n;
+        return hp_quantile_merge(&dst->quant, src->quant);
+    }
     if (dst->n == 0) {
         *dst = *src;
-        return;
+        return HP_OK;
     }
     dst->n += src->n;
     if (fn == HP_AGG_SUM || fn == HP_AGG_AVG) {
-        if (!dst->inexact && !src->inexact && add_exact(dst, src->sum, src->scale)) return;
+        if (!dst->inexact && !src->inexact && add_exact(dst, src->sum, src->scale)) return HP_OK;
         dst->fsum = acc_sum_double(dst) + acc_sum_double(src);
         dst->inexact = true;
     } else if (fn == HP_AGG_MIN) {
@@ -334,6 +404,7 @@ static void merge_acc(hp_agg_acc_t *dst, const hp_agg_acc_t *src, hp_agg_fn_t fn
     } else if (fn == HP_AGG_MAX) {
         if (num_cmp(&src->max, &dst->max) > 0) dst->max = src->max;
     }
+    return HP_OK;
 }
 
 /* ---- the table -------------------------------------------------------------- */
@@ -527,13 +598,19 @@ hp_error_t hp_agg_observe(hp_agg_t *agg, const hp_row_t *row) {
         if (err != HP_OK) return err;
     }
     hp_agg_acc_t *acc = &agg->acc[g * agg->fn_count];
-    for (size_t i = 0; i < agg->fn_count; i++) fold(&acc[i], &agg->fns[i], row);
+    for (size_t i = 0; i < agg->fn_count; i++) {
+        hp_error_t err = fold(agg, i, g, &acc[i], row);
+        if (err != HP_OK) return err;
+    }
     return HP_OK;
 }
 
 hp_error_t hp_agg_merge(hp_agg_t *dst, const hp_agg_t *src) {
     if (!dst->slots && grow_slots(dst) != HP_OK) return HP_ERR_NOMEM;
-    for (size_t sg = 0; sg < src->group_count; sg++) {
+    uint32_t *to = (uint32_t *)malloc((src->group_count ? src->group_count : 1) * sizeof(uint32_t));
+    if (!to) return HP_ERR_NOMEM;
+    hp_error_t err = HP_OK;
+    for (size_t sg = 0; err == HP_OK && sg < src->group_count; sg++) {
         const hp_agg_group_t *from = &src->groups[sg];
         const char *key = src->key_bytes + from->key_off;
 
@@ -546,17 +623,33 @@ hp_error_t hp_agg_merge(hp_agg_t *dst, const hp_agg_t *src) {
             }
         }
         if (g == SIZE_MAX) {
-            if (reserve_keys(dst, from->key_len) != HP_OK) return HP_ERR_NOMEM;
+            err = reserve_keys(dst, from->key_len);
+            if (err != HP_OK) break;
             if (from->key_len) memcpy(dst->key_bytes + dst->key_len, key, from->key_len);
-            hp_error_t err = add_group(dst, from->hash, from->key_len, &g);
-            if (err != HP_OK) return err;
+            if ((err = add_group(dst, from->hash, from->key_len, &g)) != HP_OK) break;
         }
-        for (size_t i = 0; i < dst->fn_count; i++) {
-            merge_acc(&dst->acc[g * dst->fn_count + i], &src->acc[sg * src->fn_count + i],
-                      dst->fns[i].fn);
+        to[sg] = (uint32_t)g;
+        for (size_t i = 0; err == HP_OK && i < dst->fn_count; i++) {
+            err = merge_acc(&dst->acc[g * dst->fn_count + i], &src->acc[sg * src->fn_count + i],
+                            dst->fns[i].fn);
         }
     }
-    return HP_OK;
+
+    /* Each distinct pair of src joins its group in dst, counted when new */
+    for (size_t i = 0; err == HP_OK && src->distinct && i < dst->fn_count; i++) {
+        const hp_distinct_t *d = &src->distinct[i];
+        for (size_t s = 0; err == HP_OK && d->slots && s <= d->mask; s++) {
+            const hp_distinct_slot_t *slot = &d->slots[s];
+            if (!slot->ref) continue;
+            bool added = false;
+            uint32_t g = to[slot->group];
+            err = hp_distinct_add(&dst->distinct[i], slot->hash, g, hp_distinct_value(d, slot),
+                                  slot->len, &added);
+            dst->acc[g * dst->fn_count + i].n += added;
+        }
+    }
+    free(to);
+    return err;
 }
 
 /* ---- output ----------------------------------------------------------------- */
@@ -610,10 +703,14 @@ static size_t format_num(char *out, const hp_agg_num_t *v) {
 }
 
 /* Writes one aggregate value; returns 0 when it has none (no numbers) */
-static size_t format_acc(char *out, const hp_agg_acc_t *acc, hp_agg_fn_t fn) {
-    if (fn == HP_AGG_COUNT) return format_u64(out, acc->n);
+static size_t format_acc(char *out, const hp_agg_acc_t *acc, const hp_agg_spec_t *spec) {
+    const hp_agg_fn_t fn = spec->fn;
+    if (fn == HP_AGG_COUNT || fn == HP_AGG_COUNT_DISTINCT) return format_u64(out, acc->n);
     if (acc->n == 0) return 0;
+    double v;
     switch (fn) {
+        case HP_AGG_QUANTILE:
+            return hp_quantile_get(acc->quant, spec->q, &v) ? format_double(out, v) : 0;
         case HP_AGG_SUM:
             return acc->inexact ? format_double(out, acc->fsum)
                                 : format_decimal(out, acc->sum, acc->scale);
@@ -661,7 +758,7 @@ void hp_agg_row(const hp_agg_t *agg, size_t i, hp_row_t *out, char *scratch) {
     for (size_t j = 0; j < agg->fn_count; j++) {
         const hp_agg_acc_t *acc = i < agg->group_count ? &agg->acc[i * agg->fn_count + j] : &no_rows;
         char *text = scratch + j * HP_AGG_VALUE_MAX;
-        size_t len = format_acc(text, acc, agg->fns[j].fn);
+        size_t len = format_acc(text, acc, &agg->fns[j]);
         out->fields[w++] = (hp_str_t){ .ptr = text, .len = len, .present = len > 0 };
     }
     out->field_count = w;

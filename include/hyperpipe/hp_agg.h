@@ -14,11 +14,14 @@
  *
  * Sums, minimums and maximums are exact decimals while the values have at
  * most 18 significant digits and the sum fits in 128 bits; past that they
- * fall back to double. Exact results do not depend on the order rows are
- * folded in, so parallel workers aggregate their chunks and hp_agg_merge()
- * combines them, in chunk order, into the single-threaded result.
+ * fall back to double. count_distinct is exact. Quantiles are exact up to
+ * 1024 values in a group and within 1% past that (src/hp_quantile.h).
+ * None of the results depends on the order rows are folded in, so parallel
+ * workers aggregate their chunks and hp_agg_merge() combines them, in chunk
+ * order, into the single-threaded result.
  *
- * Memory grows with the number of groups, not with the input. */
+ * Memory grows with the number of groups, and with count_distinct with the
+ * number of distinct values, not with the input. */
 
 #define HP_AGG_MAX_KEYS 16
 #define HP_AGG_MAX_FNS 32
@@ -28,11 +31,15 @@ typedef enum hp_agg_fn_e {
     HP_AGG_SUM,            /* the next four skip values that are not numbers */
     HP_AGG_AVG,
     HP_AGG_MIN,
-    HP_AGG_MAX
+    HP_AGG_MAX,
+    HP_AGG_COUNT_DISTINCT, /* distinct non-empty values */
+    HP_AGG_QUANTILE        /* median, p95 and the like: the q-quantile */
 } hp_agg_fn_t;
 
 typedef struct hp_agg_spec_s {
     hp_agg_fn_t fn;
+    char label[16];        /* the function as written: "count", "p95" */
+    double q;              /* the quantile of HP_AGG_QUANTILE */
     char column[128];      /* empty for count */
     int64_t col_index;
     char name[160];        /* the output column: "count", "sum(bytes)" */
@@ -40,6 +47,7 @@ typedef struct hp_agg_spec_s {
 
 typedef struct hp_agg_group_s hp_agg_group_t;
 typedef struct hp_agg_acc_s hp_agg_acc_t;
+typedef struct hp_distinct_s hp_distinct_t;
 
 typedef struct hp_agg_s {
     char keys[HP_AGG_MAX_KEYS][128];       /* the key columns */
@@ -60,6 +68,7 @@ typedef struct hp_agg_s {
     size_t group_count;
     size_t group_cap;
     hp_agg_acc_t *acc;     /* fn_count accumulators per group */
+    hp_distinct_t *distinct;   /* one per function, with count_distinct */
     char *key_bytes;       /* every group's encoded key */
     size_t key_len;
     size_t key_cap;

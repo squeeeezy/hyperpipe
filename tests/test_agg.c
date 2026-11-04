@@ -133,8 +133,9 @@ static void test_errors(void) {
         const char *fns;
         size_t at;
     } bad[] = {
-        { "median(x)", 0 }, { "sum", 3 }, { "sum(x", 5 }, { "sum()", 4 },
+        { "mode(x)", 0 }, { "sum", 3 }, { "sum(x", 5 }, { "sum()", 4 },
         { "count sum(x)", 6 }, { "count,", 6 },
+        { "p101(x)", 0 }, { "median", 6 }, { "count_distinct", 14 }, { "p(x)", 0 },
     };
     static hp_agg_t agg;
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -144,6 +145,35 @@ static void test_errors(void) {
         }
         CHECK(err == HP_ERR_AGG && agg.error_at == bad[i].at);
     }
+}
+
+static void test_distinct_and_quantiles(void) {
+    /* Exact quantiles interpolate as numpy and pandas do, to the bit */
+    CHECK(groups_are(logs, "host", "count_distinct(status), median(ms), p25(ms)",
+                     "host,count_distinct(status),median(ms),p25(ms)\n"
+                     "a,1,0.8,0.44999999999999996\n"
+                     "b,2,2,2\n"
+                     "c,1,0.2,0.2\n"));
+    CHECK(groups_are("v\n1\n2\n3\n4\n", NULL, "median(v), p0(v), p100(v), p99.9(v)",
+                     "median(v),p0(v),p100(v),p99.9(v)\n2.5,1,4,3.997\n"));
+    /* Empty and missing values are not distinct values; text is */
+    CHECK(groups_are("k,v\na,x\na,\na,x\na,y\nb,1\nb,1.0\n", "k", "count_distinct(v)",
+                     "k,count_distinct(v)\na,2\nb,2\n"));
+
+    /* Past the exact limit the sketch stays within 1% */
+    static char doc[1 << 20];
+    size_t w = (size_t)snprintf(doc, sizeof(doc), "v\n");
+    for (int i = 1; i <= 100000; i++) w += (size_t)snprintf(doc + w, sizeof(doc) - w, "%d\n", i);
+    hp_transcoder_config_t cfg = {
+        .in_format = HP_FORMAT_CSV, .out_format = HP_FORMAT_CSV, .agg_spec = "p50(v), p99(v), p1(v)",
+    };
+    pipe_result_t r = pipe_run(&cfg, doc, w);
+    double p50 = 0, p99 = 0, p1 = 0;
+    CHECK(r.err == HP_OK && sscanf(r.out, "p50(v),p99(v),p1(v)\n%lf,%lf,%lf", &p50, &p99, &p1) == 3);
+    CHECK(p50 > 50000 * 0.99 && p50 < 50001 * 1.01);
+    CHECK(p99 > 99000 * 0.99 && p99 < 99001 * 1.01);
+    CHECK(p1 > 1000 * 0.99 && p1 < 1001 * 1.01);
+    pipe_free(&r);
 }
 
 /* One pass, merged halves and the parallel pipeline give the same bytes */
@@ -164,7 +194,8 @@ static void test_merge_matches_one_pass(void) {
 
     hp_transcoder_config_t cfg = {
         .in_format = HP_FORMAT_CSV, .out_format = HP_FORMAT_CSV,
-        .group_by_spec = "k", .agg_spec = "count, sum(v), avg(v), min(v), max(v), sum(w)",
+        .group_by_spec = "k",
+        .agg_spec = "count, sum(v), avg(v), min(v), max(v), sum(w), count_distinct(v), median(v), p99(v)",
     };
     FILE *in = fopen(path, "rb");
     FILE *out = tmpfile();
@@ -196,6 +227,7 @@ int main(void) {
     TAP_RUN(test_keys);
     TAP_RUN(test_head_and_count);
     TAP_RUN(test_errors);
+    TAP_RUN(test_distinct_and_quantiles);
     TAP_RUN(test_merge_matches_one_pass);
     return tap_done();
 }

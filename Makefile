@@ -22,7 +22,7 @@ ifeq ($(OS),Windows_NT)
     LDLIBS = -lpsapi
 else
     EXE    =
-    LDLIBS = -pthread -ldl
+    LDLIBS = -pthread -ldl -lm
     # macOS hides sysconf names such as _SC_NPROCESSORS_ONLN under strict POSIX
     ifeq ($(shell uname -s),Darwin)
         HP_CFLAGS += -D_DARWIN_C_SOURCE
