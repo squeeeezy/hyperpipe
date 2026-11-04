@@ -1,5 +1,7 @@
 #include "hyperpipe/hp_transcoder.h"
 #include "hyperpipe/hp_parallel.h"
+#include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,13 +21,6 @@ static void use_binary_stdio(void) {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
-}
-
-static bool file_exists(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
 }
 
 static void print_usage(void) {
@@ -57,7 +52,7 @@ static void print_usage(void) {
         "  --stats                   print throughput to stderr\n"
         "  -v, --version             print version and CPU features\n"
         "  -h, --help                print this help\n",
-        stderr);
+        stdout);
 }
 
 static void print_version(void) {
@@ -81,274 +76,307 @@ static void print_perf_stats(const hp_transcoder_stats_t *st) {
             sec, mib_in / sec, (double)st->rows_read / 1e6 / sec);
 }
 
+static void complain(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("hyperpipe: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+/* ---- command line ---------------------------------------------------------- */
+
+typedef struct options_s {
+    hp_transcoder_config_t cfg;
+    const char *input_path;
+    const char *output_path;
+    int jobs;                  /* 0: auto */
+    bool show_stats;
+} options_t;
+
+typedef struct choice_s {
+    const char *name;
+    int value;
+} choice_t;
+
+static const choice_t in_formats[] = {
+    { "auto", HP_FORMAT_AUTO }, { "csv", HP_FORMAT_CSV }, { "tsv", HP_FORMAT_TSV },
+    { "ndjson", HP_FORMAT_NDJSON }, { NULL, 0 },
+};
+static const choice_t out_formats[] = {
+    { "csv", HP_FORMAT_CSV }, { "tsv", HP_FORMAT_TSV }, { "ndjson", HP_FORMAT_NDJSON },
+    { NULL, 0 },
+};
+static const choice_t error_modes[] = {
+    { "fail", HP_ON_ERROR_FAIL }, { "skip", HP_ON_ERROR_SKIP },
+    { "quarantine", HP_ON_ERROR_QUARANTINE }, { NULL, 0 },
+};
+static const choice_t simd_modes[] = {
+    { "auto", HP_SIMD_AUTO }, { "avx512", HP_SIMD_AVX512 }, { "avx2", HP_SIMD_AVX2 },
+    { "scalar", HP_SIMD_SCALAR }, { NULL, 0 },
+};
+
+static bool is_option(const char *arg, const char *short_name, const char *long_name) {
+    return (short_name && strcmp(arg, short_name) == 0) || strcmp(arg, long_name) == 0;
+}
+
+/* The value after the option at argv[*i], or NULL when it is missing */
+static const char *option_value(int argc, char **argv, int *i) {
+    if (*i + 1 < argc) return argv[++*i];
+    complain("%s needs a value", argv[*i]);
+    return NULL;
+}
+
+static bool parse_choice(const char *option, const char *value, const choice_t *choices, int *out) {
+    if (!value) return false;
+    for (const choice_t *c = choices; c->name; c++) {
+        if (strcmp(value, c->name) == 0) {
+            *out = c->value;
+            return true;
+        }
+    }
+    complain("%s: unknown value '%s'", option, value);
+    return false;
+}
+
+static bool parse_count(const char *option, const char *value, uint64_t min, uint64_t *out) {
+    if (!value) return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long n = strtoull(value, &end, 10);
+    if (value[0] == '-' || end == value || *end != '\0' || errno == ERANGE || n < min) {
+        complain("%s: invalid number '%s'", option, value);
+        return false;
+    }
+    *out = n;
+    return true;
+}
+
+static bool file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+/* A lone positional argument is the input when it names a file, or when it
+ * cannot be a filter: every condition has a space or one of = < > !. */
+static bool looks_like_input(const char *arg) {
+    return file_exists(arg) || !strpbrk(arg, " \t=<>!");
+}
+
+static bool ends_with(const char *s, const char *suffix) {
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+/* Returns 0 to run, otherwise the exit status (help and version exit 0) */
+static int parse_args(int argc, char **argv, options_t *o) {
+    hp_transcoder_config_t *cfg = &o->cfg;
+    const char *positional[2];
+    int n_positional = 0;
+    int v;
+    uint64_t n;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (is_option(a, "-h", "--help")) {
+            print_usage();
+            return -1;
+        } else if (is_option(a, "-v", "--version")) {
+            print_version();
+            return -1;
+        } else if (is_option(a, "-i", "--input")) {
+            if (!(o->input_path = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, "-o", "--output")) {
+            if (!(o->output_path = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--from")) {
+            if (!parse_choice(a, option_value(argc, argv, &i), in_formats, &v)) return 1;
+            cfg->in_format = (hp_format_t)v;
+        } else if (is_option(a, NULL, "--to")) {
+            if (!parse_choice(a, option_value(argc, argv, &i), out_formats, &v)) return 1;
+            cfg->out_format = (hp_format_t)v;
+        } else if (is_option(a, NULL, "--select")) {
+            if (!(cfg->select_spec = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--where")) {
+            if (!(cfg->where_spec = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--on-error")) {
+            if (!parse_choice(a, option_value(argc, argv, &i), error_modes, &v)) return 1;
+            cfg->on_error = (hp_on_error_t)v;
+        } else if (is_option(a, NULL, "--quarantine")) {
+            if (!(cfg->quarantine_path = option_value(argc, argv, &i))) return 1;
+            cfg->on_error = HP_ON_ERROR_QUARANTINE;
+        } else if (is_option(a, NULL, "--head") || is_option(a, NULL, "--limit")) {
+            if (!parse_count(a, option_value(argc, argv, &i), 0, &cfg->limit_rows)) return 1;
+        } else if (is_option(a, NULL, "--count")) {
+            cfg->count_only = true;
+        } else if (is_option(a, NULL, "--gzip")) {
+            cfg->gzip_out = true;
+        } else if (is_option(a, NULL, "--summary")) {
+            cfg->summary = true;
+        } else if (is_option(a, NULL, "--schema")) {
+            if (!(cfg->schema_path = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--jobs")) {
+            const char *value = option_value(argc, argv, &i);
+            if (value && strcmp(value, "auto") == 0) {
+                o->jobs = 0;
+            } else if (parse_count(a, value, 1, &n)) {
+                o->jobs = n > 1024 ? 1024 : (int)n;   /* hp_parallel_run caps it further */
+            } else {
+                return 1;
+            }
+        } else if (is_option(a, NULL, "--simd")) {
+            if (!parse_choice(a, option_value(argc, argv, &i), simd_modes, &v)) return 1;
+            cfg->simd_mode = (hp_simd_mode_t)v;
+        } else if (is_option(a, NULL, "--buffer-size")) {
+            if (!parse_count(a, option_value(argc, argv, &i), 1, &n)) return 1;
+            cfg->buffer_capacity = (size_t)n;
+        } else if (is_option(a, NULL, "--stats")) {
+            o->show_stats = true;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            complain("unknown option '%s' (see --help)", a);
+            return 1;
+        } else if (n_positional < 2) {
+            positional[n_positional++] = a;
+        } else {
+            complain("unexpected argument '%s'", a);
+            return 1;
+        }
+    }
+
+    /* Positional arguments are FILE then FILTER; either may also come from
+     * its option */
+    for (int k = 0; k < n_positional; k++) {
+        const char *a = positional[k];
+        bool as_input = !o->input_path &&
+                        (cfg->where_spec || n_positional - k > 1 || looks_like_input(a));
+        if (as_input) {
+            o->input_path = a;
+        } else if (!cfg->where_spec) {
+            cfg->where_spec = a;
+        } else {
+            complain("unexpected argument '%s'", a);
+            return 1;
+        }
+    }
+
+    if (o->output_path && ends_with(o->output_path, ".gz")) cfg->gzip_out = true;
+
+    if (cfg->count_only && o->output_path) {
+        complain("--count prints only the row count; it cannot be combined with -o");
+        return 1;
+    }
+    if (cfg->summary && (cfg->count_only || o->output_path || cfg->gzip_out)) {
+        complain("--summary cannot be combined with --count, -o or --gzip");
+        return 1;
+    }
+    if (o->jobs > 1) {
+        if (!o->input_path) {
+            complain("--jobs needs an input file; stdin cannot be split");
+            return 1;
+        }
+        if (cfg->limit_rows > 0 || cfg->summary) {
+            complain("--jobs cannot be combined with --head or --summary");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool check_select(const char *spec) {
+    static hp_projection_t projection;
+    if (!spec || hp_projection_init(&projection, spec) == HP_OK) return true;
+    complain("--select: more than %d columns, or a name longer than 127 bytes", HP_MAX_COLUMNS);
+    return false;
+}
+
+/* A filter error points at the place in the filter where parsing stopped */
+static bool check_filter(const char *where) {
+    static hp_filter_t filter;
+    if (!where || hp_filter_init(&filter, where) == HP_OK) return true;
+    complain("invalid filter: %s", filter.error);
+    fprintf(stderr, "  %s\n  %*s^\n", where, (int)filter.error_at, "");
+    return false;
+}
+
+static void report_error(hp_error_t err, const hp_transcoder_stats_t *st) {
+    if (err == HP_ERR_COLUMN_NOT_FOUND && st->error_column[0]) {
+        complain("no column '%s' in the input", st->error_column);
+    } else if (st->error_record) {
+        complain("%s at record %llu, byte %llu", hp_strerror(err),
+                 (unsigned long long)st->error_record, (unsigned long long)st->error_offset);
+    } else {
+        complain("%s", hp_strerror(err));
+    }
+}
+
+/* ---- main ------------------------------------------------------------------ */
+
 int main(int argc, char **argv) {
     use_binary_stdio();
 
-    const char *input_path = NULL;
-    const char *output_path = NULL;
-    const char *select_spec = NULL;
-    const char *where_spec = NULL;
-    const char *quarantine_path = NULL;
-    hp_format_t in_fmt = HP_FORMAT_AUTO;
-    hp_format_t out_fmt = HP_FORMAT_AUTO;
-    hp_on_error_t on_error = HP_ON_ERROR_FAIL;
-    hp_simd_mode_t simd_mode = HP_SIMD_AUTO;
-    size_t buf_cap = HP_DEFAULT_BUFFER_CAPACITY;
-    uint64_t limit_rows = 0;
-    bool show_stats = false;
-    bool count_only = false;
-    bool gzip_out = false;
-    bool summary_mode = false;
-    const char *schema_path = NULL;
-    int jobs = 0;              /* 0: auto */
+    options_t o;
+    memset(&o, 0, sizeof(o));
+    o.cfg.buffer_capacity = HP_DEFAULT_BUFFER_CAPACITY;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage();
-            return 0;
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            print_version();
-            return 0;
-        } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--input") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            input_path = argv[i];
-        } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            output_path = argv[i];
-        } else if (strcmp(argv[i], "--from") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            if (strcmp(argv[i], "auto") == 0) in_fmt = HP_FORMAT_AUTO;
-            else if (strcmp(argv[i], "csv") == 0) in_fmt = HP_FORMAT_CSV;
-            else if (strcmp(argv[i], "tsv") == 0) in_fmt = HP_FORMAT_TSV;
-            else if (strcmp(argv[i], "ndjson") == 0) in_fmt = HP_FORMAT_NDJSON;
-            else { fprintf(stderr, "Error: unknown input format: %s\n", argv[i]); return 1; }
-        } else if (strcmp(argv[i], "--to") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            if (strcmp(argv[i], "csv") == 0) out_fmt = HP_FORMAT_CSV;
-            else if (strcmp(argv[i], "tsv") == 0) out_fmt = HP_FORMAT_TSV;
-            else if (strcmp(argv[i], "ndjson") == 0) out_fmt = HP_FORMAT_NDJSON;
-            else { fprintf(stderr, "Error: unknown output format: %s\n", argv[i]); return 1; }
-        } else if (strcmp(argv[i], "--select") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            select_spec = argv[i];
-        } else if (strcmp(argv[i], "--where") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            where_spec = argv[i];
-        } else if (strcmp(argv[i], "--on-error") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            if (strcmp(argv[i], "fail") == 0) on_error = HP_ON_ERROR_FAIL;
-            else if (strcmp(argv[i], "skip") == 0) on_error = HP_ON_ERROR_SKIP;
-            else if (strcmp(argv[i], "quarantine") == 0) on_error = HP_ON_ERROR_QUARANTINE;
-            else { fprintf(stderr, "Error: unknown on-error mode: %s\n", argv[i]); return 1; }
-        } else if (strcmp(argv[i], "--quarantine") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            quarantine_path = argv[i];
-            on_error = HP_ON_ERROR_QUARANTINE;
-        } else if (strcmp(argv[i], "--head") == 0 || strcmp(argv[i], "--limit") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            char *end = NULL;
-            limit_rows = strtoull(argv[i], &end, 10);
-            if (end == argv[i] || *end != '\0') {
-                fprintf(stderr, "Error: invalid row limit: %s\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--count") == 0) {
-            count_only = true;
-        } else if (strcmp(argv[i], "--gzip") == 0) {
-            gzip_out = true;
-        } else if (strcmp(argv[i], "--summary") == 0) {
-            summary_mode = true;
-        } else if (strcmp(argv[i], "--schema") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            schema_path = argv[i];
-        } else if (strcmp(argv[i], "--jobs") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            char *end = NULL;
-            long n = strtol(argv[i], &end, 10);
-            if (strcmp(argv[i], "auto") == 0) {
-                jobs = 0;
-            } else if (end == argv[i] || *end != '\0' || n < 1) {
-                fprintf(stderr, "Error: invalid --jobs value: %s\n", argv[i]);
-                return 1;
-            } else {
-                jobs = (int)n;
-            }
-        } else if (strcmp(argv[i], "--simd") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            if (strcmp(argv[i], "auto") == 0) simd_mode = HP_SIMD_AUTO;
-            else if (strcmp(argv[i], "avx512") == 0) simd_mode = HP_SIMD_AVX512;
-            else if (strcmp(argv[i], "avx2") == 0) simd_mode = HP_SIMD_AVX2;
-            else if (strcmp(argv[i], "scalar") == 0) simd_mode = HP_SIMD_SCALAR;
-            else { fprintf(stderr, "Error: unknown SIMD mode: %s\n", argv[i]); return 1; }
-        } else if (strcmp(argv[i], "--buffer-size") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: missing argument for %s\n", argv[i-1]); return 1; }
-            char *end = NULL;
-            unsigned long long n = strtoull(argv[i], &end, 10);
-            if (end == argv[i] || *end != '\0' || n == 0) {
-                fprintf(stderr, "Error: invalid --buffer-size value: %s\n", argv[i]);
-                return 1;
-            }
-            buf_cap = (size_t)n;
-        } else if (strcmp(argv[i], "--stats") == 0) {
-            show_stats = true;
-        } else if (argv[i][0] != '-') {
-            /* Positional argument detection: either filename or filter query */
-            if (input_path == NULL && (strstr(argv[i], ".csv") || strstr(argv[i], ".tsv") ||
-                                       strstr(argv[i], ".json") || strstr(argv[i], ".log") ||
-                                       strstr(argv[i], ".txt") || file_exists(argv[i]))) {
-                input_path = argv[i];
-            } else if (where_spec == NULL) {
-                where_spec = argv[i];
-            } else if (input_path == NULL) {
-                input_path = argv[i];
-            } else {
-                fprintf(stderr, "Error: unexpected argument: %s\n", argv[i]);
-                return 1;
-            }
-        } else {
-            fprintf(stderr, "Error: unrecognized option: %s\n", argv[i]);
-            return 1;
-        }
-    }
+    int status = parse_args(argc, argv, &o);
+    if (status != 0) return status < 0 ? 0 : status;
+    if (!check_select(o.cfg.select_spec) || !check_filter(o.cfg.where_spec)) return 1;
 
-    /* A .gz output suffix implies --gzip regardless of option order */
-    if (output_path) {
-        size_t olen = strlen(output_path);
-        if (olen >= 3 && output_path[olen-1] == 'z' && output_path[olen-2] == 'g' && output_path[olen-3] == '.') {
-            gzip_out = true;
-        }
-    }
-
-    if (count_only && output_path) {
-        fprintf(stderr, "Error: --count prints the row count to stdout and produces no row output; omit -o/--output\n");
-        return 1;
-    }
-
-    if (summary_mode && (count_only || output_path || gzip_out)) {
-        fprintf(stderr, "Error: --summary prints its statistics table to stdout; it cannot be combined with --count, -o/--output or --gzip\n");
-        return 1;
-    }
-
-    /* Auto mode only picks the parallel path where it applies and pays off;
-     * an explicit --jobs N reports what keeps it from applying. */
-    const bool jobs_explicit = (jobs != 0);
+    /* --jobs auto takes the parallel path only where it applies and pays off;
+     * an explicit --jobs N says when it does not apply */
+    const bool jobs_explicit = (o.jobs != 0);
     if (!jobs_explicit) {
-        jobs = (input_path && limit_rows == 0 && !summary_mode) ? hp_parallel_auto_jobs(input_path) : 1;
-    }
-
-    if (jobs > 1 && jobs_explicit) {
-        if (!input_path) {
-            fprintf(stderr, "Error: --jobs requires a regular input file (stdin is not seekable)\n");
-            return 1;
-        }
-        if (limit_rows > 0) {
-            fprintf(stderr, "Error: --head/--limit is not supported with --jobs\n");
-            return 1;
-        }
-        if (summary_mode) {
-            fprintf(stderr, "Error: --summary is not supported with --jobs\n");
-            return 1;
-        }
+        o.jobs = (o.input_path && o.cfg.limit_rows == 0 && !o.cfg.summary)
+                     ? hp_parallel_auto_jobs(o.input_path) : 1;
     }
 
     FILE *in_f = stdin;
-    if (input_path) {
-        in_f = fopen(input_path, "rb");
-        if (!in_f) {
-            fprintf(stderr, "Error: failed to open input file '%s'\n", input_path);
-            return 1;
-        }
+    if (o.input_path && !(in_f = fopen(o.input_path, "rb"))) {
+        complain("cannot open '%s': %s", o.input_path, strerror(errno));
+        return 1;
     }
-
     FILE *out_f = stdout;
-    if (output_path) {
-        out_f = fopen(output_path, "wb");
-        if (!out_f) {
-            fprintf(stderr, "Error: failed to open output file '%s'\n", output_path);
-            if (in_f != stdin) fclose(in_f);
-            return 1;
-        }
+    if (o.output_path && !(out_f = fopen(o.output_path, "wb"))) {
+        complain("cannot create '%s': %s", o.output_path, strerror(errno));
+        if (in_f != stdin) fclose(in_f);
+        return 1;
     }
-    if (in_f) setvbuf(in_f, NULL, _IONBF, 0);
-    if (out_f) setvbuf(out_f, NULL, _IONBF, 0);
+    setvbuf(in_f, NULL, _IONBF, 0);
+    setvbuf(out_f, NULL, _IONBF, 0);
 
-    /* Default output format is resolved inside hp_transcoder_run() AFTER the
-     * input format has been sniffed: NDJSON input -> CSV output, everything
-     * else -> NDJSON output. Resolving it here (before sniffing) would freeze
-     * the output format on the CLI value instead of the detected one. */
+    hp_error_t err = HP_ERR_UNSUPPORTED;
+    hp_transcoder_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
 
-    hp_transcoder_config_t config = {
-        .in_format = in_fmt,
-        .out_format = out_fmt,
-        .simd_mode = simd_mode,
-        .on_error = on_error,
-        .quarantine_path = quarantine_path,
-        .select_spec = select_spec,
-        .where_spec = where_spec,
-        .buffer_capacity = buf_cap,
-        .limit_rows = limit_rows,
-        .count_only = count_only,
-        .gzip_out = gzip_out,
-        .summary = summary_mode,
-        .schema_path = schema_path,
-    };
-
-    hp_error_t err = HP_OK;
-    bool ran_parallel = false;
-    hp_transcoder_stats_t parallel_stats;
-    memset(&parallel_stats, 0, sizeof(parallel_stats));
-
-    if (jobs > 1) {
-        err = hp_parallel_run(&config, input_path, out_f, jobs, &parallel_stats);
-        if (err == HP_ERR_UNSUPPORTED) {
-            /* gzip input cannot be split, CSV skip/quarantine runs need the
-             * sequential resynchronization, and an unparsable first record
-             * belongs to the fault-tolerance mode: run single-threaded. */
-            if (jobs_explicit) {
-                fprintf(stderr, "Note: --jobs does not apply to this input "
-                                "(gzip, CSV with --on-error skip/quarantine, or unparsable first record); "
-                                "running single-threaded\n");
-            }
-        } else {
-            ran_parallel = true;
+    if (o.jobs > 1) {
+        err = hp_parallel_run(&o.cfg, o.input_path, out_f, o.jobs, &stats);
+        /* gzip input cannot be split, CSV skip/quarantine runs need the
+         * sequential resynchronization, and an unparsable first record
+         * belongs to the fault-tolerance mode: run single-threaded */
+        if (err == HP_ERR_UNSUPPORTED && jobs_explicit) {
+            complain("--jobs does not apply to gzip input, CSV with --on-error "
+                     "skip or quarantine, or an unparsable first record; "
+                     "running single-threaded");
         }
     }
 
-    if (!ran_parallel) {
-        hp_transcoder_t transcoder;
-        err = hp_transcoder_init(&transcoder, &config);
-        if (err != HP_OK) {
-            fprintf(stderr, "hyperpipe: %s\n", hp_strerror(err));
-            if (in_f != stdin) fclose(in_f);
-            if (out_f != stdout) fclose(out_f);
-            return 1;
-        }
-
-        err = hp_transcoder_run(&transcoder, in_f, out_f);
-
-        if (count_only) {
-            printf("%llu\n", (unsigned long long)transcoder.stats.rows_emitted);
-        }
-
-        if (show_stats) {
-            print_perf_stats(&transcoder.stats);
-        }
-
-        hp_transcoder_free(&transcoder);
-    } else {
-        if (count_only) {
-            printf("%llu\n", (unsigned long long)parallel_stats.rows_emitted);
-        }
-
-        if (show_stats) {
-            print_perf_stats(&parallel_stats);
+    if (err == HP_ERR_UNSUPPORTED) {
+        hp_transcoder_t tc;
+        err = hp_transcoder_init(&tc, &o.cfg);
+        if (err == HP_OK) {
+            err = hp_transcoder_run(&tc, in_f, out_f);
+            stats = tc.stats;
+            hp_transcoder_free(&tc);
         }
     }
 
-    if (err != HP_OK) fprintf(stderr, "hyperpipe: %s\n", hp_strerror(err));
+    if (o.cfg.count_only) printf("%llu\n", (unsigned long long)stats.rows_emitted);
+    if (o.show_stats) print_perf_stats(&stats);
+    if (err != HP_OK) report_error(err, &stats);
 
     if (in_f != stdin) fclose(in_f);
     if (out_f != stdout) fclose(out_f);
-
     return (err == HP_OK) ? 0 : 1;
 }

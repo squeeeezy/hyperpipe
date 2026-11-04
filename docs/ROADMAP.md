@@ -10,8 +10,6 @@ showing no workload slower.
 - ARM: NEON versions of the CSV and NDJSON kernels.
 - Positional parallel output on Windows: preallocate the file so chunks can
   be written at their offsets without NTFS zero-filling the gaps.
-- Error positions: report the record number and byte offset of a malformed
-  record.
 
 ## Later
 

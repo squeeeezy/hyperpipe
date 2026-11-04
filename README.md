@@ -34,7 +34,9 @@ hyperpipe [FILE] [FILTER] [options]
 
 Input is FILE or stdin. The format is detected from the first bytes, gzip
 input is decompressed, and the output format defaults to the other one:
-CSV and TSV become NDJSON, NDJSON becomes CSV.
+CSV and TSV become NDJSON, NDJSON becomes CSV. A single argument is the
+input file when such a file exists or when it cannot be a filter (no space
+and none of `= < > !`); otherwise it is the filter.
 
 ```
 hyperpipe access.csv                                    # CSV to NDJSON
@@ -51,7 +53,7 @@ hyperpipe access.csv --summary
 |---|---|
 | `-o FILE` | output file; a `.gz` name compresses |
 | `--from`, `--to` | `csv`, `tsv` or `ndjson` |
-| `--select COLUMNS` | columns to output, by name or 0-based position |
+| `--select COLUMNS` | comma-separated columns to output, by name or 0-based position |
 | `--where FILTER` | the filter, when not given as an argument |
 | `--count` | print the number of matching rows |
 | `--head N` | stop after N rows |
@@ -75,6 +77,15 @@ hyperpipe access.csv --summary
 | `A and B`, `A && B` | both |
 | `A or B`, `A \|\| B` | either; `A and B or C` is `(A and B) or C` |
 | `col == "007"` | a quoted literal always compares as text |
+
+`A, B` is the same as `A and B`. Values with spaces need quotes. A filter
+that does not parse is an error that points at the place it stopped:
+
+```
+hyperpipe: invalid filter: expected a value
+  status ==
+          ^
+```
 
 A numeric comparison matches only fields that are numbers in their whole
 length: `5000`, `5000.0` and `5e3` are equal, while `200abc`, `0x10`, `inf`
@@ -103,9 +114,17 @@ position.
 - Records up to the input buffer size are accepted, quoted and escaped
   fields included.
 
-Malformed records stop the run in `fail` mode. `skip` drops the record and
-resumes at the next line; `quarantine` also copies it, byte for byte, to the
-quarantine file.
+Malformed records stop the run in `fail` mode with the record's number and
+byte offset, which hold for parallel runs too:
+
+```
+hyperpipe: malformed CSV quoting at record 1234569, byte 31975292
+```
+
+Records are counted from the start of the input, header and blank lines
+included, so the record number is the line number unless quoted fields span
+lines. `skip` drops the record and resumes at the next line; `quarantine`
+also copies it, byte for byte, to the quarantine file.
 
 ## Parallel runs
 

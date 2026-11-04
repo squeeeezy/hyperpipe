@@ -17,6 +17,15 @@ default for large files; and every workload is at least as fast as in 1.5.
   lines, missing commas, trailing text and invalid escapes are malformed
   records (`HP_ERR_PARSE_JSON`) handled by `--on-error`.
 - CSV text after a closing quote (`"abc"xyz`) is a malformed record.
+- Filters parse strictly. A missing value, an unterminated quote, two
+  conditions without `and`/`or`, a value over 255 bytes or more than 16
+  conditions are errors; before, they matched silently or were truncated.
+- `--select` splits on commas only and trims each name, so names may hold
+  spaces; a name over 127 bytes is an error instead of being truncated.
+- A single argument is the input file when the file exists or the argument
+  cannot be a filter; before, names containing `.csv` or `.log` anywhere
+  were taken as files.
+- `--help` prints to stdout. Every message starts with `hyperpipe:`.
 - Numeric predicates compare values: `a == 5000` matches `5000.0` and `5e3`;
   fields such as `200abc`, `0x10` and `inf` are not numbers.
 - Column references resolve by header name first, by position otherwise.
@@ -31,6 +40,11 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- Errors say where: a malformed or oversized record by its number and byte
+  offset (parallel runs included), a filter by the place parsing stopped,
+  a missing column by its name. Library: `records_in`, `error_record`,
+  `error_offset` and `error_column` in `hp_transcoder_stats_t`, and
+  `HP_ERR_FILTER` with `error`/`error_at` in `hp_filter_t`.
 - Nested NDJSON values. Objects and arrays are checked against the JSON
   grammar and pass through as JSON text: verbatim to NDJSON, as a text
   field to CSV and TSV. Nesting deeper than 512 levels is a malformed
