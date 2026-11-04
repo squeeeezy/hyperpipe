@@ -128,6 +128,7 @@ static hp_error_t parse_fns(hp_agg_t *agg, const char *text) {
     }
 }
 
+/* "column", or "hour(column)" and the other time units */
 static hp_error_t parse_keys(hp_agg_t *agg, const char *text) {
     const char *p = text;
     for (;;) {
@@ -136,6 +137,17 @@ static hp_error_t parse_keys(hp_agg_t *agg, const char *text) {
         while (*p && *p != ',') p++;
         const char *end = p;
         while (end > start && isspace((unsigned char)end[-1])) end--;
+
+        int unit = -1;
+        const char *paren = memchr(start, '(', (size_t)(end - start));
+        hp_time_unit_t u;
+        if (paren && end[-1] == ')' && hp_time_unit_from_name(start, (size_t)(paren - start), &u)) {
+            unit = (int)u;
+            start = skip_space(paren + 1);
+            end--;
+            while (end > start && isspace((unsigned char)end[-1])) end--;
+            if (end == start) return HP_ERR_INVALID_ARG;
+        }
         size_t len = (size_t)(end - start);
         if (len > 0) {
             if (agg->key_count == HP_AGG_MAX_KEYS || len >= sizeof(agg->keys[0])) {
@@ -143,6 +155,7 @@ static hp_error_t parse_keys(hp_agg_t *agg, const char *text) {
             }
             memcpy(agg->keys[agg->key_count], start, len);
             agg->keys[agg->key_count][len] = '\0';
+            agg->key_unit[agg->key_count] = unit;
             agg->key_index[agg->key_count++] = -1;
         }
         if (!*p) return HP_OK;
@@ -209,7 +222,14 @@ hp_error_t hp_agg_bind(hp_agg_t *agg, const hp_header_t *header, const char **mi
 hp_error_t hp_agg_header(const hp_agg_t *agg, hp_header_t *out) {
     hp_header_free(out);
     for (size_t k = 0; k < agg->key_count; k++) {
-        if (!(out->names[out->count] = strdup(agg->keys[k]))) return HP_ERR_NOMEM;
+        char name[160];
+        if (agg->key_unit[k] >= 0) {
+            snprintf(name, sizeof(name), "%s(%s)", hp_time_unit_name((hp_time_unit_t)agg->key_unit[k]),
+                     agg->keys[k]);
+        } else {
+            snprintf(name, sizeof(name), "%s", agg->keys[k]);
+        }
+        if (!(out->names[out->count] = strdup(name))) return HP_ERR_NOMEM;
         out->count++;
     }
     for (size_t i = 0; i < agg->fn_count; i++) {
@@ -340,16 +360,31 @@ static uint64_t hash_field(uint64_t h, const char *p, size_t n, bool present) {
     return h;
 }
 
-HP_INLINE const hp_str_t *key_field(const hp_agg_t *agg, const hp_row_t *row, size_t k) {
-    size_t idx = (size_t)agg->key_index[k];
-    if (idx >= row->field_count || !row->fields[idx].present) return NULL;
-    return &row->fields[idx];
+/* The row's value for each key column: the field, or for hour(col) and the
+ * like the bucket of its time. NULL for a missing value and for one that
+ * is not a time. */
+static void row_keys(hp_agg_t *agg, const hp_row_t *row, const hp_str_t **vals, hp_str_t *buckets) {
+    for (size_t k = 0; k < agg->key_count; k++) {
+        size_t idx = (size_t)agg->key_index[k];
+        const hp_str_t *f = idx < row->field_count && row->fields[idx].present ? &row->fields[idx] : NULL;
+        int64_t us;
+        if (f && agg->key_unit[k] >= 0) {
+            if (!f->is_json && hp_time_parse(f->ptr, f->len, &us)) {
+                size_t len = hp_time_format(us, (hp_time_unit_t)agg->key_unit[k], agg->key_text[k]);
+                buckets[k] = (hp_str_t){ .ptr = agg->key_text[k], .len = len, .present = true };
+                f = &buckets[k];
+            } else {
+                f = NULL;
+            }
+        }
+        vals[k] = f;
+    }
 }
 
-static uint64_t row_hash(const hp_agg_t *agg, const hp_row_t *row) {
+static uint64_t row_hash(const hp_agg_t *agg, const hp_str_t *const *vals) {
     uint64_t h = 0;
     for (size_t k = 0; k < agg->key_count; k++) {
-        const hp_str_t *f = key_field(agg, row, k);
+        const hp_str_t *f = vals[k];
         h = f ? hash_field(h, f->ptr, f->len, true) : hash_field(h, "", 0, false);
     }
     return h;
@@ -361,9 +396,9 @@ static uint32_t read_len(const char *p) {
     return len;
 }
 
-static bool row_matches(const hp_agg_t *agg, const char *key, const hp_row_t *row) {
+static bool row_matches(const hp_agg_t *agg, const char *key, const hp_str_t *const *vals) {
     for (size_t k = 0; k < agg->key_count; k++) {
-        const hp_str_t *f = key_field(agg, row, k);
+        const hp_str_t *f = vals[k];
         uint32_t len = read_len(key);
         bool present = (key[4] & KEY_PRESENT) != 0;
         if (present != (f != NULL)) return false;
@@ -399,17 +434,16 @@ static hp_error_t reserve_keys(hp_agg_t *agg, size_t more) {
 }
 
 /* Appends the row's key to key_bytes, without claiming it yet */
-static hp_error_t encode_row_key(hp_agg_t *agg, const hp_row_t *row, size_t *key_len) {
+static hp_error_t encode_row_key(hp_agg_t *agg, const hp_str_t *const *vals, size_t *key_len) {
     size_t need = 0;
     for (size_t k = 0; k < agg->key_count; k++) {
-        const hp_str_t *f = key_field(agg, row, k);
-        need += KEY_FIELD_HEADER + (f ? f->len : 0);
+        need += KEY_FIELD_HEADER + (vals[k] ? vals[k]->len : 0);
     }
     if (reserve_keys(agg, need) != HP_OK) return HP_ERR_NOMEM;
 
     char *w = agg->key_bytes + agg->key_len;
     for (size_t k = 0; k < agg->key_count; k++) {
-        const hp_str_t *f = key_field(agg, row, k);
+        const hp_str_t *f = vals[k];
         uint32_t len = f ? (uint32_t)f->len : 0;
         memcpy(w, &len, 4);
         w[4] = (char)(f ? KEY_PRESENT | (f->has_escapes ? KEY_ESCAPES : 0) |
@@ -465,16 +499,19 @@ static hp_error_t add_group(hp_agg_t *agg, uint64_t hash, size_t key_len, size_t
 
 static hp_error_t find_row_group(hp_agg_t *agg, const hp_row_t *row, size_t *g) {
     if (!agg->slots && grow_slots(agg) != HP_OK) return HP_ERR_NOMEM;
-    uint64_t hash = row_hash(agg, row);
+    const hp_str_t *vals[HP_AGG_MAX_KEYS];
+    hp_str_t buckets[HP_AGG_MAX_KEYS];
+    row_keys(agg, row, vals, buckets);
+    uint64_t hash = row_hash(agg, vals);
     for (size_t i = hash & agg->slot_mask; agg->slots[i]; i = (i + 1) & agg->slot_mask) {
         const hp_agg_group_t *grp = &agg->groups[agg->slots[i] - 1];
-        if (grp->hash == hash && row_matches(agg, agg->key_bytes + grp->key_off, row)) {
+        if (grp->hash == hash && row_matches(agg, agg->key_bytes + grp->key_off, vals)) {
             *g = agg->slots[i] - 1;
             return HP_OK;
         }
     }
     size_t key_len = 0;
-    hp_error_t err = encode_row_key(agg, row, &key_len);
+    hp_error_t err = encode_row_key(agg, vals, &key_len);
     if (err != HP_OK) return err;
     return add_group(agg, hash, key_len, g);
 }

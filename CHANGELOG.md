@@ -40,6 +40,11 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- Time: ISO 8601, the common log format and Unix time are recognized in any
+  field. `--group-by` takes `year`, `month`, `day`, `hour` and `minute` of a
+  column, and unquoted ISO 8601 literals in filters compare as times
+  (`ts >= 2024-03-05T12:00`). In UTC, independent of the machine's time
+  zone. Library: `hp_time.h`, `is_time` in `hp_predicate_t`.
 - `--sort` with `-col` for descending order and `--memory` for its budget.
   Stable, numbers by value and text by bytes, empty values last; `--head N`
   keeps N rows in a heap; larger inputs spill sorted runs to temporary

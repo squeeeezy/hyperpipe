@@ -116,6 +116,10 @@ SORT_HP = "-bytes,host,timestamp,request"
 SORT_SQL = "TRY_CAST(bytes AS BIGINT) DESC NULLS LAST, host, timestamp, request"
 
 
+# The common log format timestamp as a time, in SQL
+CLF_SQL = "strptime(timestamp, '%d/%b/%Y:%H:%M:%S %z')"
+
+
 def tasks(a, hp, out):
     """Each task: name, output kind, {tool: (argv, writes_stdout)}."""
     q = lambda s: s.replace("'", "''")
@@ -176,6 +180,20 @@ def tasks(a, hp, out):
             "hyperpipe -j1": ([hp, nd, "--group-by", "status", "--agg", "count, avg(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
             "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(*), avg(TRY_CAST(bytes AS BIGINT)) FROM read_json('{q(nd)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
             "miller": (["mlr", "--ijsonl", "--ocsv", "stats1", "-a", "count,mean", "-f", "bytes", "-g", "status", nd], True),
+        }),
+        ("count per hour", "groups", {
+            "hyperpipe": ([hp, big, "--group-by", "hour(timestamp)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--group-by", "hour(timestamp)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, f"SELECT strftime({CLF_SQL}, '%Y-%m-%d %H:00') AS h, count(*) AS n FROM _t_1 GROUP BY h", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"SET TimeZone = 'UTC'; COPY (SELECT strftime(date_trunc('hour', {CLF_SQL}), '%Y-%m-%d %H:00') AS h, count(*) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) GROUP BY h) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "put", "-q", "@n[strftime(strptime($timestamp, \"%d/%b/%Y:%H:%M:%S %z\"), \"%Y-%m-%d %H:00\")] += 1; end { emit @n, \"h\" }", big], True),
+        }),
+        ("count in a time range", "count", {
+            "hyperpipe": ([hp, big, "timestamp >= 1995-07-01T04:30Z and timestamp < 1995-07-01T05:00Z", "--count"], True),
+            "hyperpipe -j1": ([hp, big, "timestamp >= 1995-07-01T04:30Z and timestamp < 1995-07-01T05:00Z", "--count", "--jobs", "1"], True),
+            "qsv sqlp": (["qsv", "sqlp", big, f"SELECT count(*) AS n FROM _t_1 WHERE {CLF_SQL} >= '1995-07-01 04:30:00+00:00' AND {CLF_SQL} < '1995-07-01 05:00:00+00:00'"], True),
+            "duckdb": (["duckdb", "-noheader", "-list", "-c", f"SELECT count(*) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) WHERE {CLF_SQL} >= TIMESTAMPTZ '1995-07-01 04:30:00+00' AND {CLF_SQL} < TIMESTAMPTZ '1995-07-01 05:00:00+00'"], True),
+            "miller": (["mlr", "--icsv", "--onidx", "filter", "t = strptime($timestamp, \"%d/%b/%Y:%H:%M:%S %z\"); t >= 804573000 && t < 804574800", "then", "count", big], True),
         }),
         ("sort by bytes, top 10", "csv", {
             "hyperpipe": ([hp, big, "--sort", SORT_HP, "--head", "10", "--to", "csv", "-o", out], False),

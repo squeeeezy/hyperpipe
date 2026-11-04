@@ -1,4 +1,5 @@
 #include "hyperpipe/hp_filter.h"
+#include "hyperpipe/hp_time.h"
 #include "hp_number.h"
 #include <ctype.h>
 
@@ -205,7 +206,9 @@ static hp_error_t parse_predicate(hp_filter_t *filter, const char *clause, const
      * string operators always compare text */
     bool text_op = pred->op == HP_OP_CONTAINS || pred->op == HP_OP_STARTSWITH ||
                    pred->op == HP_OP_ENDSWITH;
-    if (!quoted && !text_op) {
+    if (!quoted && !text_op && hp_time_parse_iso(pred->str_val, value_len, &pred->time_val)) {
+        pred->is_time = true;
+    } else if (!quoted && !text_op) {
         pred->is_int = hp_parse_int_span(pred->str_val, value_len, &pred->int_val);
         pred->is_positive_canonical_int =
             pred->is_int && pred->str_val[0] >= '1' && pred->str_val[0] <= '9';
@@ -216,6 +219,8 @@ static hp_error_t parse_predicate(hp_filter_t *filter, const char *clause, const
             pred->is_num = hp_parse_decimal_span(pred->str_val, value_len, &pred->num_val);
         }
     }
+    pred->eq_by_bytes = pred->op == HP_OP_EQ && !pred->is_time &&
+                        (!pred->is_num || pred->is_positive_canonical_int);
 
     *pp = p;
     return HP_OK;
@@ -366,6 +371,13 @@ static bool hp_pred_matches(const hp_predicate_t *pred, const hp_row_t *row) {
     const hp_str_t *f = &row->fields[pred->col_index];
     const char *ptr = f->ptr;
     size_t len = f->len;
+
+    /* A time literal only matches fields that are times */
+    if (pred->is_time) {
+        int64_t us;
+        if (f->is_json || !hp_time_parse(ptr, len, &us)) return false;
+        return hp_cmp_matches(pred->op, hp_sign_i64(us, pred->time_val));
+    }
 
     if (pred->is_num) {
         /* Same bytes as the literal: equal without parsing */

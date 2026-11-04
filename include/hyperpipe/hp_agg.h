@@ -2,12 +2,15 @@
 #define HYPERPIPE_HP_AGG_H
 
 #include "hp_common.h"
+#include "hp_time.h"
 
 /* --group-by and --agg: hash aggregation.
  *
  * Every row that passes the filter is folded into the group of its key, the
  * bytes of the --group-by columns; without --group-by there is one group.
- * Groups come out in the order their first row arrived.
+ * A key column may be a time bucket, hour(col) and the like (hp_time.h):
+ * the start of the hour that holds the column's time. Groups come out in
+ * the order their first row arrived.
  *
  * Sums, minimums and maximums are exact decimals while the values have at
  * most 18 significant digits and the sum fits in 128 bits; past that they
@@ -39,8 +42,10 @@ typedef struct hp_agg_group_s hp_agg_group_t;
 typedef struct hp_agg_acc_s hp_agg_acc_t;
 
 typedef struct hp_agg_s {
-    char keys[HP_AGG_MAX_KEYS][128];
+    char keys[HP_AGG_MAX_KEYS][128];       /* the key columns */
     int64_t key_index[HP_AGG_MAX_KEYS];
+    int key_unit[HP_AGG_MAX_KEYS];         /* an hp_time_unit_t, or -1 for the value */
+    char key_text[HP_AGG_MAX_KEYS][HP_TIME_TEXT_MAX];  /* the current row's buckets */
     size_t key_count;
     hp_agg_spec_t fns[HP_AGG_MAX_FNS];
     size_t fn_count;

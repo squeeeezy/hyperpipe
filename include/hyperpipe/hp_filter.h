@@ -26,9 +26,15 @@ typedef struct hp_predicate_s {
     int64_t int_val;
     bool is_num;
     bool is_int;
+    /* An unquoted ISO 8601 literal: fields compare as times (hp_time.h) */
+    bool is_time;
+    int64_t time_val;
     /* str_val is a positive integer written without sign or leading zeros
-     * ("500"); enables the inline equality test in hp_filter_matches() */
+     * ("500") */
     bool is_positive_canonical_int;
+    /* An == whose answer a byte compare can settle, often without parsing:
+     * text, or a positive canonical integer (see hp_filter_matches) */
+    bool eq_by_bytes;
     /* set from --schema hints at bind time: the column is declared to hold
      * integers, so numeric predicates use the fast int64 span parser and
      * compare in double space (see hp_pred_matches) */
@@ -100,7 +106,7 @@ HP_INLINE bool hp_filter_matches(const hp_filter_t *filter, const hp_row_t *row)
     if (filter->count == 0) return true;
 
     const hp_predicate_t *p = &filter->preds[0];
-    if (filter->count == 1 && p->op == HP_OP_EQ && (!p->is_num || p->is_positive_canonical_int)) {
+    if (filter->count == 1 && p->eq_by_bytes) {
         if (p->col_index < 0 || (size_t)p->col_index >= row->field_count) return false;
         const hp_str_t *f = &row->fields[p->col_index];
         const size_t n = f->len < p->str_val_len ? f->len : p->str_val_len;

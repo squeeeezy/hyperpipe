@@ -126,6 +126,17 @@ coordinator merges them in chunk order, which keeps arrival order, and
 writes the rows through `hp_transcoder_write_groups()`, the same writer a
 single-threaded run uses.
 
+## Time
+
+`src/hp_time.c` reads a timestamp by its shape (a `-` at offset 4 for ISO
+8601, a `/` at offset 2 for the common log format, digits for Unix time)
+with fixed-position digit reads, applies the offset, and converts the date
+with Howard Hinnant's `days_from_civil`, so nothing depends on the C
+library's time zone or locale. Times are microseconds since 1970 in UTC.
+Buckets are written by hand as sortable text. `hour(col)` keys are computed
+once per row and then hashed and stored like any key; time literals in
+filters are parsed once, and each field is parsed as it is compared.
+
 ## Sorting
 
 `src/hp_sort.c`. A row is serialized as usual, but into a page of its own;

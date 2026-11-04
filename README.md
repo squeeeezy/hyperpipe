@@ -49,6 +49,7 @@ hyperpipe dirty.csv --on-error quarantine --quarantine bad.txt
 hyperpipe access.csv --summary
 hyperpipe access.csv --group-by status --agg "count, sum(bytes)"
 hyperpipe access.csv --sort -bytes --head 10
+hyperpipe access.csv "timestamp >= 1995-07-01T12:00" --group-by "hour(timestamp)"
 ```
 
 | Option | |
@@ -84,7 +85,10 @@ hyperpipe access.csv --sort -bytes --head 10
 | `A or B`, `A \|\| B` | either; `A and B or C` is `(A and B) or C` |
 | `col == "007"` | a quoted literal always compares as text |
 
-`A, B` is the same as `A and B`. Values with spaces need quotes. A filter
+`A, B` is the same as `A and B`. Values with spaces need quotes. An
+unquoted ISO 8601 literal (`2024-03-05`, `2024-03-05T12:00+02:00`) compares
+times: `ts >= 2024-03-05` matches the fields that are times at or after
+midnight UTC, in any form listed under Time. A filter
 that does not parse is an error that points at the place it stopped:
 
 ```
@@ -129,6 +133,24 @@ hyperpipe access.csv --group-by host --count            # the number of distinct
   the double nearest to the exact sum divided by the count.
 - The result is the same for every `--jobs`. `--head N` writes the first N
   groups. Memory grows with the number of groups.
+
+## Time
+
+Timestamps are recognized in any field: ISO 8601 (`2024-03-05`,
+`2024-03-05T12:34`, `2024-03-05 12:34:56.789+02:00`), the common log format
+of web servers (`01/Jul/1995:00:00:01 -0400`), and Unix time in seconds or
+milliseconds. Offsets are applied, so times are in UTC; a time without an
+offset is taken as UTC.
+
+`--group-by` takes `year(col)`, `month(col)`, `day(col)`, `hour(col)` and
+`minute(col)`, which group by the start of that unit, written as sortable
+text (`1995-07-01 04:00`). Values that are not times fall into one group
+with an empty key.
+
+```
+hyperpipe access.log --group-by "day(timestamp), status" --agg "count, sum(bytes)"
+hyperpipe events.jsonl "ts >= 2024-03-01 and ts < 2024-04-01" --group-by "hour(ts)" --sort "hour(ts)"
+```
 
 ## Sorting
 
@@ -230,6 +252,8 @@ equal (median time, peak RSS):
 | group by status: count, sum | 23 ms, 14 MiB | 97 ms, 190 MiB | 91 ms, 183 MiB | | |
 | group by host: count | 21 ms, 20 MiB | 91 ms, 194 MiB | 88 ms, 192 MiB | 511 ms, 534 MiB | |
 | NDJSON group by status: count, avg | 33 ms, 14 MiB | 108 ms, 231 MiB | | 3,922 ms, 140 MiB | |
+| count per hour | 32 ms, 14 MiB | 154 ms, 185 MiB | 147 ms, 214 MiB | 5,592 ms, 542 MiB | |
+| count in a time range | 37 ms, 11 MiB | 171 ms, 184 MiB | 235 ms, 210 MiB | 3,093 ms, 572 MiB | |
 | sort by bytes, top 10 | 35 ms, 13 MiB | 111 ms, 156 MiB | 139 ms, 353 MiB | | |
 | sort 1M rows by four columns | 206 ms, 266 MiB | 401 ms, 678 MiB | 461 ms, 755 MiB | | |
 | start-up, 5,000 rows | 2 ms, 2 MiB | 39 ms, 51 MiB | 23 ms, 61 MiB | 7 ms, 17 MiB | |

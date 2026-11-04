@@ -205,6 +205,27 @@ is always `-`); SQL and HyperPipe leave it empty, so miller is not timed.
 | HyperPipe, one thread | 127 ms | 3.8x | 3 MiB |
 | miller | 3,922 ms | 118.8x | 140 MiB |
 
+**Count per hour** (`--group-by "hour(timestamp)"`; the others parse the
+common log format with `strptime` and print the same bucket text)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 32 ms | 1.0x | 14 MiB |
+| HyperPipe, one thread | 82 ms | 2.6x | 3 MiB |
+| qsv sqlp | 147 ms | 4.6x | 214 MiB |
+| DuckDB | 154 ms | 4.9x | 185 MiB |
+| miller | 5,592 ms | 176.4x | 542 MiB |
+
+**Count in a time range** (`timestamp >= 1995-07-01T04:30Z and timestamp < 1995-07-01T05:00Z`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 37 ms | 1.0x | 11 MiB |
+| HyperPipe, one thread | 112 ms | 3.1x | 3 MiB |
+| DuckDB | 171 ms | 4.7x | 184 MiB |
+| qsv sqlp | 235 ms | 6.4x | 210 MiB |
+| miller | 3,093 ms | 84.6x | 572 MiB |
+
 **Sort by bytes, top 10** (`--sort -bytes,host,timestamp,request --head 10`)
 
 | Tool | Time | | Peak RSS |

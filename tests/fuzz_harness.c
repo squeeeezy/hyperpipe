@@ -264,8 +264,9 @@ static int check_input(const uint8_t *data, size_t size) {
         const hp_transcoder_config_t grouped = {
             .in_format = fmt ? HP_FORMAT_NDJSON : HP_FORMAT_CSV,
             .out_format = fmt ? HP_FORMAT_CSV : HP_FORMAT_NDJSON,
-            .group_by_spec = "0",
+            .group_by_spec = "0, hour(1)",
             .agg_spec = "count, count(1), sum(1), avg(1), min(1), max(1)",
+            .where_spec = (size & 2) ? "1 >= 2000-01-01T00:00+01:00" : NULL,
         };
         out_buf_t gout = { 0 };
         (void)transcode(grouped, doc, size, &gout);
