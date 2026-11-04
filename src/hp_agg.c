@@ -4,17 +4,6 @@
 #include "hp_number.h"
 #include "hp_quantile.h"
 
-/* Exact sums are scaled integers. 128 bits hold any 18-digit value at any
- * of the 19 scales with room for 10^20 more additions; without a 128-bit
- * type, sums stay exact while they fit in 64. */
-#if defined(__SIZEOF_INT128__)
-__extension__ typedef __int128 hp_wide_t;
-__extension__ typedef unsigned __int128 hp_uwide_t;
-#else
-typedef int64_t hp_wide_t;
-typedef uint64_t hp_uwide_t;
-#endif
-
 /* A number from the input: mant * 10^-scale when exact, otherwise f */
 typedef struct hp_agg_num_s {
     int64_t mant;
@@ -669,37 +658,8 @@ static size_t format_u64(char *out, uint64_t v) {
     return n;
 }
 
-/* v * 10^-scale as decimal text: "-12.50", "0.05" */
-static size_t format_decimal(char *out, hp_wide_t v, int scale) {
-    char digits[48];
-    size_t n = 0, w = 0;
-    hp_uwide_t u = v < 0 ? (hp_uwide_t)0 - (hp_uwide_t)v : (hp_uwide_t)v;
-    do {
-        digits[n++] = (char)('0' + (int)(u % 10));
-        u /= 10;
-    } while (u);
-    while (n <= (size_t)scale) digits[n++] = '0';
-
-    if (v < 0) out[w++] = '-';
-    for (size_t i = n; i-- > 0;) {
-        out[w++] = digits[i];
-        if (i == (size_t)scale && scale > 0) out[w++] = '.';
-    }
-    return w;
-}
-
-/* The shortest text that reads back as the same double */
-static size_t format_double(char *out, double v) {
-    int n = 0;
-    for (int prec = 15; prec <= 17; prec++) {
-        n = snprintf(out, HP_AGG_VALUE_MAX, "%.*g", prec, v);
-        if (strtod(out, NULL) == v) break;
-    }
-    return (size_t)n;
-}
-
 static size_t format_num(char *out, const hp_agg_num_t *v) {
-    return v->exact ? format_decimal(out, v->mant, v->scale) : format_double(out, v->f);
+    return v->exact ? hp_format_decimal(out, v->mant, v->scale) : hp_format_double(out, v->f);
 }
 
 /* Writes one aggregate value; returns 0 when it has none (no numbers) */
@@ -710,25 +670,25 @@ static size_t format_acc(char *out, const hp_agg_acc_t *acc, const hp_agg_spec_t
     double v;
     switch (fn) {
         case HP_AGG_QUANTILE:
-            return hp_quantile_get(acc->quant, spec->q, &v) ? format_double(out, v) : 0;
+            return hp_quantile_get(acc->quant, spec->q, &v) ? hp_format_double(out, v) : 0;
         case HP_AGG_SUM:
-            return acc->inexact ? format_double(out, acc->fsum)
-                                : format_decimal(out, acc->sum, acc->scale);
+            return acc->inexact ? hp_format_double(out, acc->fsum)
+                                : hp_format_decimal(out, acc->sum, acc->scale);
         case HP_AGG_AVG: {
-            if (acc->inexact) return format_double(out, acc->fsum / (double)acc->n);
+            if (acc->inexact) return hp_format_double(out, acc->fsum / (double)acc->n);
             /* sum / (n * 10^scale) from the exact sum, so the result does
              * not depend on the order rows were folded in. Below 2^53 both
              * are exact doubles and one division rounds correctly. */
             const hp_wide_t exact53 = (hp_wide_t)1 << 53;
             hp_wide_t den = (hp_wide_t)acc->n;
             if (!scale_up(&den, acc->scale)) {
-                return format_double(out, acc_sum_double(acc) / (double)acc->n);
+                return hp_format_double(out, acc_sum_double(acc) / (double)acc->n);
             }
             if (acc->sum <= exact53 && acc->sum >= -exact53 && den <= exact53) {
-                return format_double(out, (double)acc->sum / (double)den);
+                return hp_format_double(out, (double)acc->sum / (double)den);
             }
             hp_wide_t q = acc->sum / den, r = acc->sum % den;
-            return format_double(out, (double)q + (double)r / (double)den);
+            return hp_format_double(out, (double)q + (double)r / (double)den);
         }
         case HP_AGG_MIN: return format_num(out, &acc->min);
         case HP_AGG_MAX: return format_num(out, &acc->max);

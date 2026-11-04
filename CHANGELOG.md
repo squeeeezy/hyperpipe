@@ -40,6 +40,13 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- Paths into JSON values, `meta.user.id`, `tags[0]`, `tags[-1]`, wherever a
+  column goes: filters, `--select`, `--group-by`, `--agg` and `--sort`.
+  They read NDJSON objects and arrays, and JSON held in text.
+- `--add "name = expression"`: computed columns with arithmetic, exact on
+  decimals, and `lower`, `upper`, `trim`, `len`, `substr`, `split_part`,
+  `replace`, `concat`, `coalesce`, `abs`, `round`, `floor`, `ceil` and the
+  time units. Filters, groups and sorting read them as input columns.
 - `count_distinct(col)`, exact, and quantiles: `median(col)` and `pN(col)`
   for any percentile (`p95`, `p99.9`). Quantiles are exact, as numpy and
   pandas compute them, up to 1,024 values per group and within 1% past
@@ -112,6 +119,12 @@ workload is as fast or faster.
 - CSV records are written with one bounds check, short fields are copied
   inline, and the quoting decision scans a word at a time.
 - The single-equality filter is decided inline with one byte compare.
+- NDJSON lines with object or array values stay on the structural fast
+  path, which jumps over them, instead of being parsed twice (1.3-1.5x on
+  nested events).
+- Doubles, as averages, quantiles and quotients, are written from exact
+  integer arithmetic instead of a `printf` and `strtod` loop, with the same
+  text: 30 ns a value instead of up to 900.
 
 ### Build and tests
 - Every test runs on Windows and reports TAP; `make test` runs all of them.

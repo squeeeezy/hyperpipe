@@ -81,6 +81,25 @@ hp_error_t hp_json_parse_line_ex(const char *line,
                                  char *value_arena,
                                  size_t arena_size);
 
+/* One step of a path into a JSON value: the member named key of an object,
+ * or the element at index of an array (from the end when negative). A step
+ * written as .0 has both, so it reads either. */
+#define HP_JSON_NO_INDEX INT64_MIN
+
+typedef struct hp_json_step_s {
+    const char *key;       /* NULL for a step written as [n] */
+    size_t key_len;
+    int64_t index;         /* HP_JSON_NO_INDEX for a key that is not a number */
+} hp_json_step_t;
+
+/* Follows steps into the JSON text json and fills out with the value found:
+ * a string decoded (into arena when it holds escapes, which needs no more
+ * than len bytes), an object or array as JSON text, or a literal. Returns
+ * false when the path leads nowhere or to null, or the text is not valid
+ * JSON on the way. */
+bool hp_json_lookup(const char *json, size_t len, const hp_json_step_t *steps, size_t count,
+                    hp_str_t *out, char *arena);
+
 /* Strict JSON number grammar check (RFC 8259): integers, fractions and
  * exponents, nothing else. */
 bool hp_json_is_number(const char *s, size_t len);

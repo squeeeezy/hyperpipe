@@ -11,6 +11,7 @@
 #include "hp_summary.h"
 #include "hp_agg.h"
 #include "hp_sort.h"
+#include "hp_compute.h"
 
 typedef struct hp_transcoder_config_s {
     hp_format_t in_format;
@@ -56,6 +57,8 @@ typedef struct hp_transcoder_config_s {
      * quarantine_path (parallel workers keep chunk order this way). */
     size_t (*quarantine_sink)(void *ctx, const void *data, size_t len);
     void *quarantine_ctx;
+    /* --add (hp_compute.h): computed columns, after the input's */
+    const char *compute_spec;
 } hp_transcoder_config_t;
 
 typedef struct hp_transcoder_stats_s {
@@ -96,6 +99,8 @@ typedef struct hp_transcoder_s {
     uint8_t *page_buf_data;
     size_t page_buf_cap;
     hp_gzip_deflate_t *gz_out;    /* output side compression (when enabled) */
+    hp_compute_t *compute;        /* --add and paths into JSON (heap) */
+    size_t visible_seen;          /* input columns project_visible() has looked at */
 } hp_transcoder_t;
 
 hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg);

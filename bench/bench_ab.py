@@ -71,7 +71,13 @@ def main():
     sizes = {a.csv: os.path.getsize(a.csv), a.ndjson: os.path.getsize(a.ndjson)}
     names = [os.path.basename(b) for b in a.bins]
     print(f"{'workload':32}" + "".join(f"{n:>22}" for n in names) + "   speedup  same")
-    tmp = tempfile.mkdtemp(prefix="hpab_", dir=a.out_dir)
+    # Outputs of hundreds of MiB each: on a RAM disk, leftovers would take
+    # memory from the next runs
+    with tempfile.TemporaryDirectory(prefix="hpab_", dir=a.out_dir) as tmp:
+        run_workloads(a, extra, sizes, tmp)
+
+
+def run_workloads(a, extra, sizes, tmp):
     for label, args in workloads(a.csv, a.ndjson):
         if a.filter and a.filter not in label:
             continue

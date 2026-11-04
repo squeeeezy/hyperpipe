@@ -8,8 +8,6 @@ showing no workload slower.
 
 - `--distinct`: unique rows, or unique values of some columns.
 - Join with a smaller file held in memory.
-- Paths into nested NDJSON values (`meta.x.y`) in filters, `--select` and
-  `--group-by`.
 - MSVC: replace the GCC builtins and target attributes in the SIMD units.
 - ARM: NEON versions of the CSV and NDJSON kernels.
 - Positional parallel output on Windows: preallocate the file so chunks can

@@ -119,8 +119,17 @@ numbers-and-`-` `bytes` column as JSON and write it back as JSON text.
 `bench/bench_tools.py` holds the exact commands:
 
 ```
+python3 bench/make_events.py big.csv events.ndjson
 python3 bench/bench_tools.py --csv big.csv --ndjson big.ndjson \
-        --small data/nasa_small.csv --out-dir /dev/shm -n 7
+        --small data/nasa_small.csv --events events.ndjson --out-dir /dev/shm -n 7
+```
+
+`events.ndjson` holds the same million rows as nested events, the shape
+logging pipelines write (188 MiB):
+
+```
+{"time":"01/Jul/1995:00:00:01 -0400","client":{"host":"199.72.81.55"},
+ "http":{"request":{"method":"GET","path":"/history/apollo/"},"status":200,"bytes":6245},"tags":[]}
 ```
 
 **Filter and project, CSV to CSV** (`status == 200`, three columns)
@@ -249,6 +258,36 @@ common log format with `strptime` and print the same bucket text)
 | DuckDB | 171 ms | 4.7x | 184 MiB |
 | qsv sqlp | 235 ms | 6.4x | 210 MiB |
 | miller | 3,093 ms | 84.6x | 572 MiB |
+
+**Computed column** (`"bytes >= 0" --add "kb = bytes / 1024" --select host,kb`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 36 ms | 1.0x | 19 MiB |
+| HyperPipe, one thread | 123 ms | 3.4x | 3 MiB |
+| DuckDB | 126 ms | 3.5x | 259 MiB |
+| qsv sqlp | 165 ms | 4.5x | 225 MiB |
+| miller | 542 ms | 14.9x | 583 MiB |
+
+**Nested NDJSON: filter on a path** (`"http.status == 404" --select time,client.host,http.request.path`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 76 ms | 1.0x | 13 MiB |
+| DuckDB | 147 ms | 1.9x | 299 MiB |
+| HyperPipe, one thread | 499 ms | 6.6x | 3 MiB |
+| jq | 1,866 ms | 24.6x | 4 MiB |
+| miller | 8,074 ms | 106.6x | 151 MiB |
+
+**Nested NDJSON: group by a path** (`--group-by http.request.method --agg "count(http.bytes), sum(http.bytes)"`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 64 ms | 1.0x | 15 MiB |
+| DuckDB | 130 ms | 2.0x | 296 MiB |
+| HyperPipe, one thread | 395 ms | 6.2x | 3 MiB |
+
+miller counts the rows where `bytes` is `null` as values and is left out.
 
 **Sort by bytes, top 10** (`--sort -bytes,host,timestamp,request --head 10`)
 

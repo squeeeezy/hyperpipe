@@ -9,7 +9,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+
+/* Exact sums are scaled integers. 128 bits hold any 18-digit value at any
+ * of the 19 scales with room for 10^20 more additions; without a 128-bit
+ * type, sums stay exact while they fit in 64. */
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef __int128 hp_wide_t;
+__extension__ typedef unsigned __int128 hp_uwide_t;
+#else
+typedef int64_t hp_wide_t;
+typedef uint64_t hp_uwide_t;
+#endif
+
+/* The most bytes hp_format_decimal() and hp_format_double() write */
+#define HP_NUMBER_TEXT_MAX 48
 
 /* Parses a signed decimal integer that spans the whole field. Values outside
  * int64 are rejected rather than wrapped, so they simply never match. */
@@ -127,5 +142,38 @@ static inline bool hp_parse_decimal_exact(const char *ptr, size_t len, int64_t *
     *scale = s;
     return true;
 }
+
+/* v * 10^-scale as decimal text without trailing zeros: "-12.5", "0.05" */
+static inline size_t hp_format_decimal(char *out, hp_wide_t v, int scale) {
+    char buf[48];
+    char *d = buf;             /* the digits, least significant first */
+    size_t n = 0, w = 0;
+    hp_uwide_t u = v < 0 ? (hp_uwide_t)0 - (hp_uwide_t)v : (hp_uwide_t)v;
+    if (u == 0) scale = 0;
+    while (u > UINT64_MAX) {   /* wider than 64 bits: rare, and slow */
+        d[n++] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    }
+    for (uint64_t low = (uint64_t)u; n == 0 || low; low /= 10) {
+        d[n++] = (char)('0' + (int)(low % 10));
+    }
+
+    for (; scale > 0 && d[0] == '0'; scale--) {
+        d++;
+        n--;
+    }
+    while (n <= (size_t)scale) d[n++] = '0';
+
+    if (v < 0) out[w++] = '-';
+    for (size_t i = n; i-- > 0;) {
+        out[w++] = d[i];
+        if (i == (size_t)scale && scale > 0) out[w++] = '.';
+    }
+    return w;
+}
+
+/* The shortest text that reads back as the same double: what %.15g, %.16g
+ * or %.17g writes, the first that reads back (src/hp_number.c) */
+size_t hp_format_double(char *out, double v);
 
 #endif /* HYPERPIPE_SRC_HP_NUMBER_H */

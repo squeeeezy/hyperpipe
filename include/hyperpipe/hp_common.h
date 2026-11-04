@@ -11,14 +11,19 @@
 #if defined(_MSC_VER)
     #define HP_ALIGNED(n) __declspec(align(n))
     #define HP_INLINE static __forceinline
+    #define HP_NOINLINE __declspec(noinline)
     #define HP_HOT
 #elif defined(__GNUC__) || defined(__clang__)
     #define HP_ALIGNED(n) __attribute__((aligned(n)))
     #define HP_INLINE static inline __attribute__((always_inline))
-    #define HP_HOT __attribute__((hot))
+    #define HP_NOINLINE __attribute__((noinline))
+    /* A hot kernel starts on a 64-byte boundary, so the speed of its loops
+     * does not depend on how much code happens to come before it */
+    #define HP_HOT __attribute__((hot, aligned(64)))
 #else
     #define HP_ALIGNED(n)
     #define HP_INLINE static inline
+    #define HP_NOINLINE
     #define HP_HOT
 #endif
 
@@ -45,7 +50,8 @@ typedef enum hp_error_e {
     HP_ERR_UNSUPPORTED = -11,
     HP_ERR_PARSE_JSON = -12,
     HP_ERR_FILTER = -13,
-    HP_ERR_AGG = -14
+    HP_ERR_AGG = -14,
+    HP_ERR_COMPUTE = -15
 } hp_error_t;
 
 typedef enum hp_format_e {

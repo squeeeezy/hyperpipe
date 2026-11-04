@@ -312,6 +312,7 @@ const char *hp_strerror(hp_error_t err) {
         case HP_ERR_PARSE_JSON:       return "malformed JSON";
         case HP_ERR_FILTER:           return "invalid filter";
         case HP_ERR_AGG:              return "invalid --agg";
+        case HP_ERR_COMPUTE:          return "invalid --add";
         case HP_ERR_GENERIC:          break;
     }
     return "internal error";
@@ -398,6 +399,11 @@ static hp_error_t init_parts(hp_transcoder_t *tc, const hp_transcoder_config_t *
         if (!tc->agg) return HP_ERR_NOMEM;
         if ((err = hp_agg_init(tc->agg, cfg->group_by_spec, cfg->agg_spec)) != HP_OK) return err;
     }
+    if (cfg->compute_spec) {
+        tc->compute = (hp_compute_t *)malloc(sizeof(hp_compute_t));
+        if (!tc->compute) return HP_ERR_NOMEM;
+        if ((err = hp_compute_init(tc->compute, cfg->compute_spec)) != HP_OK) return err;
+    }
     if (cfg->sort_spec && !cfg->count_only) {
         tc->sorter = (hp_sorter_t *)malloc(sizeof(hp_sorter_t));
         if (!tc->sorter) return HP_ERR_NOMEM;
@@ -450,6 +456,11 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
         free(tc->sorter);
         tc->sorter = NULL;
     }
+    if (tc->compute) {
+        hp_compute_free(tc->compute);
+        free(tc->compute);
+        tc->compute = NULL;
+    }
     if (tc->page_buf_data) {
         free(tc->page_buf_data);
         tc->page_buf_data = NULL;
@@ -470,11 +481,110 @@ static hp_error_t column_not_found(hp_transcoder_t *tc, const char *name) {
     return HP_ERR_COLUMN_NOT_FOUND;
 }
 
-/* Shared post-header binding: projection, filter, JSON key fragments.
- * Called by the streaming path once the header is known (first row for CSV,
- * first record's schema for NDJSON) and by parallel workers with a preset
- * header. Returns the first binding error, if any. */
+/* A column some option names that the input lacks may be a path into one
+ * of its JSON columns, meta.user.id; it then becomes a hidden computed
+ * column */
+static hp_error_t reach_path(hp_transcoder_t *tc, const char *name) {
+    if (hp_resolve_column(&tc->in_header, name) >= 0 || !strpbrk(name, ".[")) return HP_OK;
+    if (!tc->compute) {
+        tc->compute = (hp_compute_t *)malloc(sizeof(hp_compute_t));
+        if (!tc->compute) return HP_ERR_NOMEM;
+        hp_compute_init(tc->compute, NULL);
+        tc->compute->width = tc->in_header.count;
+    }
+    hp_error_t err = hp_compute_path(tc->compute, &tc->in_header, name);
+    return err == HP_ERR_COLUMN_NOT_FOUND ? HP_OK : err;
+}
+
+#define MAX_OPTION_COLUMNS \
+    (HP_MAX_COLUMNS + HP_MAX_PREDICATES + HP_AGG_MAX_KEYS + HP_AGG_MAX_FNS + HP_SORT_MAX_KEYS)
+
+/* The columns the options name: --select, the filter, the groups and their
+ * functions, and the sort. Returns how many there are. */
+static size_t option_columns(const hp_transcoder_t *tc, const char **names) {
+    const hp_projection_t *proj = &tc->projection;
+    const hp_agg_t *agg = tc->agg;
+    size_t n = 0;
+    for (size_t i = 0; proj->active && !proj->implicit && i < proj->count; i++) {
+        names[n++] = proj->col_names[i];
+    }
+    for (size_t i = 0; i < tc->filter.count; i++) names[n++] = tc->filter.preds[i].col_name;
+    for (size_t i = 0; agg && i < agg->key_count; i++) names[n++] = agg->keys[i];
+    for (size_t i = 0; agg && i < agg->fn_count; i++) {
+        if (agg->fns[i].column[0]) names[n++] = agg->fns[i].column;
+    }
+    for (size_t i = 0; tc->sorter && !agg && i < tc->sorter->key_count; i++) {
+        names[n++] = tc->sorter->keys[i].name;
+    }
+    return n;
+}
+
+/* Whether rows may get computed columns: --add, or a name that may be a
+ * path. Decided before the first row, so a run without them runs the
+ * record loop that has none. */
+static bool may_compute(const hp_transcoder_t *tc) {
+    const char *names[MAX_OPTION_COLUMNS];
+    const size_t n = option_columns(tc, names);
+    bool paths = false;
+    for (size_t i = 0; i < n && !paths; i++) paths = strpbrk(names[i], ".[") != NULL;
+    return tc->compute || paths;
+}
+
+/* Binds --add, then every path the options name */
+static hp_error_t bind_computed(hp_transcoder_t *tc) {
+    hp_error_t err = HP_OK;
+    if (tc->compute) {
+        const char *missing = NULL;
+        err = hp_compute_bind(tc->compute, &tc->in_header, &missing);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) return column_not_found(tc, missing);
+    }
+    const char *names[MAX_OPTION_COLUMNS];
+    const size_t n = option_columns(tc, names);
+    for (size_t i = 0; err == HP_OK && i < n; i++) err = reach_path(tc, names[i]);
+    return err;
+}
+
+static bool is_hidden(const hp_compute_t *c, size_t index) {
+    for (size_t i = 0; c && c->hidden && i < c->count; i++) {
+        if (c->cols[i].hidden && (size_t)c->cols[i].index == index) return true;
+    }
+    return false;
+}
+
+/* Without --select the output is every input column from from on, hidden
+ * ones aside: when there are any, through a projection of the others */
+static void project_visible(hp_transcoder_t *tc, size_t from) {
+    hp_projection_t *proj = &tc->projection;
+    for (size_t i = from; i < tc->in_header.count; i++) {
+        if (is_hidden(tc->compute, i)) continue;
+        tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
+        proj->col_indices[proj->count++] = (int64_t)i;
+    }
+    tc->visible_seen = tc->in_header.count;
+    proj->implicit = proj->implicit || (tc->compute && tc->compute->hidden);
+    proj->active = proj->implicit;
+}
+
+/* The columns [0, before_filter) that the filter reads are computed before
+ * it, the rest only for the rows that pass */
+static void split_computed(hp_transcoder_t *tc) {
+    hp_compute_t *c = tc->compute;
+    c->before_filter = 0;
+    for (size_t j = 0; j < c->count; j++) {
+        for (size_t i = 0; i < tc->filter.count; i++) {
+            if (tc->filter.preds[i].col_index == c->cols[j].index) c->before_filter = j + 1;
+        }
+    }
+}
+
+/* Shared post-header binding: computed columns, projection, filter, JSON
+ * key fragments. Called by the streaming path once the header is known
+ * (first row for CSV, first record's schema for NDJSON) and by parallel
+ * workers with a preset header. Returns the first binding error, if any. */
 static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
+    hp_error_t computed = bind_computed(tc);
+    if (computed != HP_OK) return computed;
+
     if (tc->agg) {
         const char *missing = NULL;
         hp_error_t err = hp_agg_bind(tc->agg, &tc->in_header, &missing);
@@ -491,10 +601,7 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
         if (err != HP_OK) return err;
         hp_project_header(&tc->projection, &tc->in_header, &tc->out_header);
     } else {
-        tc->out_header.count = 0;
-        for (size_t i = 0; i < tc->in_header.count; i++) {
-            tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
-        }
+        project_visible(tc, 0);
     }
 
     if (tc->filter.count > 0) {
@@ -506,6 +613,7 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
         }
         if (err != HP_OK) return err;
     }
+    if (tc->compute) split_computed(tc);
 
     if (tc->sorter && !tc->agg) {
         const char *missing = NULL;
@@ -695,14 +803,13 @@ static hp_error_t start_stream(hp_run_t *run) {
  * would depend on the rows each chunk happens to see first. */
 HP_INLINE void follow_schema_growth(hp_run_t *run) {
     hp_transcoder_t *tc = run->tc;
-    if (tc->config.lock_schema || tc->projection.active ||
-        tc->config.out_format != HP_FORMAT_NDJSON ||
-        tc->in_header.count <= tc->out_header.count) {
+    const hp_projection_t *proj = &tc->projection;
+    const size_t seen = proj->implicit ? tc->visible_seen : tc->out_header.count;
+    if (tc->config.lock_schema || (proj->active && !proj->implicit) ||
+        tc->config.out_format != HP_FORMAT_NDJSON || tc->in_header.count <= seen) {
         return;
     }
-    for (size_t i = tc->out_header.count; i < tc->in_header.count; i++) {
-        tc->out_header.names[tc->out_header.count++] = strdup(tc->in_header.names[i]);
-    }
+    project_visible(tc, seen);
     hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
 }
 
@@ -743,6 +850,24 @@ HP_INLINE hp_error_t deliver_record(hp_run_t *run, size_t raw_len, bool *done) {
     /* Sorting needs every row before the first N are known */
     *done = !run->sorting && tc->config.limit_rows && run->rows_emitted >= tc->config.limit_rows;
     return HP_OK;
+}
+
+/* A data record: its computed columns, the filter, and delivery. Computed
+ * values are not slices of the record, so their bytes add to the bound of
+ * its output. */
+HP_INLINE hp_error_t take_record(hp_run_t *run, size_t raw_len, bool *done, bool computing) {
+    hp_transcoder_t *tc = run->tc;
+    hp_compute_t *c = computing ? tc->compute : NULL;
+    if (run->ndjson_in) follow_schema_growth(run);
+    run->rows_read++;
+    if (c) {
+        hp_error_t err = hp_compute_begin(c, &run->row, raw_len, !run->ndjson_in);
+        if (err != HP_OK) return err;
+        raw_len += hp_compute_row(c, &run->row, 0, c->before_filter);
+    }
+    if (!hp_filter_matches(&tc->filter, &run->row)) return HP_OK;
+    if (c) raw_len += hp_compute_row(c, &run->row, c->before_filter, c->count);
+    return deliver_record(run, raw_len, done);
 }
 
 /* Bytes up to and including the next newline: the unit that fault
@@ -839,10 +964,10 @@ static void mark_error_record(hp_run_t *run, const uint8_t *rec) {
 typedef hp_error_t (*hp_next_record_fn)(hp_run_t *, const uint8_t *, size_t, bool, size_t *, size_t *);
 
 /* The streaming loop shared by both input formats. Inlined with a constant
- * next_record, so each format gets its own copy without an indirect call
- * per record. Parse errors go to the fault-tolerance mode; anything else
- * stops the run. */
-HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
+ * next_record and computing, so each format, with computed columns and
+ * without, gets its own copy without an indirect call or a test per record.
+ * Parse errors go to the fault-tolerance mode; anything else stops the run. */
+HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record, bool computing) {
     hp_transcoder_t *tc = run->tc;
     hp_sliding_buffer_t *ring = &tc->ring_buf;
     const bool skip_errors = tc->config.on_error != HP_ON_ERROR_FAIL;
@@ -891,14 +1016,9 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
                     is_data = run->ndjson_in;   /* a CSV header row is not data */
                     run->skipped += !is_data;
                 }
-                if (is_data) {
-                    if (run->ndjson_in) follow_schema_growth(run);
-                    run->rows_read++;
-                    if (hp_filter_matches(&tc->filter, &run->row) &&
-                        (err = deliver_record(run, raw_len, &done)) != HP_OK) {
-                        ring->head = (size_t)(src - ring->data);
-                        return err;
-                    }
+                if (is_data && (err = take_record(run, raw_len, &done, computing)) != HP_OK) {
+                    ring->head = (size_t)(src - ring->data);
+                    return err;
                 }
             } else {
                 run->skipped++;
@@ -931,7 +1051,14 @@ HP_INLINE hp_error_t run_records(hp_run_t *run, hp_next_record_fn next_record) {
     }
 }
 
-hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream) {
+/* The record loops with computed columns, kept out of hp_transcoder_run()
+ * so the loops without them stay as small as they were */
+static HP_NOINLINE hp_error_t run_computing(hp_run_t *run) {
+    return run->ndjson_in ? run_records(run, next_ndjson_record, true)
+                          : run_records(run, next_csv_record, true);
+}
+
+HP_HOT hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream) {
     if (!tc || !in_stream || (!out_stream && !tc->config.sink)) return HP_ERR_INVALID_ARG;
 
     /* Plain stdio, or transparent inflate when the stream turns out to be
@@ -998,9 +1125,11 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
         run->header_done = true;
     }
 
-    if (err == HP_OK) {
-        err = run->ndjson_in ? run_records(run, next_ndjson_record)
-                             : run_records(run, next_csv_record);
+    if (err == HP_OK && may_compute(tc)) {
+        err = run_computing(run);
+    } else if (err == HP_OK) {
+        err = run->ndjson_in ? run_records(run, next_ndjson_record, false)
+                             : run_records(run, next_csv_record, false);
     }
     err = finish_run(run, err);
 

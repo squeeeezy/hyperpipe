@@ -51,7 +51,7 @@ static hp_error_t reserve_arena(hp_csv_parser_t *parser, size_t window) {
     return HP_OK;
 }
 
-hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
+HP_HOT hp_error_t hp_csv_parse_row_scalar(hp_csv_parser_t *parser,
                                    const uint8_t *src,
                                    size_t len,
                                    size_t *consumed,

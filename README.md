@@ -50,13 +50,16 @@ hyperpipe access.csv --summary
 hyperpipe access.csv --group-by status --agg "count, sum(bytes)"
 hyperpipe access.csv --sort -bytes --head 10
 hyperpipe access.csv "timestamp >= 1995-07-01T12:00" --group-by "hour(timestamp)"
+hyperpipe events.jsonl "meta.user.id == 42" --select time,meta.user.name
+hyperpipe access.csv --add "kb = bytes / 1024" --sort -kb --head 10
 ```
 
 | Option | |
 |---|---|
 | `-o FILE` | output file; a `.gz` name compresses |
 | `--from`, `--to` | `csv`, `tsv` or `ndjson` |
-| `--select COLUMNS` | comma-separated columns to output, by name or 0-based position |
+| `--select COLUMNS` | comma-separated columns to output, by name, 0-based position or JSON path |
+| `--add "NAME = EXPR"` | computed columns (see Computed columns) |
 | `--where FILTER` | the filter, when not given as an argument |
 | `--count` | print the number of matching rows |
 | `--head N` | stop after N rows |
@@ -132,7 +135,8 @@ hyperpipe access.csv --group-by host --count            # the number of distinct
 - Sums, minimums and maximums are exact decimals: `0.1 + 0.2` is `0.3`.
   They stay exact while each value fits in 64 bits with at most 18 decimal
   places and the sum fits in 128 bits; past that they are doubles. `avg` is
-  the double nearest to the exact sum divided by the count.
+  the double nearest to the exact sum divided by the count. Numbers are
+  written without trailing zeros: `1.5 + 1.5` is `3`.
 - `count_distinct` is exact. Quantiles are exact, interpolated as numpy and
   pandas do, for groups of up to 1,024 numbers; past that they come from a
   sketch and are within 1% of the true value, in a few KiB per group.
@@ -157,6 +161,54 @@ with an empty key.
 hyperpipe access.log --group-by "day(timestamp), status" --agg "count, sum(bytes)"
 hyperpipe events.jsonl "ts >= 2024-03-01 and ts < 2024-04-01" --group-by "hour(ts)" --sort "hour(ts)"
 ```
+
+## Computed columns and JSON paths
+
+A path reads into a JSON value: `meta.user.id` is the member `id` of the
+member `user` of the column `meta`, `tags[0]` the first element of an array
+and `tags[-1]` the last. Paths go wherever a column does, in filters,
+`--select`, `--group-by`, `--agg` and `--sort`; one that only a filter or a
+group reads is not written out. A path that leads nowhere, or to `null`, is
+empty.
+
+```
+hyperpipe events.jsonl "http.status >= 500" --select time,client.host,http.request.path
+hyperpipe events.jsonl --group-by http.request.method --agg "count, sum(http.bytes)"
+```
+
+`--add` computes new columns from each row, after the input's; repeat it or
+separate the columns with commas. Each may use the columns before it, and
+one named like an input column replaces it. Filters, groups and sorting see
+computed columns as any other.
+
+```
+hyperpipe access.csv --add "kb = bytes / 1024" "kb > 100" --select host,kb
+hyperpipe orders.csv --add "total = price * qty, who = lower(trim(email))" --group-by who --agg "sum(total)"
+hyperpipe access.csv --add "ext = split_part(request, '.', 2)" --group-by ext --sort -count
+```
+
+| Expression | |
+|---|---|
+| `a + b`, `-`, `*`, `/`, `%` | arithmetic; `*` and `/` before `+` and `-` |
+| `'text'`, `"text"`, `12.5` | literals |
+| `` `user agent` `` | a column whose name is not a plain word |
+| `lower(s)`, `upper(s)` | case, for Latin, Greek and Cyrillic letters |
+| `trim(s)`, `len(s)` | without surrounding spaces; length in characters |
+| `substr(s, start, n)` | n characters from start, counted from 1, or from the end when negative |
+| `split_part(s, sep, n)` | the nth part, counted from 1 |
+| `replace(s, 'from', 'to')` | every occurrence |
+| `concat(a, b, ...)` | text joined; empty values add nothing |
+| `coalesce(a, b, ...)` | the first value that is not empty |
+| `abs(x)`, `round(x, digits)`, `floor(x)`, `ceil(x)` | numbers; round goes half away from zero |
+| `year(t)`, `month(t)`, `day(t)`, `hour(t)`, `minute(t)` | the start of the unit, as under Time |
+
+Arithmetic is exact on decimals up to 18 digits, so `0.1 + 0.2` is `0.3` and
+`9.99 * 3` is `29.97`; division, and anything wider, is in double and
+written in the shortest form that reads back the same. A value that is not
+a number where one is needed, an empty field and a division by zero give an
+empty result. In NDJSON output numbers stay numbers and text is quoted.
+With `--add`, CSV rows longer than the header lose the extra fields, where
+the new columns go.
 
 ## Sorting
 
@@ -193,12 +245,12 @@ hyperpipe access.csv --group-by host --agg "count, sum(bytes)" --sort "-sum(byte
   control characters inside strings are accepted.
 - Object and array values pass through as JSON text: verbatim to NDJSON,
   as a text field to CSV and TSV. Filters and `--summary` treat them as
-  strings.
+  strings; paths read into them, and into text that holds JSON.
 - NDJSON rows may omit, reorder or add keys. NDJSON output follows keys that
   appear later; CSV output keeps the columns of the first line. Parallel
   runs keep the first line's keys for every format, so their output does not
   depend on the number of threads.
-- Ragged CSV rows keep their width.
+- Ragged CSV rows keep their width, unless `--add` or a path adds columns.
 - Records up to the input buffer size are accepted, quoted and escaped
   fields included.
 
@@ -262,6 +314,9 @@ equal (median time, peak RSS):
 | p50, p95, p99 per status | 37 ms, 19 MiB | 144 ms, 242 MiB | 144 ms, 256 MiB | | |
 | count per hour | 32 ms, 14 MiB | 154 ms, 185 MiB | 147 ms, 214 MiB | 5,592 ms, 542 MiB | |
 | count in a time range | 37 ms, 11 MiB | 171 ms, 184 MiB | 235 ms, 210 MiB | 3,093 ms, 572 MiB | |
+| computed column, `kb = bytes / 1024` | 36 ms, 19 MiB | 126 ms, 259 MiB | 165 ms, 225 MiB | 542 ms, 583 MiB | |
+| nested NDJSON, filter on a path | 76 ms, 13 MiB | 147 ms, 299 MiB | | 8,074 ms, 151 MiB | 1,866 ms, 4 MiB |
+| nested NDJSON, group by a path | 64 ms, 15 MiB | 130 ms, 296 MiB | | | |
 | sort by bytes, top 10 | 35 ms, 13 MiB | 111 ms, 156 MiB | 139 ms, 353 MiB | | |
 | sort 1M rows by four columns | 206 ms, 266 MiB | 401 ms, 678 MiB | 461 ms, 755 MiB | | |
 | start-up, 5,000 rows | 2 ms, 2 MiB | 39 ms, 51 MiB | 23 ms, 61 MiB | 7 ms, 17 MiB | |

@@ -8,8 +8,8 @@ not timed further. Runs interleave the tools round by round; the table
 shows the median time and the peak RSS of the process.
 
 usage: bench_tools.py --csv big.csv --ndjson big.ndjson --small small.csv
-                      [-n 7] [--out-dir /dev/shm] [--hyperpipe PATH]
-                      [--only SUBSTRING]
+                      [--events events.ndjson] [-n 7] [--out-dir /dev/shm]
+                      [--hyperpipe PATH] [--only SUBSTRING]
 """
 import argparse
 import csv
@@ -154,7 +154,7 @@ CLF_SQL = "strptime(timestamp, '%d/%b/%Y:%H:%M:%S %z')"
 def tasks(a, hp, out):
     """Each task: name, output kind, {tool: (argv, writes_stdout)}."""
     q = lambda s: s.replace("'", "''")
-    big, nd, small = a.csv, a.ndjson, a.small
+    big, nd, small, ev = a.csv, a.ndjson, a.small, a.events
     return [
         ("filter + project, CSV to CSV", "csv", {
             "hyperpipe": ([hp, big, "status == 200", "--select", "host,status,bytes", "--to", "csv", "-o", out], False),
@@ -239,6 +239,28 @@ def tasks(a, hp, out):
             "duckdb": (["duckdb", "-noheader", "-list", "-c", f"SELECT count(*) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) WHERE {CLF_SQL} >= TIMESTAMPTZ '1995-07-01 04:30:00+00' AND {CLF_SQL} < TIMESTAMPTZ '1995-07-01 05:00:00+00'"], True),
             "miller": (["mlr", "--icsv", "--onidx", "filter", "t = strptime($timestamp, \"%d/%b/%Y:%H:%M:%S %z\"); t >= 804573000 && t < 804574800", "then", "count", big], True),
         }),
+        ("computed column: kb = bytes / 1024", "groups", {
+            "hyperpipe": ([hp, big, "bytes >= 0", "--add", "kb = bytes / 1024", "--select", "host,kb", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "bytes >= 0", "--add", "kb = bytes / 1024", "--select", "host,kb", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT host, CAST(bytes AS DOUBLE) / 1024 AS kb FROM _t_1 WHERE bytes <> '-'", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT host, CAST(bytes AS BIGINT) / 1024 AS kb FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) WHERE bytes <> '-') TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "filter", "$bytes != \"-\"", "then", "put", "$kb = $bytes / 1024", "then", "cut", "-o", "-f", "host,kb", big], True),
+        }),
+    ] + ([] if not ev else [
+        ("nested NDJSON: filter on a path", "csv", {
+            "hyperpipe": ([hp, ev, "http.status == 404", "--select", "time,client.host,http.request.path", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, ev, "http.status == 404", "--select", "time,client.host,http.request.path", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT time, client.host AS \"client.host\", http.request.path AS \"http.request.path\" FROM read_json('{q(ev)}') WHERE http.status = 404) TO '{q(out)}' (HEADER)"], False),
+            "jq": (["jq", "-rn", "[\"time\", \"client.host\", \"http.request.path\"], (inputs | select(.http.status == 404) | [.time, .client.host, .http.request.path]) | @csv", ev], True),
+            "miller": (["mlr", "--ijsonl", "--ocsv", "flatten", "then", "filter", "${http.status} == 404", "then", "cut", "-o", "-f", "time,client.host,http.request.path", ev], True),
+        }),
+        ("nested NDJSON: group by a path", "groups", {
+            "hyperpipe": ([hp, ev, "--group-by", "http.request.method", "--agg", "count(http.bytes), sum(http.bytes)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, ev, "--group-by", "http.request.method", "--agg", "count(http.bytes), sum(http.bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT http.request.method, count(http.bytes), sum(http.bytes) FROM read_json('{q(ev)}') GROUP BY 1) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--ijsonl", "--ocsv", "flatten", "then", "stats1", "-a", "count,sum", "-f", "http.bytes", "-g", "http.request.method", ev], True),
+        }),
+    ]) + [
         ("sort by bytes, top 10", "csv", {
             "hyperpipe": ([hp, big, "--sort", SORT_HP, "--head", "10", "--to", "csv", "-o", out], False),
             "hyperpipe -j1": ([hp, big, "--sort", SORT_HP, "--head", "10", "--to", "csv", "--jobs", "1", "-o", out], False),
@@ -267,12 +289,14 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--ndjson", required=True)
     ap.add_argument("--small", required=True)
+    ap.add_argument("--events", default=None, help="nested NDJSON from make_events.py")
     ap.add_argument("-n", type=int, default=7)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--hyperpipe", default="hyperpipe")
     ap.add_argument("--only", default="", help="run the tasks whose name contains this")
     a = ap.parse_args()
     a.csv, a.ndjson, a.small = map(os.path.abspath, (a.csv, a.ndjson, a.small))
+    a.events = a.events and os.path.abspath(a.events)
     hp = os.path.abspath(a.hyperpipe) if os.sep in a.hyperpipe else shutil.which(a.hyperpipe)
 
     tmp = tempfile.mkdtemp(prefix="hptools_", dir=a.out_dir)

@@ -28,7 +28,7 @@ static int64_t span_to_int64(const char *s, size_t len) {
     return s[0] == '-' ? -v : v;
 }
 
-void hp_summary_observe(hp_summary_t *s, const hp_header_t *header,
+HP_HOT void hp_summary_observe(hp_summary_t *s, const hp_header_t *header,
                         const hp_row_t *row) {
     if (!s || !row) return;
     s->rows++;

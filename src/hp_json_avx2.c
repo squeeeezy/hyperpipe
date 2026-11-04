@@ -136,7 +136,7 @@ size_t hp_json_scan_ws_avx2(const uint8_t *p, size_t len) {
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx2,bmi2")))
 #endif
-size_t hp_json_emit_body_avx2(char *dst, const char *str, size_t len) {
+HP_HOT size_t hp_json_emit_body_avx2(char *dst, const char *str, size_t len) {
     size_t i = 0;
     size_t w = 0;
     const __m256i v_quote = _mm256_set1_epi8('"');

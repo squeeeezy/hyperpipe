@@ -36,7 +36,12 @@ static void print_usage(void) {
         "  --from auto|csv|tsv|ndjson  input format (default auto)\n"
         "  --to csv|tsv|ndjson       output format (default: NDJSON for CSV/TSV\n"
         "                            input, CSV for NDJSON input)\n"
-        "  --select COLUMNS          comma-separated columns to output\n"
+        "  --select COLUMNS          comma-separated columns to output; meta.user.id\n"
+        "                            and tags[0] read into JSON values\n"
+        "  --add \"NAME = EXPR, ...\"  computed columns: + - * / %, lower, upper,\n"
+        "                            trim, len, concat, coalesce, substr, replace,\n"
+        "                            split_part, abs, round, floor, ceil, hour and\n"
+        "                            the other time units; may be repeated\n"
         "  --where FILTER            filter, when not given as an argument\n"
         "  --count                   print the number of matching rows\n"
         "  --head N, --limit N       stop after N rows\n"
@@ -102,6 +107,7 @@ typedef struct options_s {
     const char *output_path;
     int jobs;                  /* 0: auto */
     bool show_stats;
+    char *add_spec;            /* every --add, joined by commas */
 } options_t;
 
 typedef struct choice_s {
@@ -187,6 +193,21 @@ static bool parse_size(const char *option, const char *value, uint64_t *out) {
     return true;
 }
 
+/* Each --add appends its columns to the ones before */
+static bool append_add(options_t *o, const char *value) {
+    if (!value) return false;
+    size_t had = o->add_spec ? strlen(o->add_spec) : 0, more = strlen(value);
+    char *spec = (char *)realloc(o->add_spec, had + more + 3);
+    if (!spec) {
+        complain("out of memory");
+        return false;
+    }
+    if (had) memcpy(spec + had, ", ", 2);
+    memcpy(spec + (had ? had + 2 : 0), value, more + 1);
+    o->add_spec = spec;
+    return true;
+}
+
 static bool file_exists(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -247,6 +268,9 @@ static int parse_args(int argc, char **argv, options_t *o) {
             cfg->count_only = true;
         } else if (is_option(a, NULL, "--gzip")) {
             cfg->gzip_out = true;
+        } else if (is_option(a, NULL, "--add")) {
+            if (!append_add(o, option_value(argc, argv, &i))) return 1;
+            cfg->compute_spec = o->add_spec;
         } else if (is_option(a, NULL, "--group-by")) {
             if (!(cfg->group_by_spec = option_value(argc, argv, &i))) return 1;
         } else if (is_option(a, NULL, "--agg")) {
@@ -372,6 +396,17 @@ static bool check_select(const char *spec) {
     return false;
 }
 
+static bool check_add(const char *spec) {
+    static hp_compute_t compute;
+    if (!spec) return true;
+    hp_error_t err = hp_compute_init(&compute, spec);
+    hp_compute_free(&compute);
+    if (err == HP_OK) return true;
+    complain("invalid --add: %s", compute.error);
+    fprintf(stderr, "  %s\n  %*s^\n", spec, (int)compute.error_at, "");
+    return false;
+}
+
 /* A filter error points at the place in the filter where parsing stopped */
 static bool check_filter(const char *where) {
     static hp_filter_t filter;
@@ -403,7 +438,8 @@ int main(int argc, char **argv) {
 
     int status = parse_args(argc, argv, &o);
     if (status != 0) return status < 0 ? 0 : status;
-    if (!check_select(o.cfg.select_spec) || !check_filter(o.cfg.where_spec) ||
+    if (!check_select(o.cfg.select_spec) || !check_add(o.cfg.compute_spec) ||
+        !check_filter(o.cfg.where_spec) ||
         !check_agg(o.cfg.group_by_spec, o.cfg.agg_spec) || !check_sort(o.cfg.sort_spec)) {
         return 1;
     }
@@ -464,5 +500,6 @@ int main(int argc, char **argv) {
 
     if (in_f != stdin) fclose(in_f);
     if (out_f != stdout) fclose(out_f);
+    free(o.add_spec);
     return (err == HP_OK) ? 0 : 1;
 }

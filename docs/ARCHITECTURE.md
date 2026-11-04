@@ -64,10 +64,12 @@ object; anything else is `HP_ERR_PARSE_JSON`.
 - A structural fast path handles escape-free lines: one vector pass per
   64-byte chunk gives the quote and backslash bitmaps, keys and string
   values become spans between quotes, and numbers are checked against the
-  JSON grammar in the same pass. A line it does not fully accept (a
-  backslash, an unknown key, anything irregular) goes to the general path,
-  which either parses it or reports the error. The fast path writes no
-  shared state before it succeeds.
+  JSON grammar in the same pass. Objects and arrays are measured by
+  `json_value_span()` and jumped over, escapes inside them included. A
+  line it does not fully accept (a backslash elsewhere, an unknown key,
+  anything irregular) goes to the general path, which either parses it or
+  reports the error. The fast path writes no shared state before it
+  succeeds.
 
 ## Filter
 
@@ -102,11 +104,19 @@ when gzip output is on, to a `FILE` or to a sink callback.
 ## Streaming loop
 
 `hp_transcoder_run()` sets up a run and calls `run_records()` with the record
-parser for its format. The loop is inlined per format, so neither copy pays
-an indirect call per record. For each record it binds the header on the
-first one, follows NDJSON schema growth, applies the filter and passes the
-record to `deliver_record()` (group, summary, count or write). Parse errors
-go to the `--on-error` mode; everything else ends the run.
+parser for its format. The loop is inlined per format, and per whether rows
+may get computed columns, so no copy pays an indirect call, or a test for
+work it never does, per record; the copies with computed columns live in
+`run_computing()`, out of line, so the others stay as small as they were. For each record it binds the header on the
+first one, follows NDJSON schema growth, computes the columns the filter
+reads, applies the filter, computes the rest and passes the record to
+`deliver_record()` (group, summary, count or write). Parse errors go to the
+`--on-error` mode; everything else ends the run.
+
+The hot kernels, the record parsers, the NDJSON writer and the loop itself,
+are marked `HP_HOT`, which also starts them on a 64-byte boundary: the
+speed of a loop that runs 30 ns a record then does not depend on how much
+code the linker happens to put before it.
 
 ## Grouping
 
@@ -145,6 +155,45 @@ library's time zone or locale. Times are microseconds since 1970 in UTC.
 Buckets are written by hand as sortable text. `hour(col)` keys are computed
 once per row and then hashed and stored like any key; time literals in
 filters are parsed once, and each field is parsed as it is compared.
+
+## Computed columns
+
+`src/hp_compute.c` parses `--add` into expression trees, all nodes in one
+fixed array, and binds their references once the header is known. A
+reference that names no column but starts with one, `meta.user.id`, binds
+to the longest leading part that is a column and keeps the rest as steps
+for `hp_json_lookup()` (`src/hp_json_path.c`), which walks the JSON text of
+the field: members by key, elements by index, values skipped by following
+strings and nesting without checking the grammar again. Escapes and string
+decoding are shared with the parser through `src/hp_json_text.h`. The transcoder turns every path that
+an option names, and the input lacks, into a hidden computed column of its
+own, so the filter, the groups and the sorter read it by index like any
+field; without `--select` the output then goes through a projection of
+the other columns, which also follows NDJSON keys that appear later.
+
+Computed columns get header slots after the input's, or the slot of the
+input column they replace, and are written into the row after it is
+parsed: the ones the filter reads before it, the rest only for rows that
+pass. A value is a slice of the record when it can be one (a column, a path
+to an unescaped string, `trim`, `substr`); anything new goes into an arena
+that is sized once per row from a bound computed at bind time, so many
+bytes per input byte plus a constant per expression. Its bytes add to the
+record's length for the CSV writer's bound, which every field otherwise
+satisfies by being a slice of the record.
+
+Numbers carry their exact decimal, mantissa and scale as
+`hp_parse_decimal_exact` gives them, through `+`, `-`, `*` and `%` in
+128-bit arithmetic, and are written only when a text is needed. Past 18
+digits of scale the exact value is rounded once to double, through its
+decimal text and `strtod`.
+
+A double is written as the first of `%.15g`, `%.16g` and `%.17g` that reads
+back (`src/hp_number.c`). Between 1e-3 and 1e15 no `printf` is involved: the
+double is `m / 2^k` exactly, so its digits round correctly in 128-bit
+integers, and whether they read back is a comparison with half the gap to
+the neighbouring double. That is 30 ns a value instead of up to 900, with
+the same text, which a test checks against the `printf` loop over a million
+values.
 
 ## Sorting
 

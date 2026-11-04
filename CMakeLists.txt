@@ -12,13 +12,16 @@ find_package(Threads REQUIRED)
 
 add_library(hyperpipe_core STATIC
     src/hp_agg.c
+    src/hp_compute.c
     src/hp_cpuid.c
     src/hp_csv_scalar.c
     src/hp_distinct.c
     src/hp_filter.c
     src/hp_gzip.c
+    src/hp_json_path.c
     src/hp_json_scalar.c
     src/hp_keymap.c
+    src/hp_number.c
     src/hp_parallel.c
     src/hp_quantile.c
     src/hp_ring_buffer.c

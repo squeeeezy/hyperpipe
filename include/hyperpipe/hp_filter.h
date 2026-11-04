@@ -68,6 +68,7 @@ typedef struct hp_projection_s {
     int64_t col_indices[HP_MAX_COLUMNS];
     size_t count;
     bool active;
+    bool implicit;      /* every input column but hidden ones, without --select */
 } hp_projection_t;
 
 /* A column reference: a header name first, otherwise a 0-based position.

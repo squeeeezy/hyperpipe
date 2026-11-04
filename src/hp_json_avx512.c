@@ -144,7 +144,7 @@ size_t hp_json_scan_ws_avx512(const uint8_t *p, size_t len) {
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
 #endif
-size_t hp_json_emit_body_avx512(char *dst, const char *str, size_t len) {
+HP_HOT size_t hp_json_emit_body_avx512(char *dst, const char *str, size_t len) {
     size_t i = 0;
     size_t w = 0;
     const __m512i v_space = _mm512_set1_epi8(0x20);

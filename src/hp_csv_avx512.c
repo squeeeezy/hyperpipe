@@ -89,7 +89,7 @@ HP_INLINE bool avx512_emit_field(hp_row_t *out_row, size_t *fc,
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx512f,avx512bw,avx512vl,bmi2")))
 #endif
-hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
+HP_HOT hp_error_t hp_csv_parse_row_avx512(hp_csv_parser_t *parser,
                                    const uint8_t *src,
                                    size_t len,
                                    size_t *consumed,

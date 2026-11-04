@@ -285,6 +285,31 @@ static int check_input(const uint8_t *data, size_t size) {
         out_buf_t sout = { 0 };
         (void)transcode(sorted, doc, size, &sout);
         free(sout.data);
+
+        /* Computed columns and paths over hostile values, one format per
+         * input: the document goes under a header that names the columns
+         * the expressions read */
+        if (fmt != (int)(size & 1)) continue;
+        static const char *const heads[2] = { "a,b,c\n", "{\"a\":0,\"b\":0,\"c\":0}\n" };
+        const size_t head = strlen(heads[fmt]);
+        char *body = (char *)malloc(head + size + 1);
+        if (!body) abort();
+        memcpy(body, heads[fmt], head);
+        memcpy(body + head, doc, size);
+        const hp_transcoder_config_t computed = {
+            .in_format = fmt ? HP_FORMAT_NDJSON : HP_FORMAT_CSV,
+            .out_format = fmt ? HP_FORMAT_CSV : HP_FORMAT_NDJSON,
+            .compute_spec = "x = a * b + c / 3 - a % 7, y = concat(lower(a), upper(b), trim(c)), "
+                            "z = substr(a, b, c), w = replace(a, ',', '\"'), v = split_part(c, a, 2), "
+                            "u = round(a, b), t = floor(a) + ceil(b) + abs(-c), s = hour(a), "
+                            "r = coalesce(a, b, len(c)), q = c.k[0][-1].z, a = a.x",
+            .where_spec = (size & 4) ? "x > 0 or b.y[1] == 1" : NULL,
+            .select_spec = (size & 8) ? "q, 1.x, c[-1], y" : NULL,
+        };
+        out_buf_t cout = { 0 };
+        (void)transcode(computed, body, head + size, &cout);
+        free(cout.data);
+        free(body);
     }
 
     return 0;

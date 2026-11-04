@@ -71,7 +71,7 @@ static void test_without_groups(void) {
 static void test_exact_decimals(void) {
     CHECK(groups_are("v\n0.1\n0.2\n", NULL, "sum(v)", "sum(v)\n0.3\n"));
     CHECK(groups_are("v\n1.5\n2.25\n-0.75\n", NULL, "sum(v), min(v), max(v)",
-                     "sum(v),min(v),max(v)\n3.00,-0.75,2.25\n"));
+                     "sum(v),min(v),max(v)\n3,-0.75,2.25\n"));
     /* Past int64, still exact */
     CHECK(groups_are("v\n9000000000000000000\n9000000000000000000\n", NULL, "sum(v)",
                      "sum(v)\n18000000000000000000\n"));
