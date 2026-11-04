@@ -18,8 +18,9 @@ make            # build/hyperpipe
 make test       # every test, TAP output
 ```
 
-GCC or Clang on Linux and other POSIX systems, MinGW-w64 on Windows. No
-dependencies; zlib is loaded at run time when gzip is used.
+GCC or Clang on Linux and macOS, MinGW-w64 on Windows; x86-64 and ARM64,
+all tested in CI. No dependencies; zlib is loaded at run time when gzip is
+used. The vector engines are x86 only for now; ARM runs the scalar engine.
 
 ```
 cmake -S . -B build && cmake --build build && ctest --test-dir build

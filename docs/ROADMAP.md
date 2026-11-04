@@ -12,8 +12,6 @@ showing no workload slower.
   be written at their offsets without NTFS zero-filling the gaps.
 - Error positions: report the record number and byte offset of a malformed
   record.
-- CI on Linux, macOS and Windows, x86-64 and ARM, with the fuzz target run
-  for a fixed budget.
 
 ## Later
 
