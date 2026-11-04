@@ -24,6 +24,10 @@ add_library(hyperpipe_core STATIC
 )
 target_include_directories(hyperpipe_core PUBLIC include)
 target_compile_definitions(hyperpipe_core PUBLIC _POSIX_C_SOURCE=200809L _FILE_OFFSET_BITS=64)
+if(APPLE)
+    # macOS hides sysconf names such as _SC_NPROCESSORS_ONLN under strict POSIX
+    target_compile_definitions(hyperpipe_core PUBLIC _DARWIN_C_SOURCE)
+endif()
 target_link_libraries(hyperpipe_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
     target_link_libraries(hyperpipe_core PUBLIC psapi)

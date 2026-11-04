@@ -151,12 +151,14 @@ static void check_round_trip(const char *doc, size_t len, fingerprint_t original
     pipe_free(&r);
 }
 
+#if HP_X86
 static void check_kernel_agrees(fingerprint_t s, fingerprint_t v, size_t iter) {
     if (s.fields != v.fields || s.hash != v.hash) {
         fprintf(stderr, "kernels diverge at iteration %zu\n", iter);
     }
     CHECK(s.fields == v.fields && s.hash == v.hash);
 }
+#endif
 
 static void test_csv_kernels_agree_and_round_trip(void) {
     static char doc[DOC_CAP];

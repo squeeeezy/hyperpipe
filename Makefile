@@ -23,6 +23,10 @@ ifeq ($(OS),Windows_NT)
 else
     EXE    =
     LDLIBS = -pthread -ldl
+    # macOS hides sysconf names such as _SC_NPROCESSORS_ONLN under strict POSIX
+    ifeq ($(shell uname -s),Darwin)
+        HP_CFLAGS += -D_DARWIN_C_SOURCE
+    endif
 endif
 
 LIB_SRCS := $(filter-out src/hp_main.c,$(wildcard src/*.c))
@@ -68,9 +72,15 @@ bench: $(BUILD)/bench_hyperpipe$(EXE)
 test: $(TESTS)
 	@for t in $(TESTS); do echo "# $$t"; ./$$t || exit 1; done
 
-fuzz: $(LIB)
-	$(CC) $(HP_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-	    tests/fuzz_harness.c $(LIB_SRCS) $(AVX512_FLAGS) $(LDLIBS) -o $(BUILD)/fuzz_hyperpipe$(EXE)
+# The library is built in its own directory so each unit keeps its own
+# vector flags: AVX-512 flags on every unit would put AVX-512 in the
+# scalar paths too.
+FUZZ = $(BUILD)/fuzz
+SAN  = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+fuzz:
+	$(MAKE) BUILD=$(FUZZ) CFLAGS="$(SAN)" $(FUZZ)/libhyperpipe.a
+	$(CC) $(HP_CFLAGS) $(SAN) tests/fuzz_harness.c $(FUZZ)/libhyperpipe.a $(LDLIBS) \
+	    -o $(BUILD)/fuzz_hyperpipe$(EXE)
 	./$(BUILD)/fuzz_hyperpipe$(EXE) $(FUZZ_K) $(wildcard tests/corpus/*)
 
 COV = $(BUILD)/coverage

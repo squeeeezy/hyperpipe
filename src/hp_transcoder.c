@@ -145,17 +145,17 @@ HP_INLINE uint8_t *copy_field(uint8_t *dst, const char *src, size_t len) {
     return dst + len;
 }
 
-/* True when any byte of the 64-bit word equals c ("has zero byte" test on
- * w ^ c, exact as a yes/no answer). */
-HP_INLINE bool word_has_byte(uint64_t w, uint8_t c) {
+/* Nonzero when any byte of the 64-bit word equals c ("has zero byte" test
+ * on w ^ c, exact as a yes/no answer). */
+HP_INLINE uint64_t word_byte_mask(uint64_t w, uint8_t c) {
     const uint64_t ones = 0x0101010101010101ull;
     uint64_t x = w ^ (ones * c);
-    return ((x - ones) & ~x & (ones << 7)) != 0;
+    return (x - ones) & ~x & (ones << 7);
 }
 
 HP_INLINE bool word_has_csv_special(uint64_t w, uint8_t delim) {
-    return word_has_byte(w, delim) | word_has_byte(w, '"') |
-           word_has_byte(w, '\n') | word_has_byte(w, '\r');
+    return (word_byte_mask(w, delim) | word_byte_mask(w, '"') |
+            word_byte_mask(w, '\n') | word_byte_mask(w, '\r')) != 0;
 }
 
 /* Whether a value needs quoting in CSV output, checked eight bytes at a
