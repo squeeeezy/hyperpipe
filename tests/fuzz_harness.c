@@ -270,6 +270,19 @@ static int check_input(const uint8_t *data, size_t size) {
         out_buf_t gout = { 0 };
         (void)transcode(grouped, doc, size, &gout);
         free(gout.data);
+
+        /* Sorting; one input in eight with a budget small enough to spill
+         * runs to disk and merge them, which costs temporary files */
+        const hp_transcoder_config_t sorted = {
+            .in_format = fmt ? HP_FORMAT_NDJSON : HP_FORMAT_CSV,
+            .out_format = HP_FORMAT_CSV,
+            .sort_spec = "-0, 1",
+            .sort_memory = (size % 8 == 0) ? 512 : 0,
+            .limit_rows = (size & 1) ? 3 : 0,
+        };
+        out_buf_t sout = { 0 };
+        (void)transcode(sorted, doc, size, &sout);
+        free(sout.data);
     }
 
     return 0;

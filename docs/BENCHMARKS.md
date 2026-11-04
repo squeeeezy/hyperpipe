@@ -205,6 +205,29 @@ is always `-`); SQL and HyperPipe leave it empty, so miller is not timed.
 | HyperPipe, one thread | 127 ms | 3.8x | 3 MiB |
 | miller | 3,922 ms | 118.8x | 140 MiB |
 
+**Sort by bytes, top 10** (`--sort -bytes,host,timestamp,request --head 10`)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 35 ms | 1.0x | 13 MiB |
+| DuckDB | 111 ms | 3.2x | 156 MiB |
+| HyperPipe, one thread | 120 ms | 3.4x | 3 MiB |
+| qsv sqlp | 139 ms | 4.0x | 353 MiB |
+
+**Sort all rows** (same columns, 1,000,000 rows out)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 206 ms | 1.0x | 266 MiB |
+| DuckDB | 401 ms | 1.9x | 678 MiB |
+| qsv sqlp | 461 ms | 2.2x | 755 MiB |
+| HyperPipe, one thread | 657 ms | 3.2x | 257 MiB |
+
+The sort covers every column, so no two tools can break ties differently.
+`bytes` holds `-` where nothing was sent: HyperPipe puts text after the
+numbers, SQL gets the same order with `TRY_CAST(...) DESC NULLS LAST`, and
+miller's `sort -nr` puts it first, so miller is not timed.
+
 **Start-up: filter a 5,000-row file**
 
 | Tool | Time | | Peak RSS |

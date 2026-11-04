@@ -126,6 +126,27 @@ coordinator merges them in chunk order, which keeps arrival order, and
 writes the rows through `hp_transcoder_write_groups()`, the same writer a
 single-threaded run uses.
 
+## Sorting
+
+`src/hp_sort.c`. A row is serialized as usual, but into a page of its own;
+the line is stored with a key built from the row, so sorted output is
+written without parsing anything again. The key compares with `memcmp`:
+per column a type tag, then the number as an order-preserving double or
+the text with zero bytes escaped, inverted for a descending column. Each
+entry keeps the first 16 key bytes inline, so numeric keys never touch the
+record while sorting.
+
+Rows sort with a stable merge sort, cache-sized blocks first. Past the
+memory budget a sorted run goes to a temporary file; sixteen runs on disk
+of one level merge into one of the next. With `--head` a bounded heap keeps
+N rows, and its keys end with the row's position to stay deterministic.
+
+In parallel runs each worker sorts its chunk into a run. The coordinator
+cuts the runs into key ranges from sampled keys, merges the ranges on
+several threads and writes them in order, with at most `jobs + 2` ranges
+in flight. Equal keys break ties by run and position, so the bytes match a
+single-threaded run.
+
 ## Parallel runs
 
 `src/hp_parallel.c`:

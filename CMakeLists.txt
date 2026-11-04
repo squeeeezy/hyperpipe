@@ -20,6 +20,7 @@ add_library(hyperpipe_core STATIC
     src/hp_keymap.c
     src/hp_parallel.c
     src/hp_ring_buffer.c
+    src/hp_sort.c
     src/hp_summary.c
     src/hp_transcoder.c
 )

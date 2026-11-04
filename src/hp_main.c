@@ -43,6 +43,9 @@ static void print_usage(void) {
         "  --group-by COLUMNS        one output row per distinct value of COLUMNS\n"
         "  --agg FUNCTIONS           per group: count, count(col), sum(col),\n"
         "                            avg(col), min(col), max(col) (default count)\n"
+        "  --sort COLUMNS            sort rows, or groups, by COLUMNS; -col descends\n"
+        "  --memory SIZE             memory for sorting before it uses temporary\n"
+        "                            files, e.g. 2G (default 512M)\n"
         "  --summary                 print per-column statistics instead of rows\n"
         "  --schema FILE             column types, one \"name,int|string\" per line\n"
         "  --jobs N|auto             threads for file input (default auto: one per\n"
@@ -156,6 +159,31 @@ static bool parse_count(const char *option, const char *value, uint64_t min, uin
     return true;
 }
 
+/* A byte count with an optional K, M or G suffix */
+static bool parse_size(const char *option, const char *value, uint64_t *out) {
+    if (!value) return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long n = strtoull(value, &end, 10);
+    unsigned shift = 0;
+    if (end != value && *end) {
+        switch (*end | 32) {
+            case 'k': shift = 10; break;
+            case 'm': shift = 20; break;
+            case 'g': shift = 30; break;
+            default: shift = 64;
+        }
+        end++;
+    }
+    if (value[0] == '-' || end == value || *end != '\0' || errno == ERANGE || n == 0 ||
+        shift == 64 || n > (UINT64_MAX >> shift)) {
+        complain("%s: invalid size '%s'", option, value);
+        return false;
+    }
+    *out = (uint64_t)n << shift;
+    return true;
+}
+
 static bool file_exists(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -220,6 +248,11 @@ static int parse_args(int argc, char **argv, options_t *o) {
             if (!(cfg->group_by_spec = option_value(argc, argv, &i))) return 1;
         } else if (is_option(a, NULL, "--agg")) {
             if (!(cfg->agg_spec = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--sort")) {
+            if (!(cfg->sort_spec = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--memory")) {
+            if (!parse_size(a, option_value(argc, argv, &i), &n)) return 1;
+            cfg->sort_memory = (size_t)n;
         } else if (is_option(a, NULL, "--summary")) {
             cfg->summary = true;
         } else if (is_option(a, NULL, "--schema")) {
@@ -284,13 +317,17 @@ static int parse_args(int argc, char **argv, options_t *o) {
                  "combined with --select or --summary");
         return 1;
     }
+    if (cfg->sort_spec && cfg->summary) {
+        complain("--sort cannot be combined with --summary");
+        return 1;
+    }
     if (o->jobs > 1) {
         if (!o->input_path) {
             complain("--jobs needs an input file; stdin cannot be split");
             return 1;
         }
-        /* With groups, --head limits the groups, which the merge knows */
-        if ((cfg->limit_rows > 0 && !grouped) || cfg->summary) {
+        /* With groups or sorting, --head is applied after the merge */
+        if ((cfg->limit_rows > 0 && !grouped && !cfg->sort_spec) || cfg->summary) {
             complain("--jobs cannot be combined with --head or --summary");
             return 1;
         }
@@ -308,6 +345,18 @@ static bool check_agg(const char *group_by, const char *fns) {
     } else if (err != HP_OK) {
         complain("--group-by: more than %d columns, or a name longer than 127 bytes",
                  HP_AGG_MAX_KEYS);
+    }
+    return err == HP_OK;
+}
+
+static bool check_sort(const char *spec) {
+    static hp_sorter_t sorter;
+    if (!spec) return true;
+    hp_error_t err = hp_sorter_init(&sorter, spec, 0, 0);
+    hp_sorter_free(&sorter);
+    if (err != HP_OK) {
+        complain("--sort: expected comma-separated columns, at most %d, each up to "
+                 "127 bytes", HP_SORT_MAX_KEYS);
     }
     return err == HP_OK;
 }
@@ -351,7 +400,7 @@ int main(int argc, char **argv) {
     int status = parse_args(argc, argv, &o);
     if (status != 0) return status < 0 ? 0 : status;
     if (!check_select(o.cfg.select_spec) || !check_filter(o.cfg.where_spec) ||
-        !check_agg(o.cfg.group_by_spec, o.cfg.agg_spec)) {
+        !check_agg(o.cfg.group_by_spec, o.cfg.agg_spec) || !check_sort(o.cfg.sort_spec)) {
         return 1;
     }
 
@@ -359,8 +408,8 @@ int main(int argc, char **argv) {
      * an explicit --jobs N says when it does not apply */
     const bool jobs_explicit = (o.jobs != 0);
     if (!jobs_explicit) {
-        const bool grouped = o.cfg.group_by_spec || o.cfg.agg_spec;
-        o.jobs = (o.input_path && (o.cfg.limit_rows == 0 || grouped) && !o.cfg.summary)
+        const bool merged = o.cfg.group_by_spec || o.cfg.agg_spec || o.cfg.sort_spec;
+        o.jobs = (o.input_path && (o.cfg.limit_rows == 0 || merged) && !o.cfg.summary)
                      ? hp_parallel_auto_jobs(o.input_path) : 1;
     }
 

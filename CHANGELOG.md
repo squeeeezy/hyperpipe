@@ -40,6 +40,13 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- `--sort` with `-col` for descending order and `--memory` for its budget.
+  Stable, numbers by value and text by bytes, empty values last; `--head N`
+  keeps N rows in a heap; larger inputs spill sorted runs to temporary
+  files and merge them a level at a time. Parallel runs sort their chunks
+  and merge key ranges on several threads, byte-identical to one thread.
+  Library: `hp_sort.h`, `sort_spec`/`sort_memory` in
+  `hp_transcoder_config_t`, `hp_transcoder_write_sorted()`.
 - `--group-by` and `--agg`: `count`, `count(col)`, `sum`, `avg`, `min` and
   `max` per group, in first-seen order, in one pass and in parallel. Sums,
   minimums and maximums are exact decimals, so `0.1 + 0.2` is `0.3` and the

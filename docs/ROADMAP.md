@@ -6,8 +6,6 @@ showing no workload slower.
 
 ## Next
 
-- Sorting: `--sort` with an external merge for inputs larger than memory,
-  and `--top N` that keeps only N rows.
 - `--distinct` and `count_distinct(col)`; quantiles (`p50`, `p95`) from a
   mergeable sketch.
 - Join with a smaller file held in memory.

@@ -110,6 +110,12 @@ NASA_COLUMNS = ("{host: 'VARCHAR', timestamp: 'VARCHAR', request: 'VARCHAR', "
                 "status: 'BIGINT', bytes: 'VARCHAR'}")
 
 
+# A sort over every column, so no two tools may break ties differently;
+# "-" in bytes is not a number and goes after the numbers.
+SORT_HP = "-bytes,host,timestamp,request"
+SORT_SQL = "TRY_CAST(bytes AS BIGINT) DESC NULLS LAST, host, timestamp, request"
+
+
 def tasks(a, hp, out):
     """Each task: name, output kind, {tool: (argv, writes_stdout)}."""
     q = lambda s: s.replace("'", "''")
@@ -170,6 +176,20 @@ def tasks(a, hp, out):
             "hyperpipe -j1": ([hp, nd, "--group-by", "status", "--agg", "count, avg(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
             "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(*), avg(TRY_CAST(bytes AS BIGINT)) FROM read_json('{q(nd)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
             "miller": (["mlr", "--ijsonl", "--ocsv", "stats1", "-a", "count,mean", "-f", "bytes", "-g", "status", nd], True),
+        }),
+        ("sort by bytes, top 10", "csv", {
+            "hyperpipe": ([hp, big, "--sort", SORT_HP, "--head", "10", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--sort", SORT_HP, "--head", "10", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, f"SELECT * FROM _t_1 ORDER BY {SORT_SQL} LIMIT 10", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT * FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) ORDER BY {SORT_SQL} LIMIT 10) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "sort", "-nr", "bytes", "-f", "host,timestamp,request", "then", "head", "-n", "10", big], True),
+        }),
+        ("sort CSV by bytes", "csv", {
+            "hyperpipe": ([hp, big, "--sort", SORT_HP, "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--sort", SORT_HP, "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, f"SELECT * FROM _t_1 ORDER BY {SORT_SQL}", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT * FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) ORDER BY {SORT_SQL}) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "sort", "-nr", "bytes", "-f", "host,timestamp,request", big], True),
         }),
         ("startup: filter a 5,000-row file", "csv", {
             "hyperpipe": ([hp, small, "status == 404", "--to", "csv", "-o", out], False),

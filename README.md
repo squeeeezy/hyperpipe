@@ -48,6 +48,7 @@ hyperpipe access.csv.gz --to ndjson -o out.jsonl.gz
 hyperpipe dirty.csv --on-error quarantine --quarantine bad.txt
 hyperpipe access.csv --summary
 hyperpipe access.csv --group-by status --agg "count, sum(bytes)"
+hyperpipe access.csv --sort -bytes --head 10
 ```
 
 | Option | |
@@ -60,6 +61,8 @@ hyperpipe access.csv --group-by status --agg "count, sum(bytes)"
 | `--head N` | stop after N rows |
 | `--group-by COLUMNS` | one row per distinct value of the columns (see Grouping) |
 | `--agg FUNCTIONS` | what each group row holds; default `count` |
+| `--sort COLUMNS` | sort rows, or groups; `-col` descends (see Sorting) |
+| `--memory SIZE` | memory for sorting before temporary files are used (default `512M`) |
 | `--summary` | per-column type, counts, min, max and mean instead of rows |
 | `--schema FILE` | declared column types, one `name,int` or `name,string` per line |
 | `--jobs N\|auto` | threads; auto uses one per processor for files of 16 MiB or more |
@@ -127,6 +130,27 @@ hyperpipe access.csv --group-by host --count            # the number of distinct
 - The result is the same for every `--jobs`. `--head N` writes the first N
   groups. Memory grows with the number of groups.
 
+## Sorting
+
+`--sort` takes comma-separated columns; a leading `-` sorts that column in
+descending order. Rows sort by input columns, so the sort column need not
+be selected; with `--group-by` the groups sort by their output columns.
+
+```
+hyperpipe access.csv --sort -bytes --head 10 --select host,bytes
+hyperpipe access.csv --group-by host --agg "count, sum(bytes)" --sort "-sum(bytes)" --head 5
+```
+
+- Numbers compare by value, text by bytes. Numbers come first, then text,
+  then empty values, in either direction, so `-bytes` starts with the
+  largest number even when the column holds some text.
+- Equal rows keep their input order, for every `--jobs`.
+- `--head N` after `--sort` keeps only N rows in memory, whatever the
+  input size.
+- Otherwise rows are held up to `--memory`; past that they are sorted in
+  runs, written to temporary files and merged, sixteen at a time, so any
+  input sorts in bounded memory.
+
 ## Data rules
 
 - CSV follows RFC 4180. A quoted field keeps its string type: `"007"` stays
@@ -164,17 +188,19 @@ also copies it, byte for byte, to the quarantine file.
 
 For a regular file, `--jobs` splits the input into chunks of whole records
 and runs the full pipeline on each in parallel. Output is byte-identical to
-the single-threaded run. Grouping runs in parallel too: every worker groups
-its chunk and the tables are merged in chunk order. Parallel runs do not
-apply, and the run stays sequential, for stdin, gzip input, `--head`
-without grouping, `--summary`, and CSV or TSV in `skip` or `quarantine`
-mode: there a stray quote could move a chunk boundary.
+the single-threaded run. Grouping and sorting run in parallel too: every
+worker groups or sorts its chunk, and the coordinator merges the results,
+sorted runs on several threads. Parallel runs do not apply, and the run
+stays sequential, for stdin, gzip input, `--head` without grouping or
+sorting, `--summary`, and CSV or TSV in `skip` or `quarantine` mode: there
+a stray quote could move a chunk boundary.
 
 ## Memory
 
 A 512 KiB input buffer and a 256 KiB output buffer, plus the longest record
 seen. A parallel run holds at most `jobs + 2` chunks of a few MiB each.
-Nothing grows with the input size; grouping grows with the number of groups.
+Nothing grows with the input size; grouping grows with the number of groups,
+and sorting is bounded by `--memory`.
 
 ## Performance
 
@@ -202,6 +228,8 @@ equal (median time, peak RSS):
 | group by status: count, sum | 23 ms, 14 MiB | 97 ms, 190 MiB | 91 ms, 183 MiB | | |
 | group by host: count | 21 ms, 20 MiB | 91 ms, 194 MiB | 88 ms, 192 MiB | 511 ms, 534 MiB | |
 | NDJSON group by status: count, avg | 33 ms, 14 MiB | 108 ms, 231 MiB | | 3,922 ms, 140 MiB | |
+| sort by bytes, top 10 | 35 ms, 13 MiB | 111 ms, 156 MiB | 139 ms, 353 MiB | | |
+| sort 1M rows by four columns | 206 ms, 266 MiB | 401 ms, 678 MiB | 461 ms, 755 MiB | | |
 | start-up, 5,000 rows | 2 ms, 2 MiB | 39 ms, 51 MiB | 23 ms, 61 MiB | 7 ms, 17 MiB | |
 
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method, the exact commands

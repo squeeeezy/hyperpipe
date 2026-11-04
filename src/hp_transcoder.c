@@ -397,6 +397,13 @@ static hp_error_t init_parts(hp_transcoder_t *tc, const hp_transcoder_config_t *
         if (!tc->agg) return HP_ERR_NOMEM;
         if ((err = hp_agg_init(tc->agg, cfg->group_by_spec, cfg->agg_spec)) != HP_OK) return err;
     }
+    if (cfg->sort_spec && !cfg->count_only) {
+        tc->sorter = (hp_sorter_t *)malloc(sizeof(hp_sorter_t));
+        if (!tc->sorter) return HP_ERR_NOMEM;
+        err = hp_sorter_init(tc->sorter, cfg->sort_spec, cfg->limit_rows, cfg->sort_memory);
+        if (err != HP_OK) return err;
+        tc->sorter->seq = cfg->row_seq_base;
+    }
 
     if (cfg->on_error == HP_ON_ERROR_QUARANTINE && cfg->quarantine_path) {
         tc->quarantine_file = fopen(cfg->quarantine_path, "wb");
@@ -434,6 +441,11 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
         hp_agg_free(tc->agg);
         free(tc->agg);
         tc->agg = NULL;
+    }
+    if (tc->sorter) {
+        hp_sorter_free(tc->sorter);
+        free(tc->sorter);
+        tc->sorter = NULL;
     }
     if (tc->page_buf_data) {
         free(tc->page_buf_data);
@@ -492,10 +504,76 @@ static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
         if (err != HP_OK) return err;
     }
 
+    if (tc->sorter && !tc->agg) {
+        const char *missing = NULL;
+        hp_error_t err = hp_sorter_bind(tc->sorter, &tc->in_header, &missing);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) return column_not_found(tc, missing);
+        if (err != HP_OK) return err;
+    }
+
     if (tc->config.out_format == HP_FORMAT_NDJSON) {
         hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
     }
     return HP_OK;
+}
+
+/* ---- sorted output ---------------------------------------------------------- */
+
+/* With --sort, rows are written to a page of their own instead of the
+ * output, and each line is handed to the sorter. A line too large for the
+ * page arrives partly through the sink, in spill. */
+typedef struct hp_capture_s {
+    hp_page_buffer_t pb;
+    uint8_t *spill;
+    size_t spill_len, spill_cap;
+} hp_capture_t;
+
+static size_t capture_sink(void *ctx, const void *data, size_t len) {
+    hp_capture_t *c = (hp_capture_t *)ctx;
+    if (c->spill_len + len > c->spill_cap) {
+        size_t cap = c->spill_cap ? c->spill_cap : 4096;
+        while (cap < c->spill_len + len) cap *= 2;
+        uint8_t *spill = (uint8_t *)realloc(c->spill, cap);
+        if (!spill) return 0;
+        c->spill = spill;
+        c->spill_cap = cap;
+    }
+    memcpy(c->spill + c->spill_len, data, len);
+    c->spill_len += len;
+    return len;
+}
+
+static hp_error_t capture_init(hp_capture_t *c, size_t cap) {
+    memset(c, 0, sizeof(*c));
+    c->pb = (hp_page_buffer_t){ .cap = cap, .sink = capture_sink, .sink_ctx = c, .error = HP_OK };
+    c->pb.data = (uint8_t *)malloc(cap);
+    return c->pb.data ? HP_OK : HP_ERR_NOMEM;
+}
+
+static void capture_free(hp_capture_t *c) {
+    free(c->pb.data);
+    free(c->spill);
+    memset(c, 0, sizeof(*c));
+}
+
+/* Hands the line just written to the sorter, keyed by row */
+static hp_error_t capture_take(hp_capture_t *c, hp_sorter_t *sorter, const hp_row_t *row) {
+    if (c->pb.error != HP_OK) return c->pb.error;
+    const uint8_t *line = c->pb.data;
+    size_t len = c->pb.len;
+    if (c->spill_len > 0) {
+        if (capture_sink(c, c->pb.data, c->pb.len) != c->pb.len) return HP_ERR_NOMEM;
+        line = c->spill;
+        len = c->spill_len;
+    }
+    hp_error_t err = hp_sorter_add(sorter, row, line, len);
+    c->pb.len = 0;
+    c->spill_len = 0;
+    return err;
+}
+
+static void emit_line(void *ctx, const void *data, size_t len) {
+    hp_page_buffer_write((hp_page_buffer_t *)ctx, data, len);
 }
 
 /* ---- streaming ------------------------------------------------------------ */
@@ -513,6 +591,8 @@ typedef struct hp_run_s {
     uint8_t out_delim;
     bool quote_clean;              /* clean input fields may hold out_delim */
     bool resyncing;                /* drop input up to the next newline */
+    bool sorting;                  /* rows go through capture to the sorter */
+    hp_capture_t capture;
     uint64_t skipped;              /* the header row and blank lines */
     uint64_t rows_read;
     uint64_t rows_emitted;
@@ -634,23 +714,31 @@ HP_INLINE hp_error_t deliver_record(hp_run_t *run, size_t raw_len, bool *done) {
         hp_summary_observe(tc->summary, &tc->in_header, &run->row);
     } else if (tc->config.count_only) {
         /* counted below, nothing is written */
-    } else if (run->csv_out) {
-        emit_csv_row_pb(&run->pb, &run->row,
-                        tc->projection.active ? tc->projection.col_indices : NULL,
-                        tc->projection.count, run->out_delim, raw_len, run->quote_clean);
     } else {
-        const hp_row_t *row = &run->row;
-        if (tc->projection.active) {
-            hp_project_row(&tc->projection, &run->row, &run->projected);
-            row = &run->projected;
+        hp_page_buffer_t *pb = run->sorting ? &run->capture.pb : &run->pb;
+        if (run->csv_out) {
+            emit_csv_row_pb(pb, &run->row,
+                            tc->projection.active ? tc->projection.col_indices : NULL,
+                            tc->projection.count, run->out_delim, raw_len, run->quote_clean);
+        } else {
+            const hp_row_t *row = &run->row;
+            if (tc->projection.active) {
+                hp_project_row(&tc->projection, &run->row, &run->projected);
+                row = &run->projected;
+            }
+            size_t line_len = 0;
+            hp_error_t err = emit_ndjson_row_pb(pb, &tc->json_ser, &tc->out_header, row, &line_len);
+            if (err != HP_OK) return err;
+            tc->stats.bytes_out += line_len;
         }
-        size_t line_len = 0;
-        hp_error_t err = emit_ndjson_row_pb(&run->pb, &tc->json_ser, &tc->out_header, row, &line_len);
-        if (err != HP_OK) return err;
-        tc->stats.bytes_out += line_len;
+        if (run->sorting) {
+            hp_error_t err = capture_take(&run->capture, tc->sorter, &run->row);
+            if (err != HP_OK) return err;
+        }
     }
     run->rows_emitted++;
-    *done = tc->config.limit_rows && run->rows_emitted >= tc->config.limit_rows;
+    /* Sorting needs every row before the first N are known */
+    *done = !run->sorting && tc->config.limit_rows && run->rows_emitted >= tc->config.limit_rows;
     return HP_OK;
 }
 
@@ -670,31 +758,53 @@ static hp_error_t emit_groups(hp_transcoder_t *tc, hp_page_buffer_t *pb, const h
     *emitted = n;
     if (cfg->count_only) return HP_OK;
 
+    hp_capture_t capture;
+    hp_sorter_t *sorter = tc->sorter;
+    if (sorter) {
+        const char *missing = NULL;
+        hp_error_t err = hp_sorter_bind(sorter, &tc->out_header, &missing);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) return column_not_found(tc, missing);
+        if (err == HP_OK) err = capture_init(&capture, tc->page_buf_cap);
+        if (err != HP_OK) return err;
+    }
+    hp_page_buffer_t *out = sorter ? &capture.pb : pb;
+
     const bool csv_out = cfg->out_format == HP_FORMAT_CSV || cfg->out_format == HP_FORMAT_TSV;
     const uint8_t delim = cfg->out_format == HP_FORMAT_TSV ? '\t' : ',';
     if (csv_out) write_csv_names(pb, &tc->out_header, delim);
 
     static hp_row_t row;    /* 32 KiB: kept off the stack of a worker */
     char scratch[HP_AGG_MAX_FNS * HP_AGG_VALUE_MAX];
-    for (size_t i = 0; i < n; i++) {
+    hp_error_t err = HP_OK;
+    for (size_t i = 0; err == HP_OK && i < (sorter ? rows : n); i++) {
         hp_agg_row(agg, i, &row, scratch);
         if (csv_out) {
             size_t raw_len = row.field_count;
             for (size_t f = 0; f < row.field_count; f++) raw_len += row.fields[f].len;
-            emit_csv_row_pb(pb, &row, NULL, 0, delim, raw_len, true);
+            emit_csv_row_pb(out, &row, NULL, 0, delim, raw_len, true);
         } else {
             size_t line_len = 0;
-            hp_error_t err = emit_ndjson_row_pb(pb, &tc->json_ser, &tc->out_header, &row, &line_len);
-            if (err != HP_OK) return err;
+            err = emit_ndjson_row_pb(out, &tc->json_ser, &tc->out_header, &row, &line_len);
             tc->stats.bytes_out += line_len;
         }
+        if (err == HP_OK && sorter) err = capture_take(&capture, sorter, &row);
     }
-    return HP_OK;
+    if (sorter) {
+        if (err == HP_OK) err = hp_sorter_write(sorter, emit_line, pb, emitted);
+        capture_free(&capture);
+    }
+    return err;
 }
 
 static hp_error_t finish_run(hp_run_t *run, hp_error_t err) {
     hp_transcoder_t *tc = run->tc;
-    if (err == HP_OK && tc->agg && !tc->config.agg_partial) {
+    if (err == HP_OK && run->sorting && !tc->config.partial) {
+        err = hp_sorter_write(tc->sorter, emit_line, &run->pb, &run->rows_emitted);
+    } else if (err == HP_OK && run->sorting) {
+        err = hp_sorter_finish(tc->sorter);
+    }
+    if (run->sorting) capture_free(&run->capture);
+    if (err == HP_OK && tc->agg && !tc->config.partial) {
         /* An input without rows still has a result, a count of 0, under
          * the columns as they were given */
         if (!run->header_done && (err = hp_agg_header(tc->agg, &tc->out_header)) == HP_OK) {
@@ -865,6 +975,11 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     run->csv_out = (tc->config.out_format == HP_FORMAT_CSV || tc->config.out_format == HP_FORMAT_TSV);
     run->out_delim = (tc->config.out_format == HP_FORMAT_TSV) ? '\t' : ',';
     run->quote_clean = run->ndjson_in || tc->csv_parser.delim != run->out_delim;
+    run->sorting = tc->sorter && !tc->agg;
+    if (run->sorting && (err = capture_init(&run->capture, tc->page_buf_cap)) != HP_OK) {
+        free(run);
+        return err;
+    }
 
     /* Parallel workers start mid-file with the header the coordinator read */
     tc->keymap_active = false;
@@ -895,6 +1010,18 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     return err;
 }
 
+static hp_page_buffer_t output_page(hp_transcoder_t *tc, FILE *out_stream) {
+    return (hp_page_buffer_t){
+        .data = tc->page_buf_data,
+        .cap = tc->page_buf_cap,
+        .stream = out_stream,
+        .sink = tc->config.sink,
+        .sink_ctx = tc->config.sink_ctx,
+        .gz = tc->gz_out,
+        .error = HP_OK,
+    };
+}
+
 hp_error_t hp_transcoder_write_groups(hp_transcoder_t *tc, const hp_agg_t *agg, FILE *out_stream) {
     hp_transcoder_config_t *cfg = &tc->config;
     if (cfg->out_format == HP_FORMAT_AUTO) {
@@ -904,17 +1031,18 @@ hp_error_t hp_transcoder_write_groups(hp_transcoder_t *tc, const hp_agg_t *agg, 
     if (err != HP_OK) return err;
     hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
 
-    hp_page_buffer_t pb = {
-        .data = tc->page_buf_data,
-        .cap = tc->page_buf_cap,
-        .stream = out_stream,
-        .sink = cfg->sink,
-        .sink_ctx = cfg->sink_ctx,
-        .gz = tc->gz_out,
-        .error = HP_OK,
-    };
+    hp_page_buffer_t pb = output_page(tc, out_stream);
     uint64_t emitted = 0;
     err = emit_groups(tc, &pb, agg, &emitted);
+    hp_error_t finish_err = hp_page_buffer_finish(&pb);
+    tc->stats.rows_emitted += emitted;
+    return err != HP_OK ? err : finish_err;
+}
+
+hp_error_t hp_transcoder_write_sorted(hp_transcoder_t *tc, hp_sorter_t *sorter, FILE *out_stream) {
+    hp_page_buffer_t pb = output_page(tc, out_stream);
+    uint64_t emitted = 0;
+    hp_error_t err = hp_sorter_write(sorter, emit_line, &pb, &emitted);
     hp_error_t finish_err = hp_page_buffer_finish(&pb);
     tc->stats.rows_emitted += emitted;
     return err != HP_OK ? err : finish_err;
