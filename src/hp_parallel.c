@@ -185,6 +185,7 @@ typedef struct hp_chunk_s {
     bool cut_in_quotes;        /* quoting state just before `cut` */
     hp_buf_t out;
     hp_buf_t quarantine;
+    hp_agg_t *agg;             /* the chunk's groups, with --group-by/--agg */
     hp_transcoder_stats_t stats;
     hp_error_t err;
     bool done;
@@ -296,6 +297,27 @@ static void *count_quotes_main(void *arg) {
     return NULL;
 }
 
+static void free_groups(hp_agg_t *agg) {
+    if (!agg) return;
+    hp_agg_free(agg);
+    free(agg);
+}
+
+/* Writes the merged groups. A transcoder without input does the writing, so
+ * the rows come out exactly as a single-threaded run writes them. groups is
+ * NULL when no chunk held a record. */
+static hp_error_t write_groups(const hp_transcoder_config_t *cfg, const hp_agg_t *groups,
+                               FILE *out, hp_transcoder_stats_t *stats_out) {
+    hp_transcoder_t tc;
+    hp_error_t err = hp_transcoder_init(&tc, cfg);
+    if (err != HP_OK) return err;
+    err = hp_transcoder_write_groups(&tc, groups ? groups : tc.agg, out);
+    stats_out->rows_emitted = tc.stats.rows_emitted;
+    stats_out->bytes_out = tc.stats.bytes_out;
+    hp_transcoder_free(&tc);
+    return err;
+}
+
 /* ---- phase 2: transcode chunks ------------------------------------------------- */
 
 static void *transcode_main(void *arg) {
@@ -326,6 +348,7 @@ static void *transcode_main(void *arg) {
             cfg.preset_header = (i > 0) ? pool->header : NULL;
             cfg.sink = buf_append;
             cfg.sink_ctx = &c->out;
+            cfg.agg_partial = true;
             if (cfg.on_error == HP_ON_ERROR_QUARANTINE) {
                 cfg.quarantine_path = NULL;
                 cfg.quarantine_sink = buf_append;
@@ -339,6 +362,8 @@ static void *transcode_main(void *arg) {
             } else if ((c->err = hp_transcoder_init(&tc, &cfg)) == HP_OK) {
                 c->err = hp_transcoder_run(&tc, f, NULL);
                 c->stats = tc.stats;
+                c->agg = tc.agg;
+                tc.agg = NULL;
                 hp_transcoder_free(&tc);
             }
         }
@@ -552,6 +577,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
     }
 
     memset(stats_out, 0, sizeof(*stats_out));
+    hp_agg_t *groups = NULL;
     for (size_t i = 0; err == HP_OK && i < pool.n_chunks; i++) {
         hp_chunk_t *c = &pool.chunks[i];
         hp_mutex_lock(&pool.mu);
@@ -574,6 +600,14 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
         if (err == HP_OK && quarantine &&
             fwrite(c->quarantine.data, 1, c->quarantine.len, quarantine) != c->quarantine.len) {
             err = HP_ERR_IO;
+        }
+        if (err == HP_OK && c->agg) {
+            if (!groups) {
+                groups = c->agg;
+                c->agg = NULL;
+            } else {
+                err = hp_agg_merge(groups, c->agg);
+            }
         }
 
         stats_out->rows_read += c->stats.rows_read;
@@ -603,12 +637,17 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
     for (int i = 0; i < started; i++) hp_thread_join(threads[i]);
     for (size_t i = 0; err == HP_OK && i < pool.n_chunks; i++) err = pool.chunks[i].err;
     if (pool.positional && !seek_to(out_stream, out_end) && err == HP_OK) err = HP_ERR_IO;
+    if (err == HP_OK && (base_cfg->group_by_spec || base_cfg->agg_spec)) {
+        err = write_groups(&pool.cfg, groups, out_stream, stats_out);
+    }
 
     if (quarantine) fclose(quarantine);
     for (size_t i = 0; i < pool.n_chunks; i++) {
         buf_free(&pool.chunks[i].out);
         buf_free(&pool.chunks[i].quarantine);
+        free_groups(pool.chunks[i].agg);
     }
+    free_groups(groups);
     for (size_t i = 0; i < pool.n_spare; i++) buf_free(&pool.spare[i]);
     free(pool.chunks);
     hp_cond_destroy(&pool.progress);

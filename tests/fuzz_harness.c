@@ -258,6 +258,20 @@ static int check_input(const uint8_t *data, size_t size) {
         free(jout.data);
     }
 
+    /* Grouping: hostile keys and numbers through the hash table and the
+     * exact decimal arithmetic. A missing column is a normal outcome. */
+    for (int fmt = 0; fmt < 2; fmt++) {
+        const hp_transcoder_config_t grouped = {
+            .in_format = fmt ? HP_FORMAT_NDJSON : HP_FORMAT_CSV,
+            .out_format = fmt ? HP_FORMAT_CSV : HP_FORMAT_NDJSON,
+            .group_by_spec = "0",
+            .agg_spec = "count, count(1), sum(1), avg(1), min(1), max(1)",
+        };
+        out_buf_t gout = { 0 };
+        (void)transcode(grouped, doc, size, &gout);
+        free(gout.data);
+    }
+
     return 0;
 }
 

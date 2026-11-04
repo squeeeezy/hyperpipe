@@ -174,6 +174,37 @@ python3 bench/bench_tools.py --csv big.csv --ndjson big.ndjson \
 | DuckDB | 91 ms | 5.3x | 156 MiB |
 | miller | 490 ms | 28.6x | 535 MiB |
 
+**Group by status: count and sum of bytes**
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 23 ms | 1.0x | 14 MiB |
+| HyperPipe, one thread | 40 ms | 1.7x | 2 MiB |
+| qsv sqlp | 91 ms | 3.9x | 183 MiB |
+| DuckDB | 97 ms | 4.2x | 190 MiB |
+
+miller's sum is 0 for a group without numbers (status 404, where `bytes`
+is always `-`); SQL and HyperPipe leave it empty, so miller is not timed.
+
+**Group by host: count** (many groups)
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 21 ms | 1.0x | 20 MiB |
+| HyperPipe, one thread | 36 ms | 1.7x | 2 MiB |
+| qsv sqlp | 88 ms | 4.2x | 192 MiB |
+| DuckDB | 91 ms | 4.3x | 194 MiB |
+| miller | 511 ms | 24.3x | 534 MiB |
+
+**NDJSON group by status: count and mean of bytes**
+
+| Tool | Time | | Peak RSS |
+|---|---:|---:|---:|
+| HyperPipe | 33 ms | 1.0x | 14 MiB |
+| DuckDB | 108 ms | 3.3x | 231 MiB |
+| HyperPipe, one thread | 127 ms | 3.8x | 3 MiB |
+| miller | 3,922 ms | 118.8x | 140 MiB |
+
 **Start-up: filter a 5,000-row file**
 
 | Tool | Time | | Peak RSS |

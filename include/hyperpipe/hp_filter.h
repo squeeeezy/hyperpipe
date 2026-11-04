@@ -64,6 +64,10 @@ typedef struct hp_projection_s {
     bool active;
 } hp_projection_t;
 
+/* A column reference: a header name first, otherwise a 0-based position.
+ * -1 when it is neither. */
+int64_t hp_resolve_column(const hp_header_t *header, const char *ref);
+
 hp_error_t hp_projection_init(hp_projection_t *proj, const char *spec);
 hp_error_t hp_projection_bind(hp_projection_t *proj, const hp_header_t *header);
 hp_error_t hp_project_row(const hp_projection_t *proj, const hp_row_t *src, hp_row_t *dst);

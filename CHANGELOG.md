@@ -40,6 +40,13 @@ default for large files; and every workload is at least as fast as in 1.5.
   `hp_filter_eval()`; the `plan_masks` kernels are gone.
 
 ### Added
+- `--group-by` and `--agg`: `count`, `count(col)`, `sum`, `avg`, `min` and
+  `max` per group, in first-seen order, in one pass and in parallel. Sums,
+  minimums and maximums are exact decimals, so `0.1 + 0.2` is `0.3` and the
+  result does not depend on the job count. 4x faster than DuckDB and qsv on
+  the benchmark data, at a tenth of the memory. Library: `hp_agg.h`,
+  `group_by_spec`/`agg_spec` in `hp_transcoder_config_t`,
+  `hp_transcoder_write_groups()`, `HP_ERR_AGG`.
 - Errors say where: a malformed or oversized record by its number and byte
   offset (parallel runs included), a filter by the place parsing stopped,
   a missing column by its name. Library: `records_in`, `error_record`,

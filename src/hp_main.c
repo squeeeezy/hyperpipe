@@ -40,6 +40,9 @@ static void print_usage(void) {
         "  --where FILTER            filter, when not given as an argument\n"
         "  --count                   print the number of matching rows\n"
         "  --head N, --limit N       stop after N rows\n"
+        "  --group-by COLUMNS        one output row per distinct value of COLUMNS\n"
+        "  --agg FUNCTIONS           per group: count, count(col), sum(col),\n"
+        "                            avg(col), min(col), max(col) (default count)\n"
         "  --summary                 print per-column statistics instead of rows\n"
         "  --schema FILE             column types, one \"name,int|string\" per line\n"
         "  --jobs N|auto             threads for file input (default auto: one per\n"
@@ -213,6 +216,10 @@ static int parse_args(int argc, char **argv, options_t *o) {
             cfg->count_only = true;
         } else if (is_option(a, NULL, "--gzip")) {
             cfg->gzip_out = true;
+        } else if (is_option(a, NULL, "--group-by")) {
+            if (!(cfg->group_by_spec = option_value(argc, argv, &i))) return 1;
+        } else if (is_option(a, NULL, "--agg")) {
+            if (!(cfg->agg_spec = option_value(argc, argv, &i))) return 1;
         } else if (is_option(a, NULL, "--summary")) {
             cfg->summary = true;
         } else if (is_option(a, NULL, "--schema")) {
@@ -271,17 +278,38 @@ static int parse_args(int argc, char **argv, options_t *o) {
         complain("--summary cannot be combined with --count, -o or --gzip");
         return 1;
     }
+    const bool grouped = cfg->group_by_spec || cfg->agg_spec;
+    if (grouped && (cfg->select_spec || cfg->summary)) {
+        complain("--group-by and --agg choose the output columns; they cannot be "
+                 "combined with --select or --summary");
+        return 1;
+    }
     if (o->jobs > 1) {
         if (!o->input_path) {
             complain("--jobs needs an input file; stdin cannot be split");
             return 1;
         }
-        if (cfg->limit_rows > 0 || cfg->summary) {
+        /* With groups, --head limits the groups, which the merge knows */
+        if ((cfg->limit_rows > 0 && !grouped) || cfg->summary) {
             complain("--jobs cannot be combined with --head or --summary");
             return 1;
         }
     }
     return 0;
+}
+
+static bool check_agg(const char *group_by, const char *fns) {
+    static hp_agg_t agg;
+    if (!group_by && !fns) return true;
+    hp_error_t err = hp_agg_init(&agg, group_by, fns);
+    if (err == HP_ERR_AGG) {
+        complain("invalid --agg: %s", agg.error);
+        fprintf(stderr, "  %s\n  %*s^\n", fns, (int)agg.error_at, "");
+    } else if (err != HP_OK) {
+        complain("--group-by: more than %d columns, or a name longer than 127 bytes",
+                 HP_AGG_MAX_KEYS);
+    }
+    return err == HP_OK;
 }
 
 static bool check_select(const char *spec) {
@@ -322,13 +350,17 @@ int main(int argc, char **argv) {
 
     int status = parse_args(argc, argv, &o);
     if (status != 0) return status < 0 ? 0 : status;
-    if (!check_select(o.cfg.select_spec) || !check_filter(o.cfg.where_spec)) return 1;
+    if (!check_select(o.cfg.select_spec) || !check_filter(o.cfg.where_spec) ||
+        !check_agg(o.cfg.group_by_spec, o.cfg.agg_spec)) {
+        return 1;
+    }
 
     /* --jobs auto takes the parallel path only where it applies and pays off;
      * an explicit --jobs N says when it does not apply */
     const bool jobs_explicit = (o.jobs != 0);
     if (!jobs_explicit) {
-        o.jobs = (o.input_path && o.cfg.limit_rows == 0 && !o.cfg.summary)
+        const bool grouped = o.cfg.group_by_spec || o.cfg.agg_spec;
+        o.jobs = (o.input_path && (o.cfg.limit_rows == 0 || grouped) && !o.cfg.summary)
                      ? hp_parallel_auto_jobs(o.input_path) : 1;
     }
 

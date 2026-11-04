@@ -44,7 +44,8 @@ typedef enum hp_error_e {
     HP_ERR_GZIP_UNAVAILABLE = -10,
     HP_ERR_UNSUPPORTED = -11,
     HP_ERR_PARSE_JSON = -12,
-    HP_ERR_FILTER = -13
+    HP_ERR_FILTER = -13,
+    HP_ERR_AGG = -14
 } hp_error_t;
 
 typedef enum hp_format_e {

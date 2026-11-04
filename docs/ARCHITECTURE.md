@@ -105,8 +105,26 @@ when gzip output is on, to a `FILE` or to a sink callback.
 parser for its format. The loop is inlined per format, so neither copy pays
 an indirect call per record. For each record it binds the header on the
 first one, follows NDJSON schema growth, applies the filter and passes the
-record to `deliver_record()` (summary, count or write). Parse errors go to
-the `--on-error` mode; everything else ends the run.
+record to `deliver_record()` (group, summary, count or write). Parse errors
+go to the `--on-error` mode; everything else ends the run.
+
+## Grouping
+
+`src/hp_agg.c` keeps one table per run: open addressing over group ids,
+each group's key encoded once (length, flags, bytes per column) and its
+accumulators in one array. A row is hashed over its key columns, matched
+against the encoded key in place, and folded in; nothing is copied unless
+the key is new. Groups are numbered in arrival order, which is the output
+order.
+
+Numbers follow `src/hp_number.h`, shared with the filter. A value with a
+64-bit mantissa and at most 18 decimal places is kept as mantissa and
+scale; sums are 128-bit integers at the largest scale seen, so they are
+exact and do not depend on the order of the rows. Anything wider falls back
+to double. Parallel workers build a table per chunk (`agg_partial`); the
+coordinator merges them in chunk order, which keeps arrival order, and
+writes the rows through `hp_transcoder_write_groups()`, the same writer a
+single-threaded run uses.
 
 ## Parallel runs
 

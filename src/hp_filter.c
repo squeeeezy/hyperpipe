@@ -1,63 +1,6 @@
 #include "hyperpipe/hp_filter.h"
+#include "hp_number.h"
 #include <ctype.h>
-
-/* Parses a signed decimal integer that spans the whole field. Values outside
- * int64 are rejected rather than wrapped, so they simply never match. */
-static bool hp_parse_int_span(const char *ptr, size_t len, int64_t *out) {
-    size_t k = 0;
-    bool neg = false;
-    if (len > 0 && (ptr[0] == '-' || ptr[0] == '+')) {
-        neg = (ptr[0] == '-');
-        k = 1;
-    }
-    const size_t digits = len - k;
-    if (digits == 0 || digits > 19) return false;
-
-    uint64_t v = 0;
-    for (; k < len; k++) {
-        uint8_t d = (uint8_t)(ptr[k] - '0');
-        if (d > 9) return false;
-        v = v * 10 + (uint64_t)d;
-    }
-    /* Up to 18 digits always fit; only a 19-digit value can exceed int64.
-     * Below 10^19 the uint64 accumulator itself never wraps. */
-    const uint64_t limit = neg ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull;
-    if (digits == 19 && v > limit) return false;
-    *out = neg ? (int64_t)(0ull - v) : (int64_t)v;
-    return true;
-}
-
-/* Parses a plain decimal number that spans the whole field: optional sign,
- * digits with an optional fraction, optional exponent. Unlike bare strtod it
- * rejects numeric prefixes ("200abc"), whitespace, hex, inf and nan. */
-static bool hp_parse_decimal_span(const char *ptr, size_t len, double *out) {
-    char buf[64];
-    if (len == 0 || len >= sizeof(buf)) return false;
-
-    size_t k = 0;
-    size_t digits = 0;
-    if (ptr[k] == '-' || ptr[k] == '+') k++;
-    while (k < len && isdigit((unsigned char)ptr[k])) { k++; digits++; }
-    if (k < len && ptr[k] == '.') {
-        k++;
-        while (k < len && isdigit((unsigned char)ptr[k])) { k++; digits++; }
-    }
-    if (digits == 0) return false;
-
-    if (k < len && (ptr[k] == 'e' || ptr[k] == 'E')) {
-        k++;
-        if (k < len && (ptr[k] == '-' || ptr[k] == '+')) k++;
-        size_t exp_digits = 0;
-        while (k < len && isdigit((unsigned char)ptr[k])) { k++; exp_digits++; }
-        if (exp_digits == 0) return false;
-    }
-    if (k != len) return false;
-
-    memcpy(buf, ptr, len);
-    buf[len] = '\0';
-    *out = strtod(buf, NULL);
-    return true;
-}
 
 static int hp_sign_i64(int64_t a, int64_t b) { return (a > b) - (a < b); }
 static int hp_sign_f64(double a, double b) { return (a > b) - (a < b); }
@@ -78,7 +21,7 @@ static bool hp_cmp_matches(hp_pred_op_t op, int cmp) {
 /* Resolves a column reference against the header. A matching name always
  * wins, so a column literally named "2019" is found by name; otherwise a
  * non-negative integer selects the column by position. */
-static int64_t hp_resolve_column(const hp_header_t *header, const char *ref) {
+int64_t hp_resolve_column(const hp_header_t *header, const char *ref) {
     int64_t idx = hp_header_find_column(header, ref);
     if (idx >= 0) return idx;
 

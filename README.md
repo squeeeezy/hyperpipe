@@ -47,6 +47,7 @@ hyperpipe huge.csv "status == 500" --head 100
 hyperpipe access.csv.gz --to ndjson -o out.jsonl.gz
 hyperpipe dirty.csv --on-error quarantine --quarantine bad.txt
 hyperpipe access.csv --summary
+hyperpipe access.csv --group-by status --agg "count, sum(bytes)"
 ```
 
 | Option | |
@@ -57,6 +58,8 @@ hyperpipe access.csv --summary
 | `--where FILTER` | the filter, when not given as an argument |
 | `--count` | print the number of matching rows |
 | `--head N` | stop after N rows |
+| `--group-by COLUMNS` | one row per distinct value of the columns (see Grouping) |
+| `--agg FUNCTIONS` | what each group row holds; default `count` |
 | `--summary` | per-column type, counts, min, max and mean instead of rows |
 | `--schema FILE` | declared column types, one `name,int` or `name,string` per line |
 | `--jobs N\|auto` | threads; auto uses one per processor for files of 16 MiB or more |
@@ -92,6 +95,37 @@ length: `5000`, `5000.0` and `5e3` are equal, while `200abc`, `0x10`, `inf`
 and an empty field match no numeric predicate. A column name is looked up
 in the header first; a number that is not a column name selects a column by
 position.
+
+## Grouping
+
+`--group-by` writes one row per distinct value of its columns, in the order
+the values first appear, and `--agg` says what each row holds. Without
+`--group-by` the whole input is one group.
+
+```
+hyperpipe access.csv "status >= 400" --group-by host --agg "count, sum(bytes), max(bytes)"
+hyperpipe events.jsonl --agg "count, avg(latency)"
+hyperpipe access.csv --group-by host --count            # the number of distinct hosts
+```
+
+| Function | |
+|---|---|
+| `count` | rows in the group |
+| `count(col)` | rows where the column is not empty |
+| `sum(col)`, `avg(col)` | sum and mean of the numbers in the column |
+| `min(col)`, `max(col)` | smallest and largest number |
+
+- Keys are compared as text: `1` and `"1"` are one group; a missing NDJSON
+  key is a group of its own.
+- `sum`, `avg`, `min` and `max` use the values that are numbers in their
+  whole length, the rule numeric filters follow, and skip the rest. A group
+  without numbers leaves them empty, as SQL does.
+- Sums, minimums and maximums are exact decimals: `0.1 + 0.2` is `0.3`.
+  They stay exact while each value fits in 64 bits with at most 18 decimal
+  places and the sum fits in 128 bits; past that they are doubles. `avg` is
+  the double nearest to the exact sum divided by the count.
+- The result is the same for every `--jobs`. `--head N` writes the first N
+  groups. Memory grows with the number of groups.
 
 ## Data rules
 
@@ -130,15 +164,17 @@ also copies it, byte for byte, to the quarantine file.
 
 For a regular file, `--jobs` splits the input into chunks of whole records
 and runs the full pipeline on each in parallel. Output is byte-identical to
-the single-threaded run. It does not apply, and the run stays sequential,
-for stdin, gzip input, `--head`, `--summary`, and CSV or TSV in `skip` or
-`quarantine` mode: there a stray quote could move a chunk boundary.
+the single-threaded run. Grouping runs in parallel too: every worker groups
+its chunk and the tables are merged in chunk order. Parallel runs do not
+apply, and the run stays sequential, for stdin, gzip input, `--head`
+without grouping, `--summary`, and CSV or TSV in `skip` or `quarantine`
+mode: there a stray quote could move a chunk boundary.
 
 ## Memory
 
 A 512 KiB input buffer and a 256 KiB output buffer, plus the longest record
 seen. A parallel run holds at most `jobs + 2` chunks of a few MiB each.
-Nothing grows with the input size.
+Nothing grows with the input size; grouping grows with the number of groups.
 
 ## Performance
 
@@ -163,6 +199,9 @@ equal (median time, peak RSS):
 | NDJSON to CSV | 66 ms, 27 MiB | 222 ms, 529 MiB | 349 ms, 62 MiB | 3,857 ms, 137 MiB | 3,228 ms, 4 MiB |
 | NDJSON filter + project | 26 ms, 12 MiB | 99 ms, 231 MiB | | 3,870 ms, 137 MiB | 1,403 ms, 4 MiB |
 | count matching rows | 17 ms, 11 MiB | 91 ms, 156 MiB | 76 ms, 167 MiB | 490 ms, 535 MiB | |
+| group by status: count, sum | 23 ms, 14 MiB | 97 ms, 190 MiB | 91 ms, 183 MiB | | |
+| group by host: count | 21 ms, 20 MiB | 91 ms, 194 MiB | 88 ms, 192 MiB | 511 ms, 534 MiB | |
+| NDJSON group by status: count, avg | 33 ms, 14 MiB | 108 ms, 231 MiB | | 3,922 ms, 140 MiB | |
 | start-up, 5,000 rows | 2 ms, 2 MiB | 39 ms, 51 MiB | 23 ms, 61 MiB | 7 ms, 17 MiB | |
 
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the method, the exact commands

@@ -9,6 +9,7 @@
 #include "hp_cpuid.h"
 #include "hp_keymap.h"
 #include "hp_summary.h"
+#include "hp_agg.h"
 
 typedef struct hp_transcoder_config_s {
     hp_format_t in_format;
@@ -24,6 +25,12 @@ typedef struct hp_transcoder_config_s {
     bool gzip_out;         /* compress output with gzip (requires libz at runtime) */
     bool summary;          /* --summary: aggregate column statistics, no row output */
     const char *schema_path; /* --schema <file>: declared column types (int hints) */
+    /* --group-by and --agg (hp_agg.h): rows are folded into groups and the
+     * groups are written once the input ends. agg_partial keeps the table
+     * in the transcoder instead, for a parallel worker's chunk. */
+    const char *group_by_spec;
+    const char *agg_spec;
+    bool agg_partial;
     /* Parallel workers (hp_parallel.h) only: read exactly span_end input
      * bytes and bind preset_header instead of parsing a header row. Both are
      * zero/NULL in ordinary single-stream runs. */
@@ -72,6 +79,7 @@ typedef struct hp_transcoder_s {
     hp_keymap_t keymap;           /* O(1) NDJSON key lookup, valid when keymap_active */
     bool keymap_active;
     hp_summary_t *summary;        /* --summary accumulator (heap, one per run) */
+    hp_agg_t *agg;                /* --group-by/--agg table (heap) */
     hp_transcoder_stats_t stats;
     FILE *quarantine_file;
     uint8_t *page_buf_data;
@@ -90,5 +98,10 @@ const char *hp_strerror(hp_error_t err);
 
 /* Run streaming transcoding from in_stream to out_stream */
 hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_stream);
+
+/* Writes the rows of a finished aggregation in the configured output
+ * format; parallel runs use it for the merged table of their workers.
+ * in_format must be known, so the default output format can be chosen. */
+hp_error_t hp_transcoder_write_groups(hp_transcoder_t *tc, const hp_agg_t *agg, FILE *out_stream);
 
 #endif /* HYPERPIPE_HP_TRANSCODER_H */

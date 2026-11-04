@@ -310,6 +310,7 @@ const char *hp_strerror(hp_error_t err) {
         case HP_ERR_UNSUPPORTED:      return "not supported for this input";
         case HP_ERR_PARSE_JSON:       return "malformed JSON";
         case HP_ERR_FILTER:           return "invalid filter";
+        case HP_ERR_AGG:              return "invalid --agg";
         case HP_ERR_GENERIC:          break;
     }
     return "internal error";
@@ -344,11 +345,7 @@ hp_format_t hp_sniff_format(const uint8_t *sample, size_t len) {
     return HP_FORMAT_CSV;
 }
 
-hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg) {
-    if (!tc || !cfg) return HP_ERR_INVALID_ARG;
-    memset(tc, 0, sizeof(*tc));
-    tc->config = *cfg;
-
+static hp_error_t init_parts(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg) {
     size_t cap = cfg->buffer_capacity ? cfg->buffer_capacity : HP_DEFAULT_BUFFER_CAPACITY;
     hp_error_t err = hp_sliding_buffer_init(&tc->ring_buf, cap);
     if (err != HP_OK) return err;
@@ -358,30 +355,13 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
      * flat vs 64 KiB on the reference host, better on slower storage. */
     tc->page_buf_cap = 256 * 1024;
     tc->page_buf_data = (uint8_t *)malloc(tc->page_buf_cap);
-    if (!tc->page_buf_data) {
-        hp_sliding_buffer_free(&tc->ring_buf);
-        return HP_ERR_NOMEM;
-    }
+    if (!tc->page_buf_data) return HP_ERR_NOMEM;
 
     hp_dispatch_init(cfg->simd_mode);
 
     hp_format_t parser_fmt = (cfg->in_format == HP_FORMAT_AUTO) ? HP_FORMAT_CSV : cfg->in_format;
-    err = hp_csv_parser_init(&tc->csv_parser, parser_fmt, cfg->simd_mode);
-    if (err != HP_OK) {
-        hp_sliding_buffer_free(&tc->ring_buf);
-        free(tc->page_buf_data);
-        tc->page_buf_data = NULL;
-        return err;
-    }
-
-    err = hp_json_ser_init(&tc->json_ser, 4096, cfg->simd_mode);
-    if (err != HP_OK) {
-        hp_sliding_buffer_free(&tc->ring_buf);
-        free(tc->page_buf_data);
-        tc->page_buf_data = NULL;
-        return err;
-    }
-
+    if ((err = hp_csv_parser_init(&tc->csv_parser, parser_fmt, cfg->simd_mode)) != HP_OK) return err;
+    if ((err = hp_json_ser_init(&tc->json_ser, 4096, cfg->simd_mode)) != HP_OK) return err;
     tc->json_ser.scan_escapes = g_hp_dispatch.json_scan_escapes;
     tc->json_ser.emit_string = g_hp_dispatch.json_emit_string;
 
@@ -389,88 +369,49 @@ hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t 
      * with a dedicated error code instead of mid-stream. */
     if (cfg->gzip_out) {
         hp_gzip_load();
-        if (!hp_gzip_available()) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return HP_ERR_GZIP_UNAVAILABLE;
-        }
-        tc->gz_out = (hp_gzip_deflate_t *)malloc(sizeof(hp_gzip_deflate_t));
-        if (!tc->gz_out) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return HP_ERR_NOMEM;
-        }
-        hp_error_t gerr = hp_gzip_deflate_start(tc->gz_out);
-        if (gerr != HP_OK) {
-            free(tc->gz_out);
-            tc->gz_out = NULL;
-            hp_sliding_buffer_free(&tc->ring_buf);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return gerr;
-        }
+        if (!hp_gzip_available()) return HP_ERR_GZIP_UNAVAILABLE;
+        tc->gz_out = (hp_gzip_deflate_t *)calloc(1, sizeof(hp_gzip_deflate_t));
+        if (!tc->gz_out) return HP_ERR_NOMEM;
+        if ((err = hp_gzip_deflate_start(tc->gz_out)) != HP_OK) return err;
     }
 
-    if (cfg->select_spec) {
-        hp_error_t serr = hp_projection_init(&tc->projection, cfg->select_spec);
-        if (serr != HP_OK) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            hp_json_ser_free(&tc->json_ser);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return serr;
-        }
+    if (cfg->select_spec && (err = hp_projection_init(&tc->projection, cfg->select_spec)) != HP_OK) {
+        return err;
     }
-    if (cfg->where_spec) {
-        hp_error_t ferr = hp_filter_init(&tc->filter, cfg->where_spec);
-        if (ferr != HP_OK) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            hp_json_ser_free(&tc->json_ser);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return ferr;
-        }
+    if (cfg->where_spec && (err = hp_filter_init(&tc->filter, cfg->where_spec)) != HP_OK) {
+        return err;
     }
-
     /* Declared types (--schema): int hints accelerate numeric filter
      * predicates. They are applied at bind time, once the header is known. */
-    if (cfg->schema_path) {
-        hp_error_t herr = hp_filter_load_hints(&tc->filter, cfg->schema_path);
-        if (herr != HP_OK) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            hp_json_ser_free(&tc->json_ser);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return herr;
-        }
+    if (cfg->schema_path && (err = hp_filter_load_hints(&tc->filter, cfg->schema_path)) != HP_OK) {
+        return err;
     }
 
     if (cfg->summary) {
         tc->summary = (hp_summary_t *)malloc(sizeof(hp_summary_t));
-        if (!tc->summary) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            hp_json_ser_free(&tc->json_ser);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return HP_ERR_NOMEM;
-        }
+        if (!tc->summary) return HP_ERR_NOMEM;
         hp_summary_init(tc->summary);
+    }
+    if (cfg->group_by_spec || cfg->agg_spec) {
+        tc->agg = (hp_agg_t *)malloc(sizeof(hp_agg_t));
+        if (!tc->agg) return HP_ERR_NOMEM;
+        if ((err = hp_agg_init(tc->agg, cfg->group_by_spec, cfg->agg_spec)) != HP_OK) return err;
     }
 
     if (cfg->on_error == HP_ON_ERROR_QUARANTINE && cfg->quarantine_path) {
         tc->quarantine_file = fopen(cfg->quarantine_path, "wb");
-        if (!tc->quarantine_file) {
-            hp_sliding_buffer_free(&tc->ring_buf);
-            hp_json_ser_free(&tc->json_ser);
-            free(tc->page_buf_data);
-            tc->page_buf_data = NULL;
-            return HP_ERR_IO;
-        }
+        if (!tc->quarantine_file) return HP_ERR_IO;
     }
-
     return HP_OK;
+}
+
+hp_error_t hp_transcoder_init(hp_transcoder_t *tc, const hp_transcoder_config_t *cfg) {
+    if (!tc || !cfg) return HP_ERR_INVALID_ARG;
+    memset(tc, 0, sizeof(*tc));
+    tc->config = *cfg;
+    hp_error_t err = init_parts(tc, cfg);
+    if (err != HP_OK) hp_transcoder_free(tc);
+    return err;
 }
 
 void hp_transcoder_free(hp_transcoder_t *tc) {
@@ -488,6 +429,11 @@ void hp_transcoder_free(hp_transcoder_t *tc) {
     if (tc->summary) {
         free(tc->summary);
         tc->summary = NULL;
+    }
+    if (tc->agg) {
+        hp_agg_free(tc->agg);
+        free(tc->agg);
+        tc->agg = NULL;
     }
     if (tc->page_buf_data) {
         free(tc->page_buf_data);
@@ -514,7 +460,13 @@ static hp_error_t column_not_found(hp_transcoder_t *tc, const char *name) {
  * first record's schema for NDJSON) and by parallel workers with a preset
  * header. Returns the first binding error, if any. */
 static hp_error_t hp_bind_stream_header(hp_transcoder_t *tc) {
-    if (tc->projection.active) {
+    if (tc->agg) {
+        const char *missing = NULL;
+        hp_error_t err = hp_agg_bind(tc->agg, &tc->in_header, &missing);
+        if (err == HP_ERR_COLUMN_NOT_FOUND) return column_not_found(tc, missing);
+        if (err == HP_OK) err = hp_agg_header(tc->agg, &tc->out_header);
+        if (err != HP_OK) return err;
+    } else if (tc->projection.active) {
         hp_error_t err = hp_projection_bind(&tc->projection, &tc->in_header);
         if (err == HP_ERR_COLUMN_NOT_FOUND) {
             size_t i = 0;
@@ -609,17 +561,22 @@ HP_INLINE hp_error_t next_ndjson_record(hp_run_t *run, const uint8_t *src, size_
 }
 
 /* An empty header name is written as "" so it stays distinguishable from
- * an absent cell after a round trip. --count and --summary write no rows,
- * so they write no header either. */
+ * an absent cell after a round trip */
+static void write_csv_names(hp_page_buffer_t *pb, const hp_header_t *header, uint8_t delim) {
+    for (size_t i = 0; i < header->count; i++) {
+        size_t len = strlen(header->names[i]);
+        if (i > 0) hp_page_buffer_putc(pb, delim);
+        write_csv_field_pb(pb, header->names[i], len, delim, len == 0);
+    }
+    hp_page_buffer_putc(pb, '\n');
+}
+
+/* --count and --summary write no rows, so they write no header either; an
+ * aggregation writes its header with its rows */
 static void write_csv_header(hp_run_t *run) {
     hp_transcoder_t *tc = run->tc;
-    if (!run->csv_out || tc->config.count_only || tc->config.summary) return;
-    for (size_t i = 0; i < tc->out_header.count; i++) {
-        size_t len = strlen(tc->out_header.names[i]);
-        if (i > 0) hp_page_buffer_putc(&run->pb, run->out_delim);
-        write_csv_field_pb(&run->pb, tc->out_header.names[i], len, run->out_delim, len == 0);
-    }
-    hp_page_buffer_putc(&run->pb, '\n');
+    if (!run->csv_out || tc->config.count_only || tc->config.summary || tc->agg) return;
+    write_csv_names(&run->pb, &tc->out_header, run->out_delim);
 }
 
 /* Binds the stream to its header: the first CSV record, or the keys of the
@@ -666,11 +623,14 @@ HP_INLINE void follow_schema_growth(hp_run_t *run) {
     hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
 }
 
-/* Handles one record that passed the filter: folds it into --summary,
- * counts it for --count, or writes it. Sets *done once --head is reached. */
+/* Handles one record that passed the filter: folds it into the groups or
+ * --summary, counts it for --count, or writes it. Sets *done once --head
+ * is reached; with groups, --head limits the groups written. */
 HP_INLINE hp_error_t deliver_record(hp_run_t *run, size_t raw_len, bool *done) {
     hp_transcoder_t *tc = run->tc;
-    if (tc->config.summary) {
+    if (tc->agg) {
+        return hp_agg_observe(tc->agg, &run->row);
+    } else if (tc->config.summary) {
         hp_summary_observe(tc->summary, &tc->in_header, &run->row);
     } else if (tc->config.count_only) {
         /* counted below, nothing is written */
@@ -701,8 +661,47 @@ HP_INLINE size_t line_span(const uint8_t *src, size_t available) {
     return nl ? (size_t)(nl - src + 1) : available;
 }
 
+/* Writes the rows of a finished aggregation, at most limit of them (0: all) */
+static hp_error_t emit_groups(hp_transcoder_t *tc, hp_page_buffer_t *pb, const hp_agg_t *agg,
+                              uint64_t *emitted) {
+    const hp_transcoder_config_t *cfg = &tc->config;
+    const size_t rows = hp_agg_rows(agg);
+    const size_t n = (cfg->limit_rows && cfg->limit_rows < rows) ? (size_t)cfg->limit_rows : rows;
+    *emitted = n;
+    if (cfg->count_only) return HP_OK;
+
+    const bool csv_out = cfg->out_format == HP_FORMAT_CSV || cfg->out_format == HP_FORMAT_TSV;
+    const uint8_t delim = cfg->out_format == HP_FORMAT_TSV ? '\t' : ',';
+    if (csv_out) write_csv_names(pb, &tc->out_header, delim);
+
+    static hp_row_t row;    /* 32 KiB: kept off the stack of a worker */
+    char scratch[HP_AGG_MAX_FNS * HP_AGG_VALUE_MAX];
+    for (size_t i = 0; i < n; i++) {
+        hp_agg_row(agg, i, &row, scratch);
+        if (csv_out) {
+            size_t raw_len = row.field_count;
+            for (size_t f = 0; f < row.field_count; f++) raw_len += row.fields[f].len;
+            emit_csv_row_pb(pb, &row, NULL, 0, delim, raw_len, true);
+        } else {
+            size_t line_len = 0;
+            hp_error_t err = emit_ndjson_row_pb(pb, &tc->json_ser, &tc->out_header, &row, &line_len);
+            if (err != HP_OK) return err;
+            tc->stats.bytes_out += line_len;
+        }
+    }
+    return HP_OK;
+}
+
 static hp_error_t finish_run(hp_run_t *run, hp_error_t err) {
     hp_transcoder_t *tc = run->tc;
+    if (err == HP_OK && tc->agg && !tc->config.agg_partial) {
+        /* An input without rows still has a result, a count of 0, under
+         * the columns as they were given */
+        if (!run->header_done && (err = hp_agg_header(tc->agg, &tc->out_header)) == HP_OK) {
+            hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
+        }
+        if (err == HP_OK) err = emit_groups(tc, &run->pb, tc->agg, &run->rows_emitted);
+    }
     if (err == HP_OK) {
         err = hp_page_buffer_finish(&run->pb);
     } else {
@@ -894,4 +893,29 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     tc->stats.elapsed_seconds = hp_clock_seconds() - t0;
     free(run);
     return err;
+}
+
+hp_error_t hp_transcoder_write_groups(hp_transcoder_t *tc, const hp_agg_t *agg, FILE *out_stream) {
+    hp_transcoder_config_t *cfg = &tc->config;
+    if (cfg->out_format == HP_FORMAT_AUTO) {
+        cfg->out_format = (cfg->in_format == HP_FORMAT_NDJSON) ? HP_FORMAT_CSV : HP_FORMAT_NDJSON;
+    }
+    hp_error_t err = hp_agg_header(agg, &tc->out_header);
+    if (err != HP_OK) return err;
+    hp_json_ser_bind_keys(&tc->json_ser, &tc->out_header);
+
+    hp_page_buffer_t pb = {
+        .data = tc->page_buf_data,
+        .cap = tc->page_buf_cap,
+        .stream = out_stream,
+        .sink = cfg->sink,
+        .sink_ctx = cfg->sink_ctx,
+        .gz = tc->gz_out,
+        .error = HP_OK,
+    };
+    uint64_t emitted = 0;
+    err = emit_groups(tc, &pb, agg, &emitted);
+    hp_error_t finish_err = hp_page_buffer_finish(&pb);
+    tc->stats.rows_emitted += emitted;
+    return err != HP_OK ? err : finish_err;
 }

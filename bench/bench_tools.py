@@ -9,6 +9,7 @@ shows the median time and the peak RSS of the process.
 
 usage: bench_tools.py --csv big.csv --ndjson big.ndjson --small small.csv
                       [-n 7] [--out-dir /dev/shm] [--hyperpipe PATH]
+                      [--only SUBSTRING]
 """
 import argparse
 import csv
@@ -85,7 +86,22 @@ def read_count(path):
     return (1, numbers[-1]) if numbers else (0, "")
 
 
-READERS = {"csv": read_csv_rows, "ndjson": read_ndjson_rows, "count": read_count}
+def read_groups(path):
+    """Grouped results without the header, in any row order and with any
+    number formatting: tools name their columns and print numbers in their
+    own ways."""
+    def cell(x):
+        try:
+            return "%.12g" % float(x)
+        except ValueError:
+            return x
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        rows = [r for r in csv.reader(f) if r][1:]
+    return digest_rows(sorted([cell(x) for x in r] for r in rows))
+
+
+READERS = {"csv": read_csv_rows, "ndjson": read_ndjson_rows, "count": read_count,
+           "groups": read_groups}
 
 
 # DuckDB infers the mixed numbers-and-"-" bytes column as JSON and would
@@ -135,6 +151,26 @@ def tasks(a, hp, out):
             "duckdb": (["duckdb", "-noheader", "-list", "-c", f"SELECT count(*) FROM read_csv('{q(big)}') WHERE status = 404"], True),
             "miller": (["mlr", "--icsv", "--onidx", "filter", "$status == 404", "then", "count", big], True),
         }),
+        ("group by status: count, sum(bytes)", "groups", {
+            "hyperpipe": ([hp, big, "--group-by", "status", "--agg", "count, sum(bytes)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--group-by", "status", "--agg", "count, sum(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT status, count(*) AS n, sum(TRY_CAST(bytes AS BIGINT)) AS b FROM _t_1 GROUP BY status", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(*), sum(TRY_CAST(bytes AS BIGINT)) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "stats1", "-a", "count,sum", "-f", "bytes", "-g", "status", big], True),
+        }),
+        ("group by host: count", "groups", {
+            "hyperpipe": ([hp, big, "--group-by", "host", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, big, "--group-by", "host", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "qsv sqlp": (["qsv", "sqlp", big, "SELECT host, count(*) AS n FROM _t_1 GROUP BY host", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT host, count(*) FROM read_csv('{q(big)}', columns = {NASA_COLUMNS}) GROUP BY host) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--icsv", "--ocsv", "count", "-g", "host", big], True),
+        }),
+        ("NDJSON group by status: count, avg(bytes)", "groups", {
+            "hyperpipe": ([hp, nd, "--group-by", "status", "--agg", "count, avg(bytes)", "--to", "csv", "-o", out], False),
+            "hyperpipe -j1": ([hp, nd, "--group-by", "status", "--agg", "count, avg(bytes)", "--to", "csv", "--jobs", "1", "-o", out], False),
+            "duckdb": (["duckdb", "-c", f"COPY (SELECT status, count(*), avg(TRY_CAST(bytes AS BIGINT)) FROM read_json('{q(nd)}', columns = {NASA_COLUMNS}) GROUP BY status) TO '{q(out)}' (HEADER)"], False),
+            "miller": (["mlr", "--ijsonl", "--ocsv", "stats1", "-a", "count,mean", "-f", "bytes", "-g", "status", nd], True),
+        }),
         ("startup: filter a 5,000-row file", "csv", {
             "hyperpipe": ([hp, small, "status == 404", "--to", "csv", "-o", out], False),
             "qsv sqlp": (["qsv", "sqlp", small, "SELECT * FROM _t_1 WHERE status = 404", "-o", out], False),
@@ -152,6 +188,7 @@ def main():
     ap.add_argument("-n", type=int, default=7)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--hyperpipe", default="hyperpipe")
+    ap.add_argument("--only", default="", help="run the tasks whose name contains this")
     a = ap.parse_args()
     a.csv, a.ndjson, a.small = map(os.path.abspath, (a.csv, a.ndjson, a.small))
     hp = os.path.abspath(a.hyperpipe) if os.sep in a.hyperpipe else shutil.which(a.hyperpipe)
@@ -159,6 +196,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix="hptools_", dir=a.out_dir)
     placeholder = os.path.join(tmp, "OUT")
     for name, kind, tools in tasks(a, hp, placeholder):
+        if a.only not in name:
+            continue
         print(f"\n## {name}\n", flush=True)
         ref = None
         live = {}
@@ -181,6 +220,8 @@ def main():
                 continue
             live[tool] = (argv, out, to_stdout)
 
+        if not live:
+            continue
         times = {t: [] for t in live}
         rss = {t: 0.0 for t in live}
         for _ in range(a.n):

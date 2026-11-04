@@ -11,6 +11,7 @@ endif()
 find_package(Threads REQUIRED)
 
 add_library(hyperpipe_core STATIC
+    src/hp_agg.c
     src/hp_cpuid.c
     src/hp_csv_scalar.c
     src/hp_filter.c
