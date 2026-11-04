@@ -49,7 +49,7 @@ typedef struct hp_sorter_s {
     size_t budget;         /* bytes of rows held before they become a run */
     uint64_t seq;          /* the next row's position */
     bool long_keys;        /* a key is longer than an entry's prefix */
-    int threads;           /* threads hp_sorter_write() may merge with */
+    int threads;           /* threads hp_sorter_write() may sort and merge with */
 
     hp_sort_entry_t *entries;  /* rows not yet in a run; a heap with a limit */
     size_t count, cap;

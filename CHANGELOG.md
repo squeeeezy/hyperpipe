@@ -44,7 +44,9 @@ default for large files; and every workload is at least as fast as in 1.5.
   Stable, numbers by value and text by bytes, empty values last; `--head N`
   keeps N rows in a heap; larger inputs spill sorted runs to temporary
   files and merge them a level at a time. Parallel runs sort their chunks
-  and merge key ranges on several threads, byte-identical to one thread.
+  and merge key ranges on several threads, byte-identical to one thread;
+  other runs, stdin included, sort and merge their last rows on every
+  processor, or on `--jobs` threads.
   Library: `hp_sort.h`, `sort_spec`/`sort_memory` in
   `hp_transcoder_config_t`, `hp_transcoder_write_sorted()`.
 - `--group-by` and `--agg`: `count`, `count(col)`, `sum`, `avg`, `min` and

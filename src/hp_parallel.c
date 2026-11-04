@@ -368,6 +368,7 @@ static void *transcode_main(void *arg) {
             const bool sort_rows = pool->cfg.sort_spec && !pool->cfg.group_by_spec && !pool->cfg.agg_spec;
             cfg.limit_rows = sort_rows ? pool->cfg.limit_rows : 0;
             cfg.sort_memory = pool->sort_memory_per_job;
+            cfg.sort_threads = 1;   /* the coordinator merges with every thread */
             cfg.row_seq_base = (uint64_t)i << 40;
             cfg.lock_schema = true;
             cfg.preset_header = (i > 0) ? pool->header : NULL;

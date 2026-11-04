@@ -19,6 +19,7 @@ struct hp_sort_run_s {
     size_t count;
     hp_sort_block_t *blocks;
     bool own_recs;         /* records allocated one by one (with a limit) */
+    bool borrowed;         /* entries and records belong to an earlier run */
     size_t bytes;
     FILE *file;
     int level;             /* merges it took to build: runs merge a level at a time */
@@ -95,8 +96,10 @@ static void free_run(hp_sort_run_t *run) {
     if (run->own_recs) {
         for (size_t i = 0; i < run->count; i++) free(run->entries[i].rec);
     }
-    free(run->entries);
-    free_blocks(run->blocks);
+    if (!run->borrowed) {
+        free(run->entries);
+        free_blocks(run->blocks);
+    }
     if (run->file) fclose(run->file);
     memset(run, 0, sizeof(*run));
 }
@@ -155,10 +158,15 @@ static hp_error_t build_key(hp_sorter_t *s, const hp_row_t *row, size_t *key_len
             /* A zero byte is escaped as 00 FF and the text ends with 00 00,
              * so a prefix sorts before every longer text */
             *w++ = TAG_TEXT;
-            for (size_t i = 0; i < f->len; i++) {
-                uint8_t c = (uint8_t)f->ptr[i];
-                *w++ = c ^ flip;
-                if (c == 0) *w++ = 0xFF ^ flip;
+            if (!flip && !memchr(f->ptr, 0, f->len)) {
+                memcpy(w, f->ptr, f->len);
+                w += f->len;
+            } else {
+                for (size_t i = 0; i < f->len; i++) {
+                    uint8_t c = (uint8_t)f->ptr[i];
+                    *w++ = c ^ flip;
+                    if (c == 0) *w++ = 0xFF ^ flip;
+                }
             }
             *w++ = flip;
             *w++ = flip;
@@ -841,6 +849,67 @@ static hp_error_t merge_parallel(hp_sorter_t *s, void (*emit)(void *ctx, const v
     return err;
 }
 
+/* ---- the last run ------------------------------------------------------------- */
+
+/* At the end, with threads to spare, the rows still held sort as segments
+ * on several threads; the segments, in input order, then merge like runs.
+ * Only the last step may do this: the segments share the first one's
+ * memory, so none may be written to disk or freed on its own. */
+
+typedef struct segment_job_s {
+    hp_sort_entry_t *entries;
+    size_t count;
+    bool long_keys;
+    hp_error_t err;
+} segment_job_t;
+
+static void *segment_main(void *arg) {
+    segment_job_t *job = (segment_job_t *)arg;
+    job->err = sort_entries(job->entries, job->count, job->long_keys);
+    return NULL;
+}
+
+#define SEGMENT_MIN 65536
+
+static hp_error_t finish_in_segments(hp_sorter_t *s) {
+    size_t n = (size_t)s->threads;
+    if (n > 64) n = 64;
+    if (s->count / n < SEGMENT_MIN) n = s->count / SEGMENT_MIN;
+    if (n < 2 || s->limit) return hp_sorter_finish(s);
+
+    segment_job_t jobs[64];
+    hp_thread_t threads[64];
+    bool started[64] = { false };
+    const size_t per = (s->count + n - 1) / n;
+    for (size_t k = 0; k < n; k++) {
+        size_t lo = k * per, hi = lo + per < s->count ? lo + per : s->count;
+        jobs[k] = (segment_job_t){ s->entries + lo, hi - lo, s->long_keys, HP_OK };
+        if (k > 0) started[k] = hp_thread_create(&threads[k], segment_main, &jobs[k]);
+    }
+    for (size_t k = 0; k < n; k++) {
+        if (k == 0 || !started[k]) segment_main(&jobs[k]);
+    }
+    hp_error_t err = HP_OK;
+    for (size_t k = 0; k < n; k++) {
+        if (started[k]) hp_thread_join(threads[k]);
+        if (jobs[k].err != HP_OK) err = jobs[k].err;
+    }
+
+    for (size_t k = 0; err == HP_OK && k < n; k++) {
+        hp_sort_run_t run = {
+            .entries = jobs[k].entries, .count = jobs[k].count, .borrowed = k > 0,
+            .blocks = k == 0 ? s->blocks : NULL, .bytes = k == 0 ? s->held : 0,
+        };
+        err = push_run(s, &run);
+        if (err == HP_OK && k == 0) {
+            s->entries = NULL;
+            s->blocks = NULL;
+        }
+    }
+    s->count = s->cap = s->held = 0;
+    return err;
+}
+
 struct line_sink {
     void (*emit)(void *ctx, const void *data, size_t len);
     void *ctx;
@@ -855,7 +924,7 @@ static hp_error_t take_line(void *ctx, const uint8_t *rec) {
 hp_error_t hp_sorter_write(hp_sorter_t *s, void (*emit)(void *ctx, const void *data, size_t len),
                            void *ctx, uint64_t *written) {
     *written = 0;
-    hp_error_t err = hp_sorter_finish(s);
+    hp_error_t err = s->threads > 1 ? finish_in_segments(s) : hp_sorter_finish(s);
     if (err != HP_OK) return err;
     const uint64_t limit = s->limit ? s->limit : UINT64_MAX;
 

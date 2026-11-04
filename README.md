@@ -145,6 +145,8 @@ hyperpipe access.csv --group-by host --agg "count, sum(bytes)" --sort "-sum(byte
   then empty values, in either direction, so `-bytes` starts with the
   largest number even when the column holds some text.
 - Equal rows keep their input order, for every `--jobs`.
+- The sort and the merge use every processor, from stdin too; `--jobs N`
+  limits them to N threads.
 - `--head N` after `--sort` keeps only N rows in memory, whatever the
   input size.
 - Otherwise rows are held up to `--memory`; past that they are sorted in

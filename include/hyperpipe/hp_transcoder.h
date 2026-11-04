@@ -35,6 +35,7 @@ typedef struct hp_transcoder_config_s {
      * held in memory (0: the default). */
     const char *sort_spec;
     size_t sort_memory;
+    int sort_threads;      /* threads for the final sort; 0: one per processor */
     /* Parallel workers only: keep the groups or the sorted rows in the
      * transcoder for the coordinator instead of writing them, and number
      * rows for sorting from row_seq_base. */

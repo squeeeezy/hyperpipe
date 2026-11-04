@@ -141,7 +141,9 @@ memory budget a sorted run goes to a temporary file; sixteen runs on disk
 of one level merge into one of the next. With `--head` a bounded heap keeps
 N rows, and its keys end with the row's position to stay deterministic.
 
-In parallel runs each worker sorts its chunk into a run. The coordinator
+At the end of a run the rows still in memory sort as segments on several
+threads, which then merge like runs, so a sort from stdin uses every core
+as well. In parallel runs each worker sorts its chunk into a run. The coordinator
 cuts the runs into key ranges from sampled keys, merges the ranges on
 several threads and writes them in order, with at most `jobs + 2` ranges
 in flight. Equal keys break ties by run and position, so the bytes match a

@@ -1,5 +1,6 @@
 #include "hyperpipe/hp_transcoder.h"
 #include "hp_clock.h"
+#include "hp_thread.h"
 #include <ctype.h>
 
 typedef struct hp_page_buffer_s {
@@ -403,6 +404,8 @@ static hp_error_t init_parts(hp_transcoder_t *tc, const hp_transcoder_config_t *
         err = hp_sorter_init(tc->sorter, cfg->sort_spec, cfg->limit_rows, cfg->sort_memory);
         if (err != HP_OK) return err;
         tc->sorter->seq = cfg->row_seq_base;
+        tc->sorter->threads = cfg->sort_threads > 0 ? cfg->sort_threads
+                                                    : (hp_cpu_count() < 16 ? hp_cpu_count() : 16);
     }
 
     if (cfg->on_error == HP_ON_ERROR_QUARANTINE && cfg->quarantine_path) {

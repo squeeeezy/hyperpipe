@@ -407,6 +407,7 @@ int main(int argc, char **argv) {
     /* --jobs auto takes the parallel path only where it applies and pays off;
      * an explicit --jobs N says when it does not apply */
     const bool jobs_explicit = (o.jobs != 0);
+    o.cfg.sort_threads = o.jobs;   /* --jobs bounds the sort's threads too */
     if (!jobs_explicit) {
         const bool merged = o.cfg.group_by_spec || o.cfg.agg_spec || o.cfg.sort_spec;
         o.jobs = (o.input_path && (o.cfg.limit_rows == 0 || merged) && !o.cfg.summary)
