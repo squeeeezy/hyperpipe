@@ -4,18 +4,11 @@
  * transcoders concurrently, and every writer must exclude every reader.
  * Reads always follow the caller's own locked init, so the mutex also
  * provides the happens-before edge for the pointer reads. */
-#if !defined(_WIN32)
-    #include <pthread.h>
-    static pthread_mutex_t g_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
-    #define HP_DISPATCH_LOCK()   pthread_mutex_lock(&g_dispatch_mutex)
-    #define HP_DISPATCH_UNLOCK() pthread_mutex_unlock(&g_dispatch_mutex)
-#else
-    /* --jobs is unsupported on Windows; the table is single-threaded there */
-    #define HP_DISPATCH_LOCK()   (void)0
-    #define HP_DISPATCH_UNLOCK() (void)0
-#endif
+#include "hp_thread.h"
 
-#if defined(_MSC_VER)
+static hp_mutex_t g_dispatch_mutex = HP_MUTEX_INITIALIZER;
+
+#if HP_X86 && defined(_MSC_VER)
     #include <intrin.h>
     static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
         int cpu_info[4];
@@ -28,7 +21,7 @@
     static uint64_t read_xcr0(void) {
         return _xgetbv(0);
     }
-#elif defined(__GNUC__) || defined(__clang__)
+#elif HP_X86 && (defined(__GNUC__) || defined(__clang__))
     #include <cpuid.h>
     #include <immintrin.h>
     static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
@@ -40,6 +33,7 @@
         return ((uint64_t)edx << 32) | eax;
     }
 #else
+    /* Not x86: no vector engine is ever selected */
     static void run_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx) {
         (void)leaf; (void)subleaf; *eax = *ebx = *ecx = *edx = 0;
     }
@@ -106,7 +100,7 @@ const char *hp_simd_mode_to_string(hp_simd_mode_t mode) {
 }
 
 void hp_dispatch_init(hp_simd_mode_t requested_mode) {
-    HP_DISPATCH_LOCK();
+    hp_mutex_lock(&g_dispatch_mutex);
 
     hp_cpu_caps_t caps = hp_detect_cpu_caps();
 
@@ -136,13 +130,14 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
      * again with the engine already selected, and must not write a table
      * that other threads are reading. */
     if (selected == g_hp_dispatch.active_mode) {
-        HP_DISPATCH_UNLOCK();
+        hp_mutex_unlock(&g_dispatch_mutex);
         return;
     }
     g_hp_dispatch.active_mode = selected;
     g_hp_dispatch.active_mode_name = hp_simd_mode_to_string(selected);
 
     switch (selected) {
+#if HP_X86
         case HP_SIMD_AVX512:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_avx512;
             g_hp_dispatch.csv_scan_quote = hp_csv_scan_quote_avx512;
@@ -165,6 +160,7 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             g_hp_dispatch.json_struct_masks = hp_json_struct_masks_avx2;
             g_hp_dispatch.csv_parse_row = hp_csv_parse_row_avx2;
             break;
+#endif
         case HP_SIMD_SCALAR:
         default:
             g_hp_dispatch.csv_scan_special = hp_csv_scan_special_scalar;
@@ -179,7 +175,7 @@ void hp_dispatch_init(hp_simd_mode_t requested_mode) {
             break;
     }
 
-    HP_DISPATCH_UNLOCK();
+    hp_mutex_unlock(&g_dispatch_mutex);
 }
 
 hp_error_t hp_csv_parser_init(hp_csv_parser_t *parser, hp_format_t fmt, hp_simd_mode_t simd) {

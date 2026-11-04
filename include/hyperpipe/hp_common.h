@@ -22,6 +22,14 @@
     #define HP_HOT
 #endif
 
+/* The AVX2 and AVX-512 engines exist only on x86; elsewhere the scalar
+ * engine is the only one built. */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    #define HP_X86 1
+#else
+    #define HP_X86 0
+#endif
+
 typedef enum hp_error_e {
     HP_OK = 0,
     HP_ERR_GENERIC = -1,

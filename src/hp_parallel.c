@@ -16,6 +16,7 @@
  * independently of the input size. */
 
 #include "hyperpipe/hp_parallel.h"
+#include "hp_clock.h"
 #include "hp_thread.h"
 
 #include <stdio.h>
@@ -108,12 +109,6 @@ static bool can_write_at_offsets(FILE *out, uint64_t *base) {
     *base = (uint64_t)pos;
     return true;
 #endif
-}
-
-static double now_seconds(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 /* ---- record boundaries ---------------------------------------------------------- */
@@ -447,7 +442,7 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
         return HP_ERR_INVALID_ARG;
     }
     if (jobs > HP_JOB_MAX) jobs = HP_JOB_MAX;
-    double t0 = now_seconds();
+    double t0 = hp_clock_seconds();
 
     FILE *probe = fopen(input_path, "rb");
     if (!probe) return HP_ERR_IO;
@@ -611,6 +606,6 @@ hp_error_t hp_parallel_run(const hp_transcoder_config_t *base_cfg,
     hp_cond_destroy(&pool.progress);
     hp_mutex_destroy(&pool.mu);
     hp_header_free(&header);
-    stats_out->elapsed_seconds = now_seconds() - t0;
+    stats_out->elapsed_seconds = hp_clock_seconds() - t0;
     return err;
 }

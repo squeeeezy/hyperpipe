@@ -10,8 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *const csv_path = "build/test_parallel_input.csv";
-static const char *const ndjson_path = "build/test_parallel_input.ndjson";
+/* Scratch files go to the build directory; CMake passes its own */
+#ifndef HP_TEST_TMPDIR
+#define HP_TEST_TMPDIR "build/"
+#endif
+
+static const char *const csv_path = HP_TEST_TMPDIR "test_parallel_input.csv";
+static const char *const ndjson_path = HP_TEST_TMPDIR "test_parallel_input.ndjson";
 static const int job_counts[] = { 2, 3, 7 };
 
 /* Large enough for several 1 MiB ranges, so chunk boundaries land on every
@@ -161,7 +166,7 @@ static void test_csv_skip_mode_runs_sequentially(void) {
 
 /* TSV fields may be quoted too, newlines included */
 static void test_tsv_with_quoted_newlines(void) {
-    const char *tsv_path = "build/test_parallel_input.tsv";
+    const char *tsv_path = HP_TEST_TMPDIR "test_parallel_input.tsv";
     FILE *f = fopen(tsv_path, "wb");
     CHECK(f);
     fputs("id\tnote\n", f);
@@ -177,9 +182,9 @@ static void test_tsv_with_quoted_newlines(void) {
 
 /* Malformed NDJSON lines are quarantined in input order, as sequentially */
 static void test_ndjson_quarantine(void) {
-    const char *dirty_path = "build/test_parallel_dirty.ndjson";
-    const char *q_single = "build/test_parallel_q1.txt";
-    const char *q_parallel = "build/test_parallel_q2.txt";
+    const char *dirty_path = HP_TEST_TMPDIR "test_parallel_dirty.ndjson";
+    const char *q_single = HP_TEST_TMPDIR "test_parallel_q1.txt";
+    const char *q_parallel = HP_TEST_TMPDIR "test_parallel_q2.txt";
     FILE *f = fopen(dirty_path, "wb");
     CHECK(f);
     for (int i = 0; i < 150000; i++) {
@@ -269,7 +274,7 @@ static void test_ndjson_count(void) {
  * follows the growth; the parallel run locks the schema to the first line,
  * so the late key serializes under its column index. */
 static void test_ndjson_schema_lock(void) {
-    const char *grow_path = "build/test_parallel_growth.ndjson";
+    const char *grow_path = HP_TEST_TMPDIR "test_parallel_growth.ndjson";
     FILE *f = fopen(grow_path, "wb");
     CHECK(f);
     for (int i = 0; i < 4000; i++) {
@@ -288,7 +293,7 @@ static void test_ndjson_schema_lock(void) {
 }
 
 static void test_compressed_input_is_unsupported(void) {
-    const char *gz_path = "build/test_parallel_fake.gz";
+    const char *gz_path = HP_TEST_TMPDIR "test_parallel_fake.gz";
     FILE *f = fopen(gz_path, "wb");
     CHECK(f);
     const uint8_t magic[4] = { 0x1F, 0x8B, 0x08, 0x00 };

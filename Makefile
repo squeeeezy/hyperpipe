@@ -25,15 +25,17 @@ else
     LDLIBS = -pthread -ldl
 endif
 
-# The SIMD units are x86 only; elsewhere they compile to nothing usable and
-# runtime dispatch keeps the scalar paths.
+LIB_SRCS := $(filter-out src/hp_main.c,$(wildcard src/*.c))
+
+# The vector units are x86 only; elsewhere the scalar engine is built alone.
 ARCH := $(shell $(CC) -dumpmachine)
 ifneq ($(findstring x86_64,$(ARCH))$(findstring i686,$(ARCH)),)
     AVX2_FLAGS   = -mavx2 -mbmi2
     AVX512_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx2 -mbmi2
+else
+    LIB_SRCS := $(filter-out %_avx2.c %_avx512.c,$(LIB_SRCS))
 endif
 
-LIB_SRCS  = $(filter-out src/hp_main.c,$(wildcard src/*.c))
 LIB_OBJS  = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB       = $(BUILD)/libhyperpipe.a
 TESTS     = $(patsubst tests/%.c,$(BUILD)/%$(EXE),$(wildcard tests/test_*.c))

@@ -18,6 +18,7 @@ typedef void *(*hp_thread_fn)(void *arg);
 
 typedef HANDLE hp_thread_t;
 typedef SRWLOCK hp_mutex_t;
+#define HP_MUTEX_INITIALIZER SRWLOCK_INIT
 typedef CONDITION_VARIABLE hp_cond_t;
 
 typedef struct hp_thread_start_s {
@@ -77,6 +78,7 @@ static inline int hp_cpu_count(void) {
 
 typedef pthread_t hp_thread_t;
 typedef pthread_mutex_t hp_mutex_t;
+#define HP_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
 typedef pthread_cond_t hp_cond_t;
 
 static inline bool hp_thread_create(hp_thread_t *t, hp_thread_fn fn, void *arg) {

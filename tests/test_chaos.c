@@ -2,7 +2,8 @@
  * SIMD kernel and through the full transcode pipeline.
  *
  * For every generated document:
- *   1. The scalar, AVX2 and AVX-512 row parsers produce identical fields.
+ *   1. The scalar row parser and every vector parser the CPU supports
+ *      produce identical fields.
  *   2. CSV -> CSV -> reparse reproduces the original fields exactly
  *      (parse(serialize(parse(x))) == parse(x)), which covers RFC 4180
  *      re-quoting on hostile data.
@@ -150,20 +151,32 @@ static void check_round_trip(const char *doc, size_t len, fingerprint_t original
     pipe_free(&r);
 }
 
+static void check_kernel_agrees(fingerprint_t s, fingerprint_t v, size_t iter) {
+    if (s.fields != v.fields || s.hash != v.hash) {
+        fprintf(stderr, "kernels diverge at iteration %zu\n", iter);
+    }
+    CHECK(s.fields == v.fields && s.hash == v.hash);
+}
+
 static void test_csv_kernels_agree_and_round_trip(void) {
     static char doc[DOC_CAP];
+#if HP_X86
+    const hp_cpu_caps_t caps = hp_detect_cpu_caps();
+    const bool avx512 = caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl;
+#endif
     for (size_t iter = 0; iter < ITERATIONS; iter++) {
         rng_t r = rng_for(iter);
         size_t len = gen_csv_doc(&r, doc);
 
         fingerprint_t s = fingerprint_csv(doc, len, hp_csv_parse_row_scalar, HP_SIMD_SCALAR);
-        fingerprint_t a2 = fingerprint_csv(doc, len, hp_csv_parse_row_avx2, HP_SIMD_AVX2);
-        fingerprint_t a5 = fingerprint_csv(doc, len, hp_csv_parse_row_avx512, HP_SIMD_AVX512);
-        if (s.fields != a2.fields || s.fields != a5.fields || s.hash != a2.hash || s.hash != a5.hash) {
-            fprintf(stderr, "kernels diverge at iteration %zu\n", iter);
+#if HP_X86
+        if (caps.has_avx2) {
+            check_kernel_agrees(s, fingerprint_csv(doc, len, hp_csv_parse_row_avx2, HP_SIMD_AVX2), iter);
         }
-        CHECK(s.fields == a2.fields && s.fields == a5.fields);
-        CHECK(s.hash == a2.hash && s.hash == a5.hash);
+        if (avx512) {
+            check_kernel_agrees(s, fingerprint_csv(doc, len, hp_csv_parse_row_avx512, HP_SIMD_AVX512), iter);
+        }
+#endif
 
         if (s.err == HP_OK && s.fields > 0) check_round_trip(doc, len, s);
     }
@@ -195,6 +208,7 @@ static size_t gen_ndjson_line(rng_t *r, char *line, size_t cap) {
 static void test_ndjson_round_trips(void) {
     static char line[4096], arena[64 * 1024], arena2[64 * 1024];
     static hp_row_t row, row2;
+    hp_dispatch_init(HP_SIMD_AUTO); /* the best string emitter this CPU has */
 
     for (size_t iter = 0; iter < ITERATIONS; iter++) {
         rng_t r = rng_for(iter);
@@ -205,8 +219,8 @@ static void test_ndjson_round_trips(void) {
         CHECK(hp_json_parse_line(line, w, &header, &row, arena, sizeof(arena)) == HP_OK);
 
         hp_json_ser_t ser;
-        CHECK(hp_json_ser_init(&ser, 4096, HP_SIMD_AVX512) == HP_OK);
-        ser.emit_string = hp_json_emit_body_avx512;
+        CHECK(hp_json_ser_init(&ser, 4096, HP_SIMD_AUTO) == HP_OK);
+        ser.emit_string = g_hp_dispatch.json_emit_string;
         CHECK(hp_json_ser_bind_keys(&ser, &header) == HP_OK);
         const char *out = NULL;
         size_t out_len = 0;

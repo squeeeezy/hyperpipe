@@ -12,13 +12,9 @@ find_package(Threads REQUIRED)
 
 add_library(hyperpipe_core STATIC
     src/hp_cpuid.c
-    src/hp_csv_avx2.c
-    src/hp_csv_avx512.c
     src/hp_csv_scalar.c
     src/hp_filter.c
     src/hp_gzip.c
-    src/hp_json_avx2.c
-    src/hp_json_avx512.c
     src/hp_json_scalar.c
     src/hp_keymap.c
     src/hp_parallel.c
@@ -37,9 +33,19 @@ if(MSVC)
     target_compile_options(hyperpipe_core PUBLIC /W4 /WX)
 else()
     target_compile_options(hyperpipe_core PUBLIC -Wall -Wextra -Wpedantic -Werror)
-    # Only these units use vector instructions; runtime dispatch decides
-    # whether they run, so the binary stays portable across x86 CPUs.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+endif()
+
+# The vector units are x86 only. Only they use vector instructions; runtime
+# dispatch decides whether they run, so the binary stays portable across
+# x86 CPUs.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+    target_sources(hyperpipe_core PRIVATE
+        src/hp_csv_avx2.c
+        src/hp_csv_avx512.c
+        src/hp_json_avx2.c
+        src/hp_json_avx512.c
+    )
+    if(NOT MSVC)
         set_source_files_properties(src/hp_csv_avx2.c src/hp_json_avx2.c
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mbmi2")
         set_source_files_properties(src/hp_csv_avx512.c src/hp_json_avx512.c
@@ -59,5 +65,6 @@ foreach(source IN LISTS test_sources)
     get_filename_component(name ${source} NAME_WE)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE hyperpipe_core)
+    target_compile_definitions(${name} PRIVATE HP_TEST_TMPDIR="${CMAKE_BINARY_DIR}/")
     add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endforeach()

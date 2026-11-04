@@ -1,22 +1,6 @@
 #include "hyperpipe/hp_transcoder.h"
-#include <time.h>
+#include "hp_clock.h"
 #include <ctype.h>
-
-#if defined(_WIN32)
-    #include <windows.h>
-    static double get_time_sec(void) {
-        LARGE_INTEGER freq, counter;
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&counter);
-        return (double)counter.QuadPart / (double)freq.QuadPart;
-    }
-#else
-    static double get_time_sec(void) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-    }
-#endif
 
 typedef struct hp_page_buffer_s {
     uint8_t *data;
@@ -813,7 +797,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
         tc->in_reader.limit = tc->config.span_end;
     }
 
-    double t0 = get_time_sec();
+    double t0 = hp_clock_seconds();
     size_t bytes_read = 0;
     hp_error_t err = hp_sliding_buffer_refill(&tc->ring_buf, &tc->in_reader, &bytes_read);
     if (err != HP_OK) return err;
@@ -874,7 +858,7 @@ hp_error_t hp_transcoder_run(hp_transcoder_t *tc, FILE *in_stream, FILE *out_str
     if (err == HP_OK && tc->config.summary && tc->summary && out_stream) {
         hp_summary_print(tc->summary, out_stream);
     }
-    tc->stats.elapsed_seconds = get_time_sec() - t0;
+    tc->stats.elapsed_seconds = hp_clock_seconds() - t0;
     free(run);
     return err;
 }
